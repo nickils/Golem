@@ -31,12 +31,19 @@ function printHelp() {
 
 Usage:
   golem-bridge connect <channelId> [--print]
+  golem-bridge reconnect <channelId> [--print]
+  golem-bridge disconnect
   golem-bridge --help
   golem-bridge --version
 
   <channelId>  shown in the Golem plugin widget inside Roblox Studio.
-               Fresh on every Studio start; re-run connect after a restart.
+               Fresh on every Studio start.
   --print      audit mode: fetch and print both files without writing anything.
+
+connect     link this folder to a Studio session (writes ./.golem/).
+reconnect   same, for a rotated token: replaces the old session files.
+            Use after a Studio restart, with the new line from the widget.
+disconnect  forget this session (removes ./.golem/). Studio is unaffected.
 
 connect writes ./.golem/golem.py and ./.golem/golem.md, fetched over HTTPS
 from your own Studio session. Review both files before running anything.`);
@@ -169,6 +176,41 @@ function sha256(text) {
   return crypto.createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+function readSavedChannel() {
+  try {
+    const src = fs.readFileSync(path.join(process.cwd(), ".golem", "golem.py"), "utf8");
+    const m = src.match(/CHANNEL = os\.environ\.get\("AIB_CHANNEL", "([0-9a-fA-F]+)"\)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function disconnectLocal() {
+  const dir = path.join(process.cwd(), ".golem");
+  if (!fs.existsSync(dir)) {
+    console.log("Not connected (no .golem/ in this folder).");
+    return;
+  }
+  const old = readSavedChannel();
+  fs.rmSync(dir, { recursive: true, force: true });
+  console.log(old ? `Disconnected from channel ${old} (removed .golem/).` : "Disconnected (removed .golem/).");
+  console.log("Studio is unaffected. To link again: npx golem-bridge connect <channelId>");
+}
+
+async function reconnect(channelId, printOnly) {
+  validateChannel(channelId);
+  const old = readSavedChannel();
+  if (!printOnly && old && old.toLowerCase() === channelId.toLowerCase()) {
+    console.log(`Already linked to channel ${channelId} — nothing to do.`);
+    return;
+  }
+  if (!printOnly && old) {
+    console.log(`Replacing session files for channel ${old}.`);
+  }
+  await connect(channelId, printOnly);
+}
+
 async function connect(channelId, printOnly) {
   validateChannel(channelId);
   console.log(`Contacting Golem plugin on channel ${channelId} ...`);
@@ -225,7 +267,12 @@ async function main() {
     console.log(VERSION);
     return;
   }
-  if (args[0] !== "connect") {
+  if (args[0] === "disconnect") {
+    disconnectLocal();
+    return;
+  }
+  const isReconnect = args[0] === "reconnect";
+  if (args[0] !== "connect" && !isReconnect) {
     printHelp();
     process.exit(2);
   }
@@ -236,7 +283,11 @@ async function main() {
     process.exit(2);
   }
   try {
-    await connect(channelId, printOnly);
+    if (isReconnect) {
+      await reconnect(channelId, printOnly);
+    } else {
+      await connect(channelId, printOnly);
+    }
   } catch (err) {
     fail(err.message, 1);
   }
