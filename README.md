@@ -23,11 +23,11 @@ the two connection files under `./.golem/`:
 
 ```sh
 npx golem-bridge connect <channelId>
-python3 ./.golem/golem.py ping
+python3 ./.golem/golem-helper.py ping
 ```
 
 `ping` should return `"ok": true` plus the open place name. Then the agent
-reads `./.golem/golem.md` for the full tool reference.
+reads `./.golem/golem-tools.md` for the full tool reference.
 
 After a Studio restart, relink with the new line:
 
@@ -44,9 +44,8 @@ npx golem-bridge disconnect
 ## Files
 
 - `cli.js` - source of the `golem-bridge` package
-- `golem.py` - the Studio helper, stamped with the channel at connect
-- `golem.md` - the agent manual
-- `firebase-rules.json` - relay rules (paste into the Firebase console once)
+- `golem-helper.py` - the Studio helper, stamped with the channel at connect
+- `golem-tools.md` - the agent manual
 - `package.json` - npm manifest
 
 ## Notes
@@ -54,12 +53,9 @@ npx golem-bridge disconnect
 - Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
 is the secret. Studio mints a fresh one on every start and wipes the old
 channel, so a leaked line dies with the session.
-- `golem.py` and `golem.md` ship in this package. The relay carries
+- `golem-helper.py` and `golem-tools.md` ship in this package. The relay carries
 small JSON commands and results only.
-- Relay rules: paste `firebase-rules.json` into the Firebase console
-(Realtime Database > Rules) once. It lets anyone open a channel they
-know the ID of, and nobody list channels. All three programs only ever
-touch their own channel, so nothing else changes.
+
 - Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
 in the plugin kills it on the spot and issues a new one. (Every Studio
 restart already rotates automatically.)
