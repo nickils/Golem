@@ -6,7 +6,7 @@
     "golem-bridge": "./cli.js"
   },
   "type": "commonjs",
-  "files": ["cli.js", "golem.py", "golem.md", "README.md", "firebase-rules.json"],
+  "files": ["cli.js", "golem-helper.py", "golem-tools.md", "README.md"],
   "keywords": ["roblox", "roblox-studio", "ai", "cli"],
   "engines": {
     "node": ">=18"
