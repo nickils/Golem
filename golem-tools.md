@@ -28,9 +28,9 @@ plugin widget and run `npx golem-bridge reconnect <newId>`.
 Every task that uses tools follows one ritual. No exceptions.
 
 ```
-python3 ./.golem/golem.py turn begin
+python3 ./.golem/golem-helper.py turn begin
 ... your work (tree, read, script, create, ...) ...
-python3 ./.golem/golem.py turn end --note "short reply the user reads"
+python3 ./.golem/golem-helper.py turn end --note "short reply the user reads"
 ```
 
 What this does: `turn begin` opens a group in the user's Studio chat, every
@@ -64,11 +64,11 @@ no turn is needed either. Just reply normally.
 
 ## 1. The helper
 
-All Studio commands go through one script: `./.golem/golem.py`
+All Studio commands go through one script: `./.golem/golem-helper.py`
 (zero-dependency Python 3, your channel already baked in). Below,
-`golem.py ...` always means:
+`golem-helper.py ...` always means:
 
-    python3 ./.golem/golem.py ...
+    python3 ./.golem/golem-helper.py ...
 
 Keep it in `./.golem/`. If it is ever missing, ask the user for their
 channel ID (shown in the Golem plugin widget) and re-run:
@@ -82,7 +82,7 @@ new session with the fresh line from the widget:
 
 Then check the connection:
 
-    golem.py ping
+    golem-helper.py ping
 
 `ping` must return `"ok": true` plus the place name. If it times out,
 Roblox Studio is not running. Tell the user and retry when they confirm
@@ -144,49 +144,49 @@ contain any UTF-8 text (odd bytes are sanitized automatically).
 command on a fresh setup, and the "is Studio open?" test whenever commands
 start timing out.
 
-    golem.py ping
+    golem-helper.py ping
 
 **status** — is the plugin alive? Reads the channel's recent beacons, no
 Studio round-trip needed. Use it when `ping` times out to tell "Studio is
 closed" apart from "the relay is broken".
 
-    golem.py status
+    golem-helper.py status
 
 **debug** — full diagnostics: relay round-trip, versions, commands served,
 error count. Use when something behaves strangely.
 
-    golem.py debug
+    golem-helper.py debug
 
 ### 4.2 Exploring — start every task here
 
 **tree** — nested instance tree. The fastest way to learn a place's layout.
 Defaults: path `game`, depth 2. Keep depth small on big places.
 
-    golem.py tree game --depth 2
-    golem.py tree Workspace --depth 3
+    golem-helper.py tree game --depth 2
+    golem-helper.py tree Workspace --depth 3
 
 **list** — children of one instance. Add `--recursive` for all descendants
 and `--max N` to cap them.
 
-    golem.py list ServerScriptService
-    golem.py list game --recursive --max 1000
+    golem-helper.py list ServerScriptService
+    golem-helper.py list game --recursive --max 1000
 
 **count** — cheap instance count, no payload. Good for orientation ("how big
 is this place?") and before/after checks.
 
-    golem.py count Workspace --class Part
+    golem-helper.py count Workspace --class Part
 
 **find** — find instances by name substring (case-sensitive) or by
 CollectionService tag. `--exact` matches the full name; `--class` and
 `--scope` narrow the search.
 
-    golem.py find Coin --class Part --scope Workspace
-    golem.py find --tag Choppable
+    golem-helper.py find Coin --class Part --scope Workspace
+    golem-helper.py find --tag Choppable
 
 **grep** — search inside script sources. Plain text, case-sensitive unless
 `-i`. Returns path, line number, and matching text.
 
-    golem.py grep applyDamage --scope ServerScriptService
+    golem-helper.py grep applyDamage --scope ServerScriptService
 
 ### 4.3 Reading instances
 
@@ -194,8 +194,8 @@ CollectionService tag. `--exact` matches the full name; `--class` and
 `--json` prints the whole record (properties, attributes, children);
 `--props A,B` adds extra properties.
 
-    golem.py read ServerScriptService/Main
-    golem.py read Workspace/Spawn --json
+    golem-helper.py read ServerScriptService/Main
+    golem-helper.py read Workspace/Spawn --json
 
 ### 4.4 Scripts and Lua
 
@@ -204,7 +204,7 @@ call. Source comes from stdin (heredoc) or `--source`. Modes: `create`
 (fails if the name exists), `update` (keeps the instance, replaces the
 source), `replace` (deletes and recreates).
 
-    golem.py script ServerScriptService Main --class Script --mode create <<'EOF'
+    golem-helper.py script ServerScriptService Main --class Script --mode create <<'EOF'
     print("hello")
     EOF
 
@@ -213,44 +213,44 @@ as an argument or pipe it in (`-`). Return plain values or tables; returned
 instances come back as records. Yields like `task.wait(1)` are fine. Never
 loop forever (see rule 2).
 
-    golem.py lua 'return 1+1'
-    golem.py lua - < code.lua
+    golem-helper.py lua 'return 1+1'
+    golem-helper.py lua - < code.lua
 
 **exec** — raw op call for anything without a dedicated command. Takes one
 JSON object with `op` and `args` (see §5).
 
-    golem.py exec '{"op":"list","args":{"path":"game"}}'
+    golem-helper.py exec '{"op":"list","args":{"path":"game"}}'
 
 ### 4.5 Organizing
 
 **delete** — delete one or more instances. Destructive: confirm with the
 user first.
 
-    golem.py delete Workspace/OldPart Workspace/OldModel
+    golem-helper.py delete Workspace/OldPart Workspace/OldModel
 
 **move** — reparent an instance.
 
-    golem.py move Workspace/Part ServerStorage
+    golem-helper.py move Workspace/Part ServerStorage
 
 **rename** — rename an instance. The new name must not contain `/`.
 
-    golem.py rename Workspace/Part1 FrontDoor
+    golem-helper.py rename Workspace/Part1 FrontDoor
 
 **group** — wrap instances into a new Model. After grouping, set the pivot
 (see `pivot`) before rotating the group.
 
-    golem.py group Workspace/Trunk Workspace/Canopy --name Tree
+    golem-helper.py group Workspace/Trunk Workspace/Canopy --name Tree
 
 **duplicate** — clone an instance, optionally N times. `--offset x,y,z`
 shifts each copy (copy i gets offset x i), so rows and grids are one
 command.
 
-    golem.py duplicate Workspace/Fence --count 5 --offset 4,0,0
+    golem-helper.py duplicate Workspace/Fence --count 5 --offset 4,0,0
 
 **selection** — read the Studio selection, or set it (highlights instances
 for the user), or clear it.
 
-    golem.py selection --set Workspace/PartA,Workspace/PartB
+    golem-helper.py selection --set Workspace/PartA,Workspace/PartB
 
 ### 4.6 Moving and rotating — use these, never raw CFrames
 
@@ -258,34 +258,34 @@ for the user), or clear it.
 teleports to coordinates. Optional `--orientation` sets absolute rotation
 in degrees.
 
-    golem.py place Workspace/Crate 10,5,0
+    golem-helper.py place Workspace/Crate 10,5,0
 
 **shift** — move by an offset in studs, in world space (default) or the
 part's own space (`--space local`).
 
-    golem.py shift Workspace/Crate 0,5,0
+    golem-helper.py shift Workspace/Crate 0,5,0
 
 **rotate** — THE way to rotate. Relative mode spins in place around an axis
 (`x`, `y`, `z`, or `up`, `right`, `forward`, or an `x,y,z` vector) in world
 or local space. Absolute mode (`--set`) writes the orientation in degrees.
 
-    golem.py rotate Workspace/Door --axis y --degrees 90
-    golem.py rotate Workspace/Door --set 0,90,0
+    golem-helper.py rotate Workspace/Door --axis y --degrees 90
+    golem-helper.py rotate Workspace/Door --set 0,90,0
 
 **face** — aim an instance at a world point, keeping its position. Good for
 branches, signs, cannons. `--axis` picks which side points at the target.
 
-    golem.py face Workspace/Cannon 0,5,30
+    golem-helper.py face Workspace/Cannon 0,5,30
 
 **scale** — resize by a relative multiplier. Models scale as a whole.
 
-    golem.py scale Workspace/Tree 1.5
+    golem-helper.py scale Workspace/Tree 1.5
 
 **pivot** — move a model or part pivot (the point it rotates around). Give
 `--position`, `--orientation`, or both. After grouping a build, put the
 pivot at its base so rotations look right.
 
-    golem.py pivot Workspace/Tree --position 0,0,0
+    golem-helper.py pivot Workspace/Tree --position 0,0,0
 
 ### 4.7 Surfaces, terrain, and physics
 
@@ -293,95 +293,95 @@ pivot at its base so rotations look right.
 `SmoothPlastic`, ...), transparency, and reflectance on parts. Models: all
 their parts. Combine flags freely.
 
-    golem.py paint Workspace/Wall --color #B0B0B0 --material SmoothPlastic
+    golem-helper.py paint Workspace/Wall --color #B0B0B0 --material SmoothPlastic
 
 **match** — copy color, material, transparency, and reflectance from one
 part onto others. Keeps builds visually consistent.
 
-    golem.py match Workspace/WallA Workspace/WallB Workspace/WallC
+    golem-helper.py match Workspace/WallA Workspace/WallB Workspace/WallC
 
 **anchor** — anchor parts so physics never moves them (models: all parts).
 `--off` unanchors. Static builds should always be anchored.
 
-    golem.py anchor Workspace/House
+    golem-helper.py anchor Workspace/House
 
 **collide** — collision on or off (models: all parts). `--off` makes parts
 walk-through.
 
-    golem.py collide Workspace/GhostWall --off
+    golem-helper.py collide Workspace/GhostWall --off
 
 **terrain** — fill or carve terrain. `--position` is required; blocks need
 `--size`, balls need `--radius`. `--action clear` carves (fills with Air).
 
-    golem.py terrain --action fill --shape block --position 0,-4,0 --size 128,8,128 --material Grass
+    golem-helper.py terrain --action fill --shape block --position 0,-4,0 --size 128,8,128 --material Grass
 
 ### 4.8 Gameplay helpers
 
 **light** — add or update a light inside a part. Types: `point`, `spot`,
 `surface`.
 
-    golem.py light Workspace/Lamp --type point --color #FFD9A0 --range 30 --brightness 2
+    golem-helper.py light Workspace/Lamp --type point --color #FFD9A0 --range 30 --brightness 2
 
 **sound** — add a Sound to a parent. `--play` previews it immediately,
 `--loop` loops it.
 
-    golem.py sound Workspace Radio 1837879082 --volume 0.5 --play
+    golem-helper.py sound Workspace Radio 1837879082 --volume 0.5 --play
 
 **scatter** — clone a template into a random disc around it. Trees, rocks,
 grass: build one, scatter the rest.
 
-    golem.py scatter Workspace/Tree --count 20 --radius 60 --y-jitter 2
+    golem-helper.py scatter Workspace/Tree --count 20 --radius 60 --y-jitter 2
 
 **weld** — join a model's parts with WeldConstraints so the whole build
 moves as one.
 
-    golem.py weld Workspace/Cart
+    golem-helper.py weld Workspace/Cart
 
 **hitbox** — invisible part sized to the target's bounding box. Click and
 chop targets, interaction zones. `--collide` makes it solid.
 
-    golem.py hitbox Workspace/Tree --padding 1
+    golem-helper.py hitbox Workspace/Tree --padding 1
 
 **prompt** — ProximityPrompt ("Press E to ...") on a part. `--object` is
 the title above it, `--hold` the hold time in seconds.
 
-    golem.py prompt Workspace/Tree "Chop" --object Tree --hold 0.5
+    golem-helper.py prompt Workspace/Tree "Chop" --object Tree --hold 0.5
 
 **particles** — attach a ParticleEmitter with a preset: `leaves`, `sparks`,
 `smoke`, `magic`, `fire`, `snow`, `rain`, `bubbles`, `dust`, `confetti`,
 `fireflies`.
 
-    golem.py particles Workspace/Torch fire --rate 40
+    golem-helper.py particles Workspace/Torch fire --rate 40
 
 **sign** — a readable wooden sign: board part with text on its face.
 
-    golem.py sign "Camp rules: no griefing" --position 0,6,10
+    golem-helper.py sign "Camp rules: no griefing" --position 0,6,10
 
 **attr** — Studio attributes: typed config on instances without scripts.
 `--set` repeats; values parse as integer, float, `true`/`false`, or string.
 
-    golem.py attr Workspace/Door --set Open=false --set LockLevel=3
+    golem-helper.py attr Workspace/Door --set Open=false --set LockLevel=3
 
 **tag** — add or remove CollectionService tags. Find tagged instances later
 with `find --tag`.
 
-    golem.py tag Workspace/Tree --add Choppable
+    golem-helper.py tag Workspace/Tree --add Choppable
 
 ### 4.9 VFX
 
 **beam** — glowing beam between two parts. Lasers, tethers, energy links.
 
-    golem.py beam Workspace/TowerA Workspace/TowerB --color #78B4FF --width 0.4
+    golem-helper.py beam Workspace/TowerA Workspace/TowerB --color #78B4FF --width 0.4
 
 **trail** — motion trail on a part. Shows when the part moves: sword
 swipes, comet tails.
 
-    golem.py trail Workspace/Sword --lifetime 0.6
+    golem-helper.py trail Workspace/Sword --lifetime 0.6
 
 **explosion** — one-shot visual explosion. Harmless by default: no physics
 damage.
 
-    golem.py explosion --position 0,10,0 --radius 8
+    golem-helper.py explosion --position 0,10,0 --radius 8
 
 ### 4.10 UI — build interfaces as instances, not code
 
@@ -405,32 +405,32 @@ Positions and sizes use `"xs,xo,ys,yo"` (scale/offset pairs); anchors use
 
 **ui_screen** — ScreenGui under StarterGui. The root of every interface.
 
-    golem.py ui_screen MainMenu
+    golem-helper.py ui_screen MainMenu
 
 **ui_frame** — rounded panel, the backbone of screens.
 
-    golem.py ui_frame StarterGui/MainMenu Panel --size 0.8,0,0.6,0 --radius 12
+    golem-helper.py ui_frame StarterGui/MainMenu Panel --size 0.8,0,0.6,0 --radius 12
 
 **ui_label** — text label. Fonts: `regular`, `medium`, `semibold`, `bold`,
 `mono`.
 
-    golem.py ui_label StarterGui/MainMenu/Panel Title --text "Item Shop" --font semibold --text-size 20
+    golem-helper.py ui_label StarterGui/MainMenu/Panel Title --text "Item Shop" --font semibold --text-size 20
 
 **ui_button** — text button with hover feedback built in.
 
-    golem.py ui_button StarterGui/MainMenu/Panel Buy --text "Buy"
+    golem-helper.py ui_button StarterGui/MainMenu/Panel Buy --text "Buy"
 
 **ui_input** — TextBox the player can type into.
 
-    golem.py ui_input StarterGui/MainMenu/Panel Name --placeholder "Your name..."
+    golem-helper.py ui_input StarterGui/MainMenu/Panel Name --placeholder "Your name..."
 
 **ui_image** — ImageLabel showing a Roblox asset id.
 
-    golem.py ui_image StarterGui/MainMenu/Panel Icon --asset 123456 --scale fit
+    golem-helper.py ui_image StarterGui/MainMenu/Panel Icon --asset 123456 --scale fit
 
 **ui_list** — UIListLayout that auto-arranges a container's children.
 
-    golem.py ui_list StarterGui/MainMenu/Panel --direction vertical --padding 8
+    golem-helper.py ui_list StarterGui/MainMenu/Panel --direction vertical --padding 8
 
 ### 4.11 Marketplace — browse and add assets
 
@@ -443,23 +443,23 @@ Do not call them in a loop; cache results and page with `--cursor`.
 price, and a thumbnail URL. Open the thumbnail to judge the asset before
 inserting.
 
-    golem.py search castle --category model --limit 5
+    golem-helper.py search castle --category model --limit 5
 
 **info** — details plus thumbnail for one asset.
 
-    golem.py info 487667385
+    golem-helper.py info 487667385
 
 **insert** — place an asset into the open place. ONLY free assets
 (`priceInRobux` null or 0) or assets the user owns. Paid or restricted
 assets fail with "Asset is not trusted". If that happens, pick a different
 result.
 
-    golem.py insert 487667385 Workspace --name "Castle Wall"
+    golem-helper.py insert 487667385 Workspace --name "Castle Wall"
 
 **apply** — set an asset-backed property: `Image`, `Texture`, `SoundId`,
 `MeshId`, and similar.
 
-    golem.py apply 123456 Workspace/Sign/Decal Texture
+    golem-helper.py apply 123456 Workspace/Sign/Decal Texture
 
 Workflow: search, open thumbnails, `info` the shortlist, `insert`, verify
 with `tree`/`read`, set a `waypoint`. Tell the user what you added and
@@ -479,22 +479,22 @@ AND the client, live while the test runs. `--all` adds prints.
 Workflow: build, Ctrl+S, `play`, wait 10-20 s so scripts can run and fail,
 `logs`, fix every error, `stop`, save, re-test until clean.
 
-    golem.py play
-    golem.py logs
-    golem.py stop
+    golem-helper.py play
+    golem-helper.py logs
+    golem-helper.py stop
 
 ### 4.13 Session and talking to the user
 
 **waypoint** — named undo checkpoint ("one clean undo away"). Set one
 before risky edits and at every milestone.
 
-    golem.py waypoint "before refactor"
+    golem-helper.py waypoint "before refactor"
 
 **undo** — one Studio undo step. Edit mode only.
 
 **look** — aim the user's editor camera at your work so they see it.
 
-    golem.py look Workspace/Castle --distance 60
+    golem-helper.py look Workspace/Castle --distance 60
 
 **say** — post a message to the Studio chat AND close the turn. Only for
 finished chunks of work (see §0).
@@ -596,7 +596,7 @@ length along the X axis.** A vertical trunk needs `Orientation (0, 0, 90)`.
 Always set orientation when creating such parts. `create` accepts top-level
 `position` {x,y,z} and `orientation` {x,y,z} in degrees:
 
-    golem.py exec '{"op":"create","args":{"class":"Part","parent":"Workspace","name":"Trunk","position":{"x":0,"y":6,"z":0},"orientation":{"x":0,"y":0,"z":90},"props":{"Shape":"Enum.PartType.Cylinder","Anchored":true,"Material":"Enum.Material.Wood","Color":"#8B5A2B","Size":{"type":"Vector3","x":12,"y":2,"z":2}}}}'
+    golem-helper.py exec '{"op":"create","args":{"class":"Part","parent":"Workspace","name":"Trunk","position":{"x":0,"y":6,"z":0},"orientation":{"x":0,"y":0,"z":90},"props":{"Shape":"Enum.PartType.Cylinder","Anchored":true,"Material":"Enum.Material.Wood","Color":"#8B5A2B","Size":{"type":"Vector3","x":12,"y":2,"z":2}}}}'
 
 (Height 12 runs along X, so orientation (0,0,90) stands it up. Ball canopies
 need no orientation.)
