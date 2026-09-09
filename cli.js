@@ -7,6 +7,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 
 const DB_URL = "https://roblox-golem-default-rtdb.firebaseio.com";
 const POLL_INTERVAL_MS = 2000;
@@ -40,8 +41,8 @@ function printHelp() {
   console.log(`golem-bridge v${VERSION} — connect an AI agent to Roblox Studio via the Golem plugin.
 
 Usage:
-  golem-bridge connect <channelId> [--print]
-  golem-bridge reconnect <channelId> [--print]
+  golem-bridge connect <channelId> [--print] [--yes]
+  golem-bridge reconnect <channelId> [--print] [--yes]
   golem-bridge disconnect
   golem-bridge --help
   golem-bridge --version
@@ -49,6 +50,7 @@ Usage:
   <channelId>  shown in the Golem plugin widget inside Roblox Studio.
                Fresh on every Studio start.
   --print      audit mode: verify Studio, then print both files without writing.
+  --yes        answer the install question with yes (for scripts).
 
 connect     link this folder to a Studio session (writes ./.golem/).
 reconnect   same, for a rotated token: replaces the old session files.
@@ -57,7 +59,7 @@ disconnect  forget this session (removes ./.golem/). Studio is unaffected.
 
 connect verifies Studio is alive over HTTPS, then stamps your channel ID
 into local copies of the bundled golem.py and golem.md. No code is ever
-downloaded from the network. You can still review both files first with
+downloaded from the network. It lists the files and asks before writing anything; review first with
 --print, or read them in this package before running anything.`);
 }
 
@@ -71,6 +73,25 @@ function validateChannel(channelId) {
     fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
   }
   return channelId;
+}
+
+function askYes(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      try {
+        rl.close();
+      } catch {
+        // already closed (EOF on stdin)
+      }
+      resolve(value);
+    };
+    rl.question(question + " ", (answer) => finish(/^\s*y(es)?\s*$/i.test(answer || "")));
+    rl.on("close", () => finish(false));
+  });
 }
 
 async function fetchText(url, body) {
@@ -175,7 +196,7 @@ function disconnectLocal() {
   console.log("Studio is unaffected. To link again: npx golem-bridge connect <channelId>");
 }
 
-async function reconnect(channelId, printOnly) {
+async function reconnect(channelId, printOnly, autoYes) {
   validateChannel(channelId);
   const old = readSavedChannel();
   if (!printOnly && old && old.toLowerCase() === channelId.toLowerCase()) {
@@ -185,10 +206,10 @@ async function reconnect(channelId, printOnly) {
   if (!printOnly && old) {
     console.log(`Replacing session files for channel ${old}.`);
   }
-  await connect(channelId, printOnly);
+  await connect(channelId, printOnly, autoYes);
 }
 
-async function connect(channelId, printOnly) {
+async function connect(channelId, printOnly, autoYes) {
   validateChannel(channelId);
   console.log(`Contacting Golem plugin on channel ${channelId} ...`);
   let entry;
@@ -233,6 +254,16 @@ async function connect(channelId, printOnly) {
   }
 
   const dir = path.join(process.cwd(), ".golem");
+  const pyHash = sha256(files.source);
+  const mdHash = sha256(files.prompt);
+  if (!autoYes) {
+    console.log("Ready to write 2 files (they ship in this package \u2014 nothing was downloaded):");
+    console.log("  " + path.join(".golem", "golem.py") + " (" + files.source.length + " bytes, sha256:" + pyHash.slice(0, 16) + "...) \u2014 the Studio helper");
+    console.log("  " + path.join(".golem", "golem.md") + " (" + files.prompt.length + " bytes, sha256:" + mdHash.slice(0, 16) + "...) \u2014 the tool manual");
+    if (!(await askYes("Install these files? [y/n]"))) {
+      fail("aborted: nothing was written. Re-run with --yes to skip this question, or --print to inspect first.", 1);
+    }
+  }
   fs.mkdirSync(dir, { recursive: true });
 
   const pyPath = path.join(dir, "golem.py");
@@ -275,19 +306,24 @@ async function main() {
   }
   const channelId = args[1];
   const printOnly = args.includes("--print");
+  const autoYes = args.includes("--yes") || args.includes("-y");
   if (!channelId || channelId.startsWith("-")) {
     printHelp();
     process.exit(2);
   }
   try {
     if (isReconnect) {
-      await reconnect(channelId, printOnly);
+      await reconnect(channelId, printOnly, autoYes);
     } else {
-      await connect(channelId, printOnly);
+      await connect(channelId, printOnly, autoYes);
     }
   } catch (err) {
     fail(err.message, 1);
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { askYes };
