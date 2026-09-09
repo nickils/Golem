@@ -1,12 +1,12 @@
 {
   "name": "golem-bridge",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "description": "Connects an AI coding agent to a running Roblox Studio session via the Golem plugin.",
   "bin": {
     "golem-bridge": "./cli.js"
   },
   "type": "commonjs",
-  "files": ["cli.js", "golem-helper.py", "golem-tools.md", "README.md"],
+  "files": ["cli.js", "golem-tools.md", "README.md"],
   "keywords": ["roblox", "roblox-studio", "ai", "cli"],
   "engines": {
     "node": ">=18"
