@@ -25,30 +25,7 @@ python3 ./.golem/golem.py ping
 `ping` should return `"ok": true` plus the open place name. Then the agent
 reads `./.golem/golem.md` for the full tool reference.
 
-## Studio side
-
-Install the Golem plugin from the Creator Store:
-
-```
-https://create.roblox.com/store/asset/<ASSET_ID>
-```
-
-(Replace with the real link after publishing.)
-
 ## Files
 
 - `cli.js` - source of the `golem-bridge` package
 - `package.json` - npm manifest
-
-## Notes
-
-- Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
-is the secret. It is generated once and stored in the Studio settings.
-- The plugin serves `golem.py` and `golem.md` on demand. They are never
-stored on the relay.
-
-## Release
-
-```sh
-npm publish
-```
