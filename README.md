@@ -4,7 +4,8 @@
 running the Golem plugin.
 
 This repo holds the npm package (the AI side). The Studio plugin itself is
-distributed through the Roblox Creator Store, not from here.
+distributed through the Roblox Creator Store; its source is published as
+a file release on this repo's Releases page.
 
 ## How it connects
 
@@ -17,17 +18,25 @@ Connect to my Roblox Studio, Run: npx golem-bridge connect <channelId>
 The line is a session token: Studio mints a fresh channel on every start
 and wipes the old one.
 
-The user sends that line to their AI. It downloads this package, which
-checks Studio is alive, then stamps the channel into local copies of
-the two connection files under `./.golem/`:
+Best flow: the user runs the line themselves, so the secret never enters
+AI chat, then tells the AI it is connected. Or the user sends the line to
+their AI and it runs it. Either way:
 
 ```sh
 npx golem-bridge connect <channelId>
-python3 ./.golem/golem-helper.py ping
 ```
 
-`ping` should return `"ok": true` plus the open place name. Then the agent
-reads `./.golem/golem-tools.md` for the full tool reference.
+verifies Studio is alive, saves the 16-char channel to `./.golem/channel`,
+and prints the tool manual. Nothing else is installed: every command runs
+straight from this package:
+
+```sh
+npx golem-bridge ping
+npx golem-bridge tree --depth 3
+```
+
+`ping` should return `"ok": true` plus the open place name. `manual`
+reprints the reference any time (`help <tool>` explains one tool).
 
 After a Studio restart, relink with the new line:
 
@@ -43,9 +52,8 @@ npx golem-bridge disconnect
 
 ## Files
 
-- `cli.js` - source of the `golem-bridge` package
-- `golem-helper.py` - the Studio helper, stamped with the channel at connect
-- `golem-tools.md` - the agent manual
+- `cli.js` - the whole package: session setup plus every Studio tool
+- `golem-tools.md` - the agent manual (printed by `connect` and `manual`)
 - `package.json` - npm manifest
 
 ## Notes
@@ -53,8 +61,10 @@ npx golem-bridge disconnect
 - Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
 is the secret. Studio mints a fresh one on every start and wipes the old
 channel, so a leaked line dies with the session.
-- `golem-helper.py` and `golem-tools.md` ship in this package. The relay carries
-small JSON commands and results only.
+- Only `cli.js` and `golem-tools.md` ship in this package. The relay carries
+small JSON commands and results only, and `connect` writes nothing but
+the 16-char channel id.
+- npm account `skellzy` and GitHub `nickils` are the same person.
 
 - Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
 in the plugin kills it on the spot and issues a new one. (Every Studio
@@ -66,13 +76,9 @@ Trust model: whoever holds the channel ID can send commands to that Studio
 session and read the results. Treat the setup line like a password. It
 expires on every Studio restart.
 
-- `connect` verifies
-Studio is alive over HTTPS and stamps your channel ID into local copies.
-Read all three files here before running anything, or fetch with
-`--print` to inspect without writing.
-- `connect` asks before it writes: it lists the files first, then waits
-for y. Pass `--yes` to skip the question (scripts), `--print` to look
-without writing.
+- `connect` verifies Studio is alive over HTTPS, saves the channel id,
+and prints the manual. Read both files here before running anything, or
+pass `--print` to verify without saving.
 - `connect` only accepts hex channel IDs, talks HTTPS to the relay only
 (never follows redirects), times out stalled requests, and caps response
 sizes. The only data it acts on is a small `ping` reply.
