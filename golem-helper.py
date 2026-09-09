@@ -6,62 +6,62 @@ result channel. This helper sends a command, waits for the matching result,
 and prints it as JSON. Python 3.8+, no dependencies.
 
 Usage:
-    python3 golem.py ping
-    python3 golem.py debug                           # full connection + marketplace diagnostics
-    python3 golem.py exec '{"op":"list","args":{"path":"game"}}'
-    python3 golem.py lua 'return 1+1'
-    python3 golem.py lua - < code.lua
-    python3 golem.py list ServerScriptService
-    python3 golem.py list game --recursive --max 1000
-    python3 golem.py tree game --depth 3
-    python3 golem.py read ServerScriptService/Main
-    python3 golem.py find Coin --class Part --scope Workspace
-    python3 golem.py grep applyDamage --scope ServerScriptService
-    python3 golem.py script ReplicatedStorage Config --class ModuleScript < source.lua
-    python3 golem.py delete Workspace/OldPart
-    python3 golem.py move Workspace/Part ServerStorage
-    python3 golem.py selection --set Workspace/Part
-    python3 golem.py waypoint "before refactor"
-    python3 golem.py turn begin
-    python3 golem.py turn end --note "short reply the user reads in the chat"
-    python3 golem.py place <path> <x,y,z> [--orientation x,y,z]   # absolute position
-    python3 golem.py paint <path> [--color #RRGGBB] [--material Grass] [--transparency 0.2]
-    python3 golem.py rename <path> <newName>
-    python3 golem.py look <path> [--distance 40]     # aim the editor camera
-    python3 golem.py count [scope] [--class Part]    # quick instance count
-    python3 golem.py undo                            # one Studio undo step
-    python3 golem.py anchor <path> [--off]           # anchor parts (models: all parts)
-    python3 golem.py collide <path> [--off]          # toggle collision
-    python3 golem.py light <path> [--type point|spot|surface] [--color #RRGGBB] [--range 30] [--brightness 1]
-    python3 golem.py sound <parent> <audioId> [--volume 0.5] [--loop] [--play] [--name N]
-    python3 golem.py scatter <path> --count 20 --radius 60 [--y-jitter 2] [--parent P]
-    python3 golem.py weld <path>                        # weld a model's parts together
-    python3 golem.py hitbox <path> [--padding 1] [--name N] [--collide]
-    python3 golem.py prompt <path> "Chop" [--object Tree] [--hold 0.5] [--distance 8]
-    python3 golem.py particles <path> leaves|sparks|smoke|magic|fire|snow|rain|bubbles|dust|confetti|fireflies [--rate N] [--color #RRGGBB]
-    python3 golem.py sign "Camp rules: no griefing" [--position x,y,z] [--parent P] [--size 6,4,0.5]
-    python3 golem.py attr <path> [--set k=v ...] [--clear k ...]     # Studio attributes
-    python3 golem.py beam <FROM> <TO> [--color #RRGGBB] [--width 0.4] [--curve 0]   # glowing beam between parts
-    python3 golem.py trail <path> [--color #RRGGBB] [--lifetime 0.6]  # motion trail on a moving part
-    python3 golem.py explosion [--position x,y,z] [--radius 8]        # one-shot boom (visual only)
-    python3 golem.py ui_screen <name> [--parent P] [--order N]        # ScreenGui under StarterGui
-    python3 golem.py ui_frame <parent> <name> [--position 0,0,0,0] [--size 1,0,1,0] [--anchor 0,0]
+    python3 golem-helper.py ping
+    python3 golem-helper.py debug                           # full connection + marketplace diagnostics
+    python3 golem-helper.py exec '{"op":"list","args":{"path":"game"}}'
+    python3 golem-helper.py lua 'return 1+1'
+    python3 golem-helper.py lua - < code.lua
+    python3 golem-helper.py list ServerScriptService
+    python3 golem-helper.py list game --recursive --max 1000
+    python3 golem-helper.py tree game --depth 3
+    python3 golem-helper.py read ServerScriptService/Main
+    python3 golem-helper.py find Coin --class Part --scope Workspace
+    python3 golem-helper.py grep applyDamage --scope ServerScriptService
+    python3 golem-helper.py script ReplicatedStorage Config --class ModuleScript < source.lua
+    python3 golem-helper.py delete Workspace/OldPart
+    python3 golem-helper.py move Workspace/Part ServerStorage
+    python3 golem-helper.py selection --set Workspace/Part
+    python3 golem-helper.py waypoint "before refactor"
+    python3 golem-helper.py turn begin
+    python3 golem-helper.py turn end --note "short reply the user reads in the chat"
+    python3 golem-helper.py place <path> <x,y,z> [--orientation x,y,z]   # absolute position
+    python3 golem-helper.py paint <path> [--color #RRGGBB] [--material Grass] [--transparency 0.2]
+    python3 golem-helper.py rename <path> <newName>
+    python3 golem-helper.py look <path> [--distance 40]     # aim the editor camera
+    python3 golem-helper.py count [scope] [--class Part]    # quick instance count
+    python3 golem-helper.py undo                            # one Studio undo step
+    python3 golem-helper.py anchor <path> [--off]           # anchor parts (models: all parts)
+    python3 golem-helper.py collide <path> [--off]          # toggle collision
+    python3 golem-helper.py light <path> [--type point|spot|surface] [--color #RRGGBB] [--range 30] [--brightness 1]
+    python3 golem-helper.py sound <parent> <audioId> [--volume 0.5] [--loop] [--play] [--name N]
+    python3 golem-helper.py scatter <path> --count 20 --radius 60 [--y-jitter 2] [--parent P]
+    python3 golem-helper.py weld <path>                        # weld a model's parts together
+    python3 golem-helper.py hitbox <path> [--padding 1] [--name N] [--collide]
+    python3 golem-helper.py prompt <path> "Chop" [--object Tree] [--hold 0.5] [--distance 8]
+    python3 golem-helper.py particles <path> leaves|sparks|smoke|magic|fire|snow|rain|bubbles|dust|confetti|fireflies [--rate N] [--color #RRGGBB]
+    python3 golem-helper.py sign "Camp rules: no griefing" [--position x,y,z] [--parent P] [--size 6,4,0.5]
+    python3 golem-helper.py attr <path> [--set k=v ...] [--clear k ...]     # Studio attributes
+    python3 golem-helper.py beam <FROM> <TO> [--color #RRGGBB] [--width 0.4] [--curve 0]   # glowing beam between parts
+    python3 golem-helper.py trail <path> [--color #RRGGBB] [--lifetime 0.6]  # motion trail on a moving part
+    python3 golem-helper.py explosion [--position x,y,z] [--radius 8]        # one-shot boom (visual only)
+    python3 golem-helper.py ui_screen <name> [--parent P] [--order N]        # ScreenGui under StarterGui
+    python3 golem-helper.py ui_frame <parent> <name> [--position 0,0,0,0] [--size 1,0,1,0] [--anchor 0,0]
                        [--color #RRGGBB] [--radius 8] [--transparency 0] [--clip]
-    python3 golem.py ui_label <parent> <name> --text "..." [--align left|center|right] [--wrap]
+    python3 golem-helper.py ui_label <parent> <name> --text "..." [--align left|center|right] [--wrap]
                        [--color #RRGGBB] [--font medium] [--text-size 16]
-    python3 golem.py ui_button <parent> <name> --text "..." [--color #RRGGBB] [--text-color #RRGGBB]
-    python3 golem.py ui_input <parent> <name> [--placeholder "..."] [--background #RRGGBB]
-    python3 golem.py ui_image <parent> <name> --asset <assetId> [--scale fit|stretch|tile]
-    python3 golem.py ui_list <parent> [--direction vertical|horizontal] [--padding 8]
+    python3 golem-helper.py ui_button <parent> <name> --text "..." [--color #RRGGBB] [--text-color #RRGGBB]
+    python3 golem-helper.py ui_input <parent> <name> [--placeholder "..."] [--background #RRGGBB]
+    python3 golem-helper.py ui_image <parent> <name> --asset <assetId> [--scale fit|stretch|tile]
+    python3 golem-helper.py ui_list <parent> [--direction vertical|horizontal] [--padding 8]
                        [--halign left|center|right] [--valign top|middle|bottom]
-    python3 golem.py play [--mode play|run]               # start play-testing the game
-    python3 golem.py stop                                 # stop the play test
-    python3 golem.py logs [--all] [--limit N] [--since TS]  # output log (errors+warnings by default)
-    python3 golem.py tag <path> --add Choppable [--remove Old]       # + find --tag Choppable
-    python3 golem.py match <from> <to...>              # copy color/material onto targets
-    python3 golem.py search <query> [--category C] [--limit N]   # marketplace (runs directly, no Studio)
-    python3 golem.py info <assetId>                   # asset details (runs directly, no Studio)
-    python3 golem.py insert <assetId> [parent]        # place a FREE marketplace asset into the place
+    python3 golem-helper.py play [--mode play|run]               # start play-testing the game
+    python3 golem-helper.py stop                                 # stop the play test
+    python3 golem-helper.py logs [--all] [--limit N] [--since TS]  # output log (errors+warnings by default)
+    python3 golem-helper.py tag <path> --add Choppable [--remove Old]       # + find --tag Choppable
+    python3 golem-helper.py match <from> <to...>              # copy color/material onto targets
+    python3 golem-helper.py search <query> [--category C] [--limit N]   # marketplace (runs directly, no Studio)
+    python3 golem-helper.py info <assetId>                   # asset details (runs directly, no Studio)
+    python3 golem-helper.py insert <assetId> [parent]        # place a FREE marketplace asset into the place
 
 Add --timeout N (seconds, default 120) to any command.
 Exit codes: 0 = ok, 1 = Studio reported an error, 2 = transport/usage error.
@@ -327,7 +327,7 @@ def status():
 
 def _turn_reminder(entry):
     if isinstance(entry, dict) and entry.get("turnOpen"):
-        helper = (sys.argv and sys.argv[0]) or "golem.py"
+        helper = (sys.argv and sys.argv[0]) or "golem-helper.py"
         n = entry.get("turnTools")
         head = (">> TURN STILL OPEN (%d tools) - do NOT reply yet." % n
                 if isinstance(n, int) else ">> TURN STILL OPEN - do NOT reply yet.")
@@ -355,7 +355,7 @@ def _out(data, as_json=False, raw_field=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Golem helper for Roblox Studio", prog="golem.py")
+    ap = argparse.ArgumentParser(description="Golem helper for Roblox Studio", prog="golem-helper.py")
     ap.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for Studio (default 120)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
