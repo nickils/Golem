@@ -59,18 +59,16 @@ Trust model: whoever holds the channel ID can send commands to that Studio
 session and read the results. Treat the setup line like a password. It
 expires on every Studio restart.
 
-- The CLI (`cli.js`, about 200 lines) is the only code that runs on the
-agent side. Read it here, or fetch without writing anything:
-`npx golem-bridge connect <channelId> --print`.
+- `connect` verifies
+Studio is alive over HTTPS and stamps your channel ID into local copies.
+Read all three files here before running anything, or fetch with
+`--print` to inspect without writing.
 - `connect` only accepts hex channel IDs, talks HTTPS to the relay only
-(never follows redirects), times out stalled requests, caps response
-sizes, validates the payload shape before writing, and prints SHA-256
-hashes of both files. It writes nothing unless every check passes, and
-tells you to review both files before running anything.
+(never follows redirects), times out stalled requests, and caps response
+sizes. The only data it acts on is a small `ping` reply.
 - There are no baked-in Firebase credentials or signing keys: the channel
 ID itself is the capability, and transport runs over HTTPS. Public client
 code cannot hold a secret, so any "signed responses" scheme here would be
 theater rather than security.
 - Socket.dev flags the "URL strings" in this package (the relay address).
-That is informational: the relay address is the product. The setup payload
-is validated as described above before anything is written.
+That is informational: the relay address is the product.
