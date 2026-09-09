@@ -1,0 +1,23 @@
+{
+  "name": "golem-bridge",
+  "version": "1.0.1",
+  "description": "Connects an AI coding agent to a running Roblox Studio session via the Golem plugin.",
+  "bin": {
+    "golem-bridge": "./cli.js"
+  },
+  "type": "commonjs",
+  "files": ["cli.js", "README.md"],
+  "keywords": ["roblox", "roblox-studio", "ai", "cli"],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nickils/Golem.git"
+  },
+  "homepage": "https://github.com/nickils/Golem#readme",
+  "bugs": {
+    "url": "https://github.com/nickils/Golem/issues"
+  }
+}
