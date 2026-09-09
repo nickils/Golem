@@ -15,7 +15,7 @@ Connect to my Roblox Studio, Run: npx golem-bridge connect <channelId>
 ```
 
 The line is a session token: Studio mints a fresh channel on every start
-and wipes the old one. After a restart, re-run connect with the new line.
+and wipes the old one.
 
 The user sends that line to their AI. It downloads this package, which asks
 the plugin for its two connection files and stores them under `./.golem/`:
@@ -27,6 +27,18 @@ python3 ./.golem/golem.py ping
 
 `ping` should return `"ok": true` plus the open place name. Then the agent
 reads `./.golem/golem.md` for the full tool reference.
+
+After a Studio restart, relink with the new line:
+
+```sh
+npx golem-bridge reconnect <newChannelId>
+```
+
+Done with a session? Forget it locally (Studio is unaffected):
+
+```sh
+npx golem-bridge disconnect
+```
 
 ## Files
 
@@ -62,5 +74,3 @@ theater rather than security.
 - Socket.dev flags the "URL strings" in this package (the relay address).
 That is informational: the relay address is the product. The setup payload
 is validated as described above before anything is written.
-npm publish
-```
