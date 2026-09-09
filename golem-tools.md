@@ -13,24 +13,28 @@ modify the user's open place in real time: browse the Explorer tree, read and
 write scripts, create and edit instances and properties, run Lua inside
 Studio, manage the selection, and set undo checkpoints.
 
-Your connection (already configured, nothing to change):
+Your connection is a SESSION token: Studio mints a fresh channel on
+every start and wipes the old one. It lives in `./.golem/channel`
+(written by `connect`, read automatically - never print it, never paste
+it anywhere: anyone holding it can drive this Studio session).
 
-- Relay database: `__DB_URL__`
-- Your private channel: `__CHANNEL_ID__`
+Two ways to get connected: the user may connect for you (then just run
+`npx golem-bridge status` to confirm and start working), or they paste
+you the setup line and you run `npx golem-bridge connect <channelId>`
+yourself.
 
-The channel is a SESSION token: Studio mints a fresh one on every start
-and wipes the old channel. If commands suddenly start timing out mid-task,
-the user probably restarted Studio. Ask them for the new line from the
-plugin widget and run `npx golem-bridge reconnect <newId>`.
+If commands suddenly start timing out mid-task, the user probably
+restarted Studio. Ask them for the new line from the plugin widget and
+run `npx golem-bridge reconnect <newId>`.
 
 ## 0. The turn rule — read this first
 
 Every task that uses tools follows one ritual. No exceptions.
 
 ```
-python3 ./.golem/golem-helper.py turn begin
+npx golem-bridge turn begin
 ... your work (tree, read, script, create, ...) ...
-python3 ./.golem/golem-helper.py turn end --note "short reply the user reads"
+npx golem-bridge turn end --note "short reply the user reads"
 ```
 
 What this does: `turn begin` opens a group in the user's Studio chat, every
@@ -62,16 +66,18 @@ Rules:
 No tools needed for a reply (a greeting, a question, an explanation)? Then
 no turn is needed either. Just reply normally.
 
-## 1. The helper
+## 1. The command
 
-All Studio commands go through one script: `./.golem/golem-helper.py`
-(zero-dependency Python 3, your channel already baked in). Below,
-`golem-helper.py ...` always means:
+All Studio commands go through one CLI: `npx golem-bridge`
+(zero-dependency Node - nothing is installed, every command runs
+straight from the package). Below, `golem-bridge ...` always means:
 
-    python3 ./.golem/golem-helper.py ...
+    npx golem-bridge ...
 
-Keep it in `./.golem/`. If it is ever missing, ask the user for their
-channel ID (shown in the Golem plugin widget) and re-run:
+Your channel lives in `./.golem/channel` (written by `connect`, read
+automatically - you never need to look at it). If commands say you are
+not connected, ask the user for their channel ID (shown in the Golem
+plugin widget) and run:
 
     npx golem-bridge connect <channelId>
 
@@ -82,7 +88,7 @@ new session with the fresh line from the widget:
 
 Then check the connection:
 
-    golem-helper.py ping
+    npx golem-bridge ping
 
 `ping` must return `"ok": true` plus the place name. If it times out,
 Roblox Studio is not running. Tell the user and retry when they confirm
@@ -90,8 +96,9 @@ it is open. **Studio must stay open while you work.** Commands sent while
 it is closed are dropped (only commands from the ~45 s before startup may
 still run).
 
-Every command takes ~1-3 s (relay latency). That is normal. Do not retry
-faster; the helper already waits. Every result is JSON:
+Every command takes a few seconds (relay latency plus a short startup).
+That is normal. Do not retry faster; the CLI already waits. Every
+result is JSON:
 
     {"ok": true, "result": {...}, "turnOpen": false}
 
@@ -144,49 +151,49 @@ contain any UTF-8 text (odd bytes are sanitized automatically).
 command on a fresh setup, and the "is Studio open?" test whenever commands
 start timing out.
 
-    golem-helper.py ping
+    npx golem-bridge ping
 
 **status** — is the plugin alive? Reads the channel's recent beacons, no
 Studio round-trip needed. Use it when `ping` times out to tell "Studio is
 closed" apart from "the relay is broken".
 
-    golem-helper.py status
+    npx golem-bridge status
 
 **debug** — full diagnostics: relay round-trip, versions, commands served,
 error count. Use when something behaves strangely.
 
-    golem-helper.py debug
+    npx golem-bridge debug
 
 ### 4.2 Exploring — start every task here
 
 **tree** — nested instance tree. The fastest way to learn a place's layout.
 Defaults: path `game`, depth 2. Keep depth small on big places.
 
-    golem-helper.py tree game --depth 2
-    golem-helper.py tree Workspace --depth 3
+    npx golem-bridge tree game --depth 2
+    npx golem-bridge tree Workspace --depth 3
 
 **list** — children of one instance. Add `--recursive` for all descendants
 and `--max N` to cap them.
 
-    golem-helper.py list ServerScriptService
-    golem-helper.py list game --recursive --max 1000
+    npx golem-bridge list ServerScriptService
+    npx golem-bridge list game --recursive --max 1000
 
 **count** — cheap instance count, no payload. Good for orientation ("how big
 is this place?") and before/after checks.
 
-    golem-helper.py count Workspace --class Part
+    npx golem-bridge count Workspace --class Part
 
 **find** — find instances by name substring (case-sensitive) or by
 CollectionService tag. `--exact` matches the full name; `--class` and
 `--scope` narrow the search.
 
-    golem-helper.py find Coin --class Part --scope Workspace
-    golem-helper.py find --tag Choppable
+    npx golem-bridge find Coin --class Part --scope Workspace
+    npx golem-bridge find --tag Choppable
 
 **grep** — search inside script sources. Plain text, case-sensitive unless
 `-i`. Returns path, line number, and matching text.
 
-    golem-helper.py grep applyDamage --scope ServerScriptService
+    npx golem-bridge grep applyDamage --scope ServerScriptService
 
 ### 4.3 Reading instances
 
@@ -194,8 +201,8 @@ CollectionService tag. `--exact` matches the full name; `--class` and
 `--json` prints the whole record (properties, attributes, children);
 `--props A,B` adds extra properties.
 
-    golem-helper.py read ServerScriptService/Main
-    golem-helper.py read Workspace/Spawn --json
+    npx golem-bridge read ServerScriptService/Main
+    npx golem-bridge read Workspace/Spawn --json
 
 ### 4.4 Scripts and Lua
 
@@ -204,7 +211,7 @@ call. Source comes from stdin (heredoc) or `--source`. Modes: `create`
 (fails if the name exists), `update` (keeps the instance, replaces the
 source), `replace` (deletes and recreates).
 
-    golem-helper.py script ServerScriptService Main --class Script --mode create <<'EOF'
+    npx golem-bridge script ServerScriptService Main --class Script --mode create <<'EOF'
     print("hello")
     EOF
 
@@ -213,44 +220,44 @@ as an argument or pipe it in (`-`). Return plain values or tables; returned
 instances come back as records. Yields like `task.wait(1)` are fine. Never
 loop forever (see rule 2).
 
-    golem-helper.py lua 'return 1+1'
-    golem-helper.py lua - < code.lua
+    npx golem-bridge lua 'return 1+1'
+    npx golem-bridge lua - < code.lua
 
 **exec** — raw op call for anything without a dedicated command. Takes one
 JSON object with `op` and `args` (see §5).
 
-    golem-helper.py exec '{"op":"list","args":{"path":"game"}}'
+    npx golem-bridge exec '{"op":"list","args":{"path":"game"}}'
 
 ### 4.5 Organizing
 
 **delete** — delete one or more instances. Destructive: confirm with the
 user first.
 
-    golem-helper.py delete Workspace/OldPart Workspace/OldModel
+    npx golem-bridge delete Workspace/OldPart Workspace/OldModel
 
 **move** — reparent an instance.
 
-    golem-helper.py move Workspace/Part ServerStorage
+    npx golem-bridge move Workspace/Part ServerStorage
 
 **rename** — rename an instance. The new name must not contain `/`.
 
-    golem-helper.py rename Workspace/Part1 FrontDoor
+    npx golem-bridge rename Workspace/Part1 FrontDoor
 
 **group** — wrap instances into a new Model. After grouping, set the pivot
 (see `pivot`) before rotating the group.
 
-    golem-helper.py group Workspace/Trunk Workspace/Canopy --name Tree
+    npx golem-bridge group Workspace/Trunk Workspace/Canopy --name Tree
 
 **duplicate** — clone an instance, optionally N times. `--offset x,y,z`
 shifts each copy (copy i gets offset x i), so rows and grids are one
 command.
 
-    golem-helper.py duplicate Workspace/Fence --count 5 --offset 4,0,0
+    npx golem-bridge duplicate Workspace/Fence --count 5 --offset 4,0,0
 
 **selection** — read the Studio selection, or set it (highlights instances
 for the user), or clear it.
 
-    golem-helper.py selection --set Workspace/PartA,Workspace/PartB
+    npx golem-bridge selection --set Workspace/PartA,Workspace/PartB
 
 ### 4.6 Moving and rotating — use these, never raw CFrames
 
@@ -258,34 +265,34 @@ for the user), or clear it.
 teleports to coordinates. Optional `--orientation` sets absolute rotation
 in degrees.
 
-    golem-helper.py place Workspace/Crate 10,5,0
+    npx golem-bridge place Workspace/Crate 10,5,0
 
 **shift** — move by an offset in studs, in world space (default) or the
 part's own space (`--space local`).
 
-    golem-helper.py shift Workspace/Crate 0,5,0
+    npx golem-bridge shift Workspace/Crate 0,5,0
 
 **rotate** — THE way to rotate. Relative mode spins in place around an axis
 (`x`, `y`, `z`, or `up`, `right`, `forward`, or an `x,y,z` vector) in world
 or local space. Absolute mode (`--set`) writes the orientation in degrees.
 
-    golem-helper.py rotate Workspace/Door --axis y --degrees 90
-    golem-helper.py rotate Workspace/Door --set 0,90,0
+    npx golem-bridge rotate Workspace/Door --axis y --degrees 90
+    npx golem-bridge rotate Workspace/Door --set 0,90,0
 
 **face** — aim an instance at a world point, keeping its position. Good for
 branches, signs, cannons. `--axis` picks which side points at the target.
 
-    golem-helper.py face Workspace/Cannon 0,5,30
+    npx golem-bridge face Workspace/Cannon 0,5,30
 
 **scale** — resize by a relative multiplier. Models scale as a whole.
 
-    golem-helper.py scale Workspace/Tree 1.5
+    npx golem-bridge scale Workspace/Tree 1.5
 
 **pivot** — move a model or part pivot (the point it rotates around). Give
 `--position`, `--orientation`, or both. After grouping a build, put the
 pivot at its base so rotations look right.
 
-    golem-helper.py pivot Workspace/Tree --position 0,0,0
+    npx golem-bridge pivot Workspace/Tree --position 0,0,0
 
 ### 4.7 Surfaces, terrain, and physics
 
@@ -293,95 +300,95 @@ pivot at its base so rotations look right.
 `SmoothPlastic`, ...), transparency, and reflectance on parts. Models: all
 their parts. Combine flags freely.
 
-    golem-helper.py paint Workspace/Wall --color #B0B0B0 --material SmoothPlastic
+    npx golem-bridge paint Workspace/Wall --color #B0B0B0 --material SmoothPlastic
 
 **match** — copy color, material, transparency, and reflectance from one
 part onto others. Keeps builds visually consistent.
 
-    golem-helper.py match Workspace/WallA Workspace/WallB Workspace/WallC
+    npx golem-bridge match Workspace/WallA Workspace/WallB Workspace/WallC
 
 **anchor** — anchor parts so physics never moves them (models: all parts).
 `--off` unanchors. Static builds should always be anchored.
 
-    golem-helper.py anchor Workspace/House
+    npx golem-bridge anchor Workspace/House
 
 **collide** — collision on or off (models: all parts). `--off` makes parts
 walk-through.
 
-    golem-helper.py collide Workspace/GhostWall --off
+    npx golem-bridge collide Workspace/GhostWall --off
 
 **terrain** — fill or carve terrain. `--position` is required; blocks need
 `--size`, balls need `--radius`. `--action clear` carves (fills with Air).
 
-    golem-helper.py terrain --action fill --shape block --position 0,-4,0 --size 128,8,128 --material Grass
+    npx golem-bridge terrain --action fill --shape block --position 0,-4,0 --size 128,8,128 --material Grass
 
 ### 4.8 Gameplay helpers
 
 **light** — add or update a light inside a part. Types: `point`, `spot`,
 `surface`.
 
-    golem-helper.py light Workspace/Lamp --type point --color #FFD9A0 --range 30 --brightness 2
+    npx golem-bridge light Workspace/Lamp --type point --color #FFD9A0 --range 30 --brightness 2
 
 **sound** — add a Sound to a parent. `--play` previews it immediately,
 `--loop` loops it.
 
-    golem-helper.py sound Workspace Radio 1837879082 --volume 0.5 --play
+    npx golem-bridge sound Workspace Radio 1837879082 --volume 0.5 --play
 
 **scatter** — clone a template into a random disc around it. Trees, rocks,
 grass: build one, scatter the rest.
 
-    golem-helper.py scatter Workspace/Tree --count 20 --radius 60 --y-jitter 2
+    npx golem-bridge scatter Workspace/Tree --count 20 --radius 60 --y-jitter 2
 
 **weld** — join a model's parts with WeldConstraints so the whole build
 moves as one.
 
-    golem-helper.py weld Workspace/Cart
+    npx golem-bridge weld Workspace/Cart
 
 **hitbox** — invisible part sized to the target's bounding box. Click and
 chop targets, interaction zones. `--collide` makes it solid.
 
-    golem-helper.py hitbox Workspace/Tree --padding 1
+    npx golem-bridge hitbox Workspace/Tree --padding 1
 
 **prompt** — ProximityPrompt ("Press E to ...") on a part. `--object` is
 the title above it, `--hold` the hold time in seconds.
 
-    golem-helper.py prompt Workspace/Tree "Chop" --object Tree --hold 0.5
+    npx golem-bridge prompt Workspace/Tree "Chop" --object Tree --hold 0.5
 
 **particles** — attach a ParticleEmitter with a preset: `leaves`, `sparks`,
 `smoke`, `magic`, `fire`, `snow`, `rain`, `bubbles`, `dust`, `confetti`,
 `fireflies`.
 
-    golem-helper.py particles Workspace/Torch fire --rate 40
+    npx golem-bridge particles Workspace/Torch fire --rate 40
 
 **sign** — a readable wooden sign: board part with text on its face.
 
-    golem-helper.py sign "Camp rules: no griefing" --position 0,6,10
+    npx golem-bridge sign "Camp rules: no griefing" --position 0,6,10
 
 **attr** — Studio attributes: typed config on instances without scripts.
 `--set` repeats; values parse as integer, float, `true`/`false`, or string.
 
-    golem-helper.py attr Workspace/Door --set Open=false --set LockLevel=3
+    npx golem-bridge attr Workspace/Door --set Open=false --set LockLevel=3
 
 **tag** — add or remove CollectionService tags. Find tagged instances later
 with `find --tag`.
 
-    golem-helper.py tag Workspace/Tree --add Choppable
+    npx golem-bridge tag Workspace/Tree --add Choppable
 
 ### 4.9 VFX
 
 **beam** — glowing beam between two parts. Lasers, tethers, energy links.
 
-    golem-helper.py beam Workspace/TowerA Workspace/TowerB --color #78B4FF --width 0.4
+    npx golem-bridge beam Workspace/TowerA Workspace/TowerB --color #78B4FF --width 0.4
 
 **trail** — motion trail on a part. Shows when the part moves: sword
 swipes, comet tails.
 
-    golem-helper.py trail Workspace/Sword --lifetime 0.6
+    npx golem-bridge trail Workspace/Sword --lifetime 0.6
 
 **explosion** — one-shot visual explosion. Harmless by default: no physics
 damage.
 
-    golem-helper.py explosion --position 0,10,0 --radius 8
+    npx golem-bridge explosion --position 0,10,0 --radius 8
 
 ### 4.10 UI — build interfaces as instances, not code
 
@@ -405,32 +412,32 @@ Positions and sizes use `"xs,xo,ys,yo"` (scale/offset pairs); anchors use
 
 **ui_screen** — ScreenGui under StarterGui. The root of every interface.
 
-    golem-helper.py ui_screen MainMenu
+    npx golem-bridge ui_screen MainMenu
 
 **ui_frame** — rounded panel, the backbone of screens.
 
-    golem-helper.py ui_frame StarterGui/MainMenu Panel --size 0.8,0,0.6,0 --radius 12
+    npx golem-bridge ui_frame StarterGui/MainMenu Panel --size 0.8,0,0.6,0 --radius 12
 
 **ui_label** — text label. Fonts: `regular`, `medium`, `semibold`, `bold`,
 `mono`.
 
-    golem-helper.py ui_label StarterGui/MainMenu/Panel Title --text "Item Shop" --font semibold --text-size 20
+    npx golem-bridge ui_label StarterGui/MainMenu/Panel Title --text "Item Shop" --font semibold --text-size 20
 
 **ui_button** — text button with hover feedback built in.
 
-    golem-helper.py ui_button StarterGui/MainMenu/Panel Buy --text "Buy"
+    npx golem-bridge ui_button StarterGui/MainMenu/Panel Buy --text "Buy"
 
 **ui_input** — TextBox the player can type into.
 
-    golem-helper.py ui_input StarterGui/MainMenu/Panel Name --placeholder "Your name..."
+    npx golem-bridge ui_input StarterGui/MainMenu/Panel Name --placeholder "Your name..."
 
 **ui_image** — ImageLabel showing a Roblox asset id.
 
-    golem-helper.py ui_image StarterGui/MainMenu/Panel Icon --asset 123456 --scale fit
+    npx golem-bridge ui_image StarterGui/MainMenu/Panel Icon --asset 123456 --scale fit
 
 **ui_list** — UIListLayout that auto-arranges a container's children.
 
-    golem-helper.py ui_list StarterGui/MainMenu/Panel --direction vertical --padding 8
+    npx golem-bridge ui_list StarterGui/MainMenu/Panel --direction vertical --padding 8
 
 ### 4.11 Marketplace — browse and add assets
 
@@ -443,23 +450,23 @@ Do not call them in a loop; cache results and page with `--cursor`.
 price, and a thumbnail URL. Open the thumbnail to judge the asset before
 inserting.
 
-    golem-helper.py search castle --category model --limit 5
+    npx golem-bridge search castle --category model --limit 5
 
 **info** — details plus thumbnail for one asset.
 
-    golem-helper.py info 487667385
+    npx golem-bridge info 487667385
 
 **insert** — place an asset into the open place. ONLY free assets
 (`priceInRobux` null or 0) or assets the user owns. Paid or restricted
 assets fail with "Asset is not trusted". If that happens, pick a different
 result.
 
-    golem-helper.py insert 487667385 Workspace --name "Castle Wall"
+    npx golem-bridge insert 487667385 Workspace --name "Castle Wall"
 
 **apply** — set an asset-backed property: `Image`, `Texture`, `SoundId`,
 `MeshId`, and similar.
 
-    golem-helper.py apply 123456 Workspace/Sign/Decal Texture
+    npx golem-bridge apply 123456 Workspace/Sign/Decal Texture
 
 Workflow: search, open thumbnails, `info` the shortlist, `insert`, verify
 with `tree`/`read`, set a `waypoint`. Tell the user what you added and
@@ -479,22 +486,22 @@ AND the client, live while the test runs. `--all` adds prints.
 Workflow: build, Ctrl+S, `play`, wait 10-20 s so scripts can run and fail,
 `logs`, fix every error, `stop`, save, re-test until clean.
 
-    golem-helper.py play
-    golem-helper.py logs
-    golem-helper.py stop
+    npx golem-bridge play
+    npx golem-bridge logs
+    npx golem-bridge stop
 
 ### 4.13 Session and talking to the user
 
 **waypoint** — named undo checkpoint ("one clean undo away"). Set one
 before risky edits and at every milestone.
 
-    golem-helper.py waypoint "before refactor"
+    npx golem-bridge waypoint "before refactor"
 
 **undo** — one Studio undo step. Edit mode only.
 
 **look** — aim the user's editor camera at your work so they see it.
 
-    golem-helper.py look Workspace/Castle --distance 60
+    npx golem-bridge look Workspace/Castle --distance 60
 
 **say** — post a message to the Studio chat AND close the turn. Only for
 finished chunks of work (see §0).
@@ -596,7 +603,7 @@ length along the X axis.** A vertical trunk needs `Orientation (0, 0, 90)`.
 Always set orientation when creating such parts. `create` accepts top-level
 `position` {x,y,z} and `orientation` {x,y,z} in degrees:
 
-    golem-helper.py exec '{"op":"create","args":{"class":"Part","parent":"Workspace","name":"Trunk","position":{"x":0,"y":6,"z":0},"orientation":{"x":0,"y":0,"z":90},"props":{"Shape":"Enum.PartType.Cylinder","Anchored":true,"Material":"Enum.Material.Wood","Color":"#8B5A2B","Size":{"type":"Vector3","x":12,"y":2,"z":2}}}}'
+    npx golem-bridge exec '{"op":"create","args":{"class":"Part","parent":"Workspace","name":"Trunk","position":{"x":0,"y":6,"z":0},"orientation":{"x":0,"y":0,"z":90},"props":{"Shape":"Enum.PartType.Cylinder","Anchored":true,"Material":"Enum.Material.Wood","Color":"#8B5A2B","Size":{"type":"Vector3","x":12,"y":2,"z":2}}}}'
 
 (Height 12 runs along X, so orientation (0,0,90) stands it up. Ball canopies
 need no orientation.)
@@ -667,6 +674,10 @@ become records). Yields like `task.wait(1)` are fine; never loop forever.
 - The channel id is a shared secret. Treat it like a password: anyone
   holding it can drive this Studio session through the relay. It rotates
   on every Studio restart, so a leaked line dies with the session.
+- Results come back through the same relay. If a result ever looks
+  forged or nonsensical (data that contradicts what you just wrote),
+  stop and ask the user to rotate the channel (Settings > END SESSION
+  AND ROTATE CHANNEL) before acting on it.
 
 ## 10. End-of-reply checklist
 
