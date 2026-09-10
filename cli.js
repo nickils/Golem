@@ -7,9 +7,20 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
-const DB_URL = process.env.AIB_FIREBASE_DB || "https://roblox-golem-default-rtdb.firebaseio.com";
-const POLL_INTERVAL_MS = Math.max(250, (parseFloat(process.env.AIB_POLL_INTERVAL) || 2) * 1000);
+// GOLEM_* names are preferred; AIB_* are the legacy aliases kept for
+// backward compatibility with existing setups and scripts.
+function envOf(...names) {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v) return v;
+  }
+  return undefined;
+}
+
+const DB_URL = envOf("GOLEM_FIREBASE_DB", "AIB_FIREBASE_DB") || "https://roblox-golem-default-rtdb.firebaseio.com";
+const POLL_INTERVAL_MS = Math.max(250, (parseFloat(envOf("GOLEM_POLL_INTERVAL", "AIB_POLL_INTERVAL")) || 2) * 1000);
 const FETCH_TIMEOUT_MS = 30000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT = 120;
@@ -23,6 +34,24 @@ try {
   VERSION = require("./package.json").version || "unknown";
 } catch {
   // running outside the package dir; version is informational only
+}
+
+// The relay must be HTTPS (plain HTTP is only allowed for localhost, for
+// local Firebase emulator testing). Trailing slashes are stripped so URL
+// joins stay clean. Takes an optional override for testability.
+function relayBase(url) {
+  const raw = String(url !== undefined ? url : DB_URL || "").replace(/\/+$/, "");
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(raw)) return raw;
+  if (!/^https:\/\//.test(raw)) {
+    throw new Error(
+      `refusing to talk to a non-HTTPS relay (${raw || "(empty)"}) - check GOLEM_FIREBASE_DB/AIB_FIREBASE_DB`
+    );
+  }
+  return raw;
+}
+
+function isTooLarge(err) {
+  return !!err && typeof err.message === "string" && err.message.includes("response too large");
 }
 
 function fail(message, exitCode) {
@@ -72,14 +101,20 @@ async function fetchText(url, opts) {
 }
 
 async function relayCall(channelId, op, args, timeoutSec) {
+  let base;
+  try {
+    base = relayBase();
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
   const enc = encodeURIComponent(channelId);
-  const cmdId = `c${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+  const cmdId = `c${Date.now().toString(36)}${crypto.randomBytes(8).toString("hex")}`;
   const payload = JSON.stringify({ id: cmdId, op, args: args || {}, ts: Math.floor(Date.now() / 1000) });
   let sinceKey = null;
   for (let attempt = 0; ; attempt++) {
     let r;
     try {
-      r = await fetchText(`${DB_URL}/channels/${enc}/cmd.json`, { method: "POST", body: payload });
+      r = await fetchText(`${base}/channels/${enc}/cmd.json`, { method: "POST", body: payload });
     } catch (err) {
       return { ok: false, error: `cannot reach the relay (${err.message}) - check internet/DNS` };
     }
@@ -102,8 +137,14 @@ async function relayCall(channelId, op, args, timeoutSec) {
   while (Date.now() < deadline) {
     let r;
     try {
-      r = await fetchText(`${DB_URL}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 60000 });
-    } catch {
+      r = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 60000 });
+    } catch (err) {
+      if (isTooLarge(err)) {
+        return {
+          ok: false,
+          error: "the result channel is too large to poll - ask the user to restart Studio to rotate to a fresh channel",
+        };
+      }
       attempt++;
       await sleep(Math.min(15, 0.5 * 2 ** Math.min(attempt, 5)) * 1000);
       continue;
@@ -126,17 +167,23 @@ async function relayCall(channelId, op, args, timeoutSec) {
     if (keys && typeof keys === "object") {
       for (const key of Object.keys(keys).sort()) {
         if (sinceKey !== null && !(key > sinceKey)) continue;
-        sinceKey = key;
         let entry;
         try {
-          const er = await fetchText(`${DB_URL}/channels/${enc}/res/${encodeURIComponent(key)}.json`, {
+          const er = await fetchText(`${base}/channels/${enc}/res/${encodeURIComponent(key)}.json`, {
             timeoutMs: 60000,
           });
-          if (!er.ok) continue;
+          if (!er.ok) continue; // transient: retry this key on the next poll
           entry = JSON.parse(er.text);
-        } catch {
-          continue;
+        } catch (err) {
+          if (isTooLarge(err)) {
+            return {
+              ok: false,
+              error: `Studio's reply to '${op}' exceeded the relay size cap - narrow the query (path, depth, max)`,
+            };
+          }
+          continue; // transient or corrupt entry: retry this key on the next poll
         }
+        sinceKey = key;
         if (entry && entry.id === cmdId) {
           if (entry.resultEncoded && typeof entry.result === "string") {
             try {
@@ -168,7 +215,8 @@ function turnReminder(entry) {
   console.error(`${head} When this task is done, close it with:\n>>    npx golem-bridge turn end --note "your reply"`);
 }
 
-// Exit codes: 0 = ok, 1 = Studio reported an error, 2 = usage error.
+// Exit codes: 0 = ok, 1 = Studio/relay reported an error, 2 = usage error.
+// Usage errors never go through out(); they print directly and exit 2.
 function out(data, opts) {
   const o = opts || {};
   if (data && data.ok) {
@@ -189,7 +237,7 @@ function out(data, opts) {
   }
   console.error(JSON.stringify(data, null, 2));
   turnReminder(data);
-  process.exitCode = data && "error" in data ? 1 : 2;
+  process.exitCode = 1;
 }
 
 function vec3(s) {
@@ -209,7 +257,8 @@ function vec3(s) {
 class UsageError extends Error {}
 
 function loadChannel() {
-  if (process.env.AIB_CHANNEL) return process.env.AIB_CHANNEL;
+  const fromEnv = envOf("GOLEM_CHANNEL", "AIB_CHANNEL");
+  if (fromEnv) return fromEnv;
   try {
     const raw = fs.readFileSync(path.join(process.cwd(), ".golem", "channel"), "utf8").trim();
     if (raw) return raw;
@@ -228,30 +277,55 @@ function loadChannel() {
   return null;
 }
 
+function isValidChannel(id) {
+  return typeof id === "string" && CHANNEL_RE.test(id);
+}
+
 function requireChannel() {
   const id = loadChannel();
-  if (typeof id !== "string" || !CHANNEL_RE.test(id)) {
+  if (!isValidChannel(id)) {
     out({ ok: false, error: "not connected (no channel saved) - run: npx golem-bridge connect <channelId>" });
     return null;
   }
   return id;
 }
 
-function validateChannel(channelId) {
-  if (typeof channelId !== "string" || !CHANNEL_RE.test(channelId)) {
-    fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
-  }
-  return channelId;
-}
+// Leftover filenames from the 2.x Python helper, cleaned up on connect.
+const STALE_HELPER_FILES = ["golem-helper.py", "golem-tools.md", "golem.py", "golem.md"];
 
 function removeStaleHelpers(dir) {
-  for (const stale of ["golem-helper.py", "golem-tools.md", "golem.py", "golem.md"]) {
+  for (const stale of STALE_HELPER_FILES) {
     try {
       fs.rmSync(path.join(dir, stale), { force: true });
     } catch {
       // cleanup must never block a connect
     }
   }
+}
+
+// The channel id is a capability secret, so the file must not be
+// world-readable. Returns the path of the written file.
+function saveChannel(dir, id) {
+  try {
+    removeStaleHelpers(dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "channel");
+    fs.writeFileSync(file, id + "\n", { mode: 0o600 });
+    try {
+      fs.chmodSync(file, 0o600); // tighten pre-existing files too (mode only applies on creation)
+    } catch {
+      // best effort (e.g. filesystems without unix permissions)
+    }
+  } catch (err) {
+    fail(`cannot save the channel file in ${dir}: ${err.message}`, 1);
+  }
+  return path.join(dir, "channel");
+}
+
+function envChannelName() {
+  if (process.env.GOLEM_CHANNEL) return "GOLEM_CHANNEL";
+  if (process.env.AIB_CHANNEL) return "AIB_CHANNEL";
+  return null;
 }
 
 function readStdin() {
@@ -273,8 +347,8 @@ const MP_CATEGORIES = {
 const ASSET_TYPE_NAMES = { 1: "Image", 3: "Audio", 4: "Mesh", 9: "Decal", 10: "Model", 18: "Video", 19: "Font", 40: "MeshPart" };
 
 async function mpGet(url) {
-  const r = await fetchText(url, { headers: { "User-Agent": "Golem-aib/1.0" }, timeoutMs: 20000 });
-  if (!r.ok) throw new Error(`HTTP ${r.status} from Roblox`);
+  const r = await fetchText(url, { headers: { "User-Agent": `golem-bridge/${VERSION}` }, timeoutMs: 20000 });
+  if (!r.ok) throw new Error(`HTTP ${r.status} from Roblox: ${r.text.slice(0, 200)}`);
   return JSON.parse(r.text);
 }
 
@@ -290,13 +364,14 @@ async function mpSearch(query, category, limit, cursor) {
   const ids = ((data && data.data) || []).filter((it) => it && it.id != null).map((it) => it.id);
   const details = {};
   const thumbs = {};
-  for (let i = 0; i < Math.min(ids.length, 12); i++) {
+  const enriched = Math.min(ids.length, 12);
+  for (let i = 0; i < enriched; i++) {
     try {
       details[ids[i]] = await mpGet(`https://economy.roblox.com/v2/assets/${ids[i]}/details`);
     } catch {
       // one bad asset must not kill the search
     }
-    if (i < 11) await sleep(400); // the economy API rate limits hard
+    if (i < enriched - 1) await sleep(400); // the economy API rate limits hard
   }
   if (ids.length) {
     try {
@@ -319,7 +394,7 @@ async function mpSearch(query, category, limit, cursor) {
       entry.assetTypeId = d.AssetTypeId;
       entry.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
       if (d.Creator && typeof d.Creator === "object") entry.creator = d.Creator.Name;
-      if (d.PriceInRobux != null) entry.priceInRobux = d.PriceInRobux;
+      entry.priceInRobux = d.PriceInRobux ?? null; // null = free or unknown
       if (d.IsForSale != null) entry.forSale = d.IsForSale;
       if (typeof d.Description === "string" && d.Description) entry.description = d.Description.slice(0, 280);
     } else {
@@ -331,8 +406,8 @@ async function mpSearch(query, category, limit, cursor) {
     }
     return entry;
   });
-  const output = { totalResults: data.totalResults, results };
-  if (data.nextPageCursor) output.nextPageCursor = data.nextPageCursor;
+  const output = { totalResults: (data && data.totalResults) ?? 0, results };
+  if (data && data.nextPageCursor) output.nextPageCursor = data.nextPageCursor;
   return output;
 }
 
@@ -346,7 +421,7 @@ async function mpInfo(assetId) {
     output.assetTypeId = d.AssetTypeId;
     output.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
     if (d.Creator && typeof d.Creator === "object") output.creator = d.Creator.Name;
-    if (d.PriceInRobux != null) output.priceInRobux = d.PriceInRobux;
+    output.priceInRobux = d.PriceInRobux ?? null; // null = free or unknown
     if (d.IsForSale != null) output.forSale = d.IsForSale;
     if (typeof d.Description === "string") output.description = d.Description.slice(0, 1000);
   }
@@ -363,24 +438,25 @@ async function mpInfo(assetId) {
 }
 
 function marketplaceViaPlugin() {
-  return (process.env.AIB_MARKETPLACE || "").toLowerCase() === "plugin";
+  return (envOf("GOLEM_MARKETPLACE", "AIB_MARKETPLACE") || "").toLowerCase() === "plugin";
 }
 
 async function status() {
   const channel = loadChannel();
-  if (typeof channel !== "string" || !CHANNEL_RE.test(channel)) {
+  if (!isValidChannel(channel)) {
     return { ok: false, error: "not connected (no channel saved) - run: npx golem-bridge connect <channelId>" };
   }
   let beaconData;
   let resKeys;
   try {
+    const base = relayBase();
     const enc = encodeURIComponent(channel);
-    const bb = await fetchText(`${DB_URL}/channels/${enc}/beacons.json?orderBy=${encodeURIComponent('"$key"')}&limitToLast=5`, {
+    const bb = await fetchText(`${base}/channels/${enc}/beacons.json?orderBy=${encodeURIComponent('"$key"')}&limitToLast=5`, {
       timeoutMs: 30000,
     });
     beaconData = bb.text === "null" ? {} : JSON.parse(bb.text);
     if (typeof beaconData !== "object" || beaconData === null) beaconData = {};
-    const rb = await fetchText(`${DB_URL}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 30000 });
+    const rb = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 30000 });
     resKeys = rb.text === "null" ? {} : JSON.parse(rb.text);
     if (typeof resKeys !== "object" || resKeys === null) resKeys = {};
   } catch (err) {
@@ -398,12 +474,14 @@ async function status() {
   }
   beacons.sort((a, b) => a[0] - b[0]);
   const [ts, beacon] = beacons[beacons.length - 1];
-  const age = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  const age = ts > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - ts)) : null;
   const ver = beacon.v || "?";
   const verdict =
-    age <= 900
-      ? `plugin is LIVE (v${ver}, hello beacon ${age}s ago) - it should answer commands`
-      : `last hello was ${Math.floor(age / 60)} min ago (v${ver}) - Studio may be closed or hung since then; ask the user to check the Golem window`;
+    age === null
+      ? `last beacon has no timestamp (v${ver}) - ask the user to check the Golem window`
+      : age <= 900
+        ? `plugin is LIVE (v${ver}, hello beacon ${age}s ago) - it should answer commands`
+        : `last hello was ${Math.floor(age / 60)} min ago (v${ver}) - Studio may be closed or hung since then; ask the user to check the Golem window`;
   return { ok: true, beacon, ageSeconds: age, recentResults: results, verdict };
 }
 
@@ -412,7 +490,7 @@ async function status() {
 // pos: ["name"] = required, ["name", default] = optional, ["name", "+"]
 //   = one-or-more, 3rd element = choices, 4th = value type.
 // flags: name: "bool"|"str"|"int"|"float"|"append" or [type, {flag, choices,
-//   default, required}]. Default flag spelling is the name with _ as -.
+//   default}]. Default flag spelling is the name with _ as -.
 
 const GROUPS = [
   ["Connection", ["ping", "debug", "status"]],
@@ -501,21 +579,21 @@ function stripTimeout(argv) {
     if (a.startsWith("--timeout=")) { timeout = parseFloat(a.slice(10)); continue; }
     out.push(a);
   }
-  if (timeout !== null && !(timeout > 0)) throw new UsageError("--timeout must be a positive number of seconds");
+  if (timeout !== null && (!(timeout > 0) || !Number.isFinite(timeout)))
+    throw new UsageError("--timeout must be a positive, finite number of seconds");
   return { args: out, timeout };
 }
 
 function parseToolArgs(name, argv) {
   const spec = TOOLS[name];
   const ns = {};
-  const bools = {}, vals = {}, shorts = {};
+  const bools = {}, vals = {};
   for (const dest of Object.keys(spec.flags || {})) {
     const fs = spec.flags[dest];
     const t = Array.isArray(fs) ? fs[0] : fs;
     const o = Array.isArray(fs) ? (fs[1] || {}) : {};
     const flag = o.flag || "--" + dest.replace(/_/g, "-");
-    if (o.short) shorts[o.short] = dest;
-    if (t === "bool") { ns[dest] = !!o.invert; bools[flag] = { dest, invert: !!o.invert }; }
+    if (t === "bool") { ns[dest] = false; bools[flag] = dest; }
     else { ns[dest] = t === "append" ? [] : (o.default !== undefined ? o.default : null); vals[flag] = { dest, type: t, choices: o.choices, multi: t === "append" }; }
   }
   const coerce = (fl, raw) => {
@@ -536,7 +614,7 @@ function parseToolArgs(name, argv) {
       const fl = eq === -1 ? t : t.slice(0, eq);
       if (fl in bools) {
         if (eq !== -1) throw new UsageError(`${name}: ${fl} takes no value`);
-        ns[bools[fl].dest] = !bools[fl].invert; i++; continue;
+        ns[bools[fl]] = true; i++; continue;
       }
       const v = vals[fl];
       if (!v) throw new UsageError(`${name}: unknown flag ${fl}`);
@@ -547,13 +625,9 @@ function parseToolArgs(name, argv) {
       if (v.multi) ns[v.dest].push(c); else ns[v.dest] = c;
       i++; continue;
     }
-    if (t in bools) { ns[bools[t].dest] = !bools[t].invert; i++; continue; }
-    if (t.startsWith("-") && t.length > 1 && !/^-\d/.test(t)) {
-      for (const c of t.slice(1)) {
-        if (!(c in shorts)) throw new UsageError(`${name}: unknown flag -${c}`);
-        ns[shorts[c]] = true;
-      }
-      i++; continue;
+    if (t in bools) { ns[bools[t]] = true; i++; continue; }
+    if (t.startsWith("-") && t.length > 1 && !/^-[\d.]/.test(t)) {
+      throw new UsageError(`${name}: unknown flag ${t}`);
     }
     pos.push(t); i++;
   }
@@ -590,11 +664,15 @@ function scalar(s) {
 function buildArgs(name, ns) {
   const V = (s) => vec3(s);
   switch (name) {
+    case "ping":
+      return { op: "ping", args: {} };
+    case "debug":
+      return { op: "debug", args: {} };
     case "exec": {
       let raw;
       try { raw = JSON.parse(ns.json); } catch { throw new UsageError("exec: invalid JSON"); }
-      if (!raw || typeof raw !== "object" || Array.isArray(raw) || !("op" in raw))
-        throw new UsageError('exec: JSON must be an object with an "op" key');
+      if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.op !== "string" || !raw.op)
+        throw new UsageError('exec: JSON must be an object with a string "op" key');
       return { op: raw.op, args: (raw.args && typeof raw.args === "object" && !Array.isArray(raw.args)) ? raw.args : {} };
     }
     case "lua": {
@@ -606,11 +684,17 @@ function buildArgs(name, ns) {
     case "list": {
       const a = { path: ns.path };
       if (ns.recursive) a.recursive = true;
-      if (ns.max) a.max = ns.max;
+      if (ns.max != null) {
+        if (ns.max <= 0) throw new UsageError("list: --max must be a positive integer");
+        a.max = ns.max;
+      }
       return { op: "list", args: a };
     }
-    case "tree":
-      return { op: "tree", args: { path: ns.path, depth: ns.depth || 2 } };
+    case "tree": {
+      const depth = ns.depth ?? 2;
+      if (depth < 0) throw new UsageError("tree: --depth must be 0 or greater");
+      return { op: "tree", args: { path: ns.path, depth } };
+    }
     case "read": {
       const a = { path: ns.path };
       if (ns.props) a.props = ns.props.split(",").map((s) => s.trim()).filter(Boolean);
@@ -619,15 +703,22 @@ function buildArgs(name, ns) {
     case "find": {
       const a = { scope: ns.scope };
       if (ns.tag) a.tag = ns.tag;
-      else a.query = ns.query;
+      else if (ns.query) a.query = ns.query;
+      else throw new UsageError("find: need a name query or --tag");
       if (ns.cls) a.class = ns.cls;
-      if (ns.max) a.max = ns.max;
+      if (ns.max != null) {
+        if (ns.max <= 0) throw new UsageError("find: --max must be a positive integer");
+        a.max = ns.max;
+      }
       if (ns.exact) a.exact = true;
       return { op: "find", args: a };
     }
     case "grep": {
       const a = { pattern: ns.pattern, scope: ns.scope };
-      if (ns.max) a.max = ns.max;
+      if (ns.max != null) {
+        if (ns.max <= 0) throw new UsageError("grep: --max must be a positive integer");
+        a.max = ns.max;
+      }
       if (ns.i) a.caseSensitive = false;
       return { op: "grep", args: a };
     }
@@ -652,14 +743,18 @@ function buildArgs(name, ns) {
       return { op: "say", args: { text: ns.text } };
     case "turn": {
       if (ns.action === "begin") return { op: "turn_begin", args: {} };
-      const a = {};
-      if (ns.note) a.note = ns.note;
-      return { op: "turn_end", args: a };
+      if (!ns.note) throw new UsageError('turn end: --note "your reply" is required');
+      return { op: "turn_end", args: { note: ns.note } };
     }
     case "rotate": {
       const a = { path: ns.path, space: ns.space };
       if (ns.absolute != null) a.orientation = V(ns.absolute);
-      else { a.axis = ns.axis != null ? ns.axis : null; a.degrees = ns.degrees != null ? ns.degrees : null; }
+      else {
+        if (ns.axis == null || ns.degrees == null)
+          throw new UsageError("rotate: need --set x,y,z or both --axis and --degrees");
+        a.axis = ns.axis;
+        a.degrees = ns.degrees;
+      }
       return { op: "rotate", args: a };
     }
     case "face":
@@ -667,8 +762,10 @@ function buildArgs(name, ns) {
     case "shift":
       return { op: "shift", args: { path: ns.path, offset: V(ns.offset), space: ns.space } };
     case "scale":
+      if (!(ns.factor > 0)) throw new UsageError("scale: factor must be a positive number");
       return { op: "scale", args: { path: ns.path, factor: ns.factor } };
     case "duplicate": {
+      if (!(ns.count >= 1)) throw new UsageError("duplicate: --count must be 1 or greater");
       const a = { path: ns.path, count: ns.count };
       if (ns.offset) a.offset = V(ns.offset);
       if (ns.parent) a.parent = ns.parent;
@@ -692,6 +789,8 @@ function buildArgs(name, ns) {
       return { op: "place", args: a };
     }
     case "paint": {
+      if (ns.color == null && ns.material == null && ns.transparency == null && ns.reflectance == null)
+        throw new UsageError("paint: need at least one of --color, --material, --transparency, --reflectance");
       const a = { paths: ns.paths };
       if (ns.color) a.color = ns.color;
       if (ns.material) a.material = ns.material;
@@ -821,7 +920,10 @@ function buildArgs(name, ns) {
       return { op: "stop", args: {} };
     case "logs": {
       const a = ns.all ? { filter: "all" } : {};
-      if (ns.limit != null) a.limit = ns.limit;
+      if (ns.limit != null) {
+        if (ns.limit <= 0) throw new UsageError("logs: --limit must be a positive integer");
+        a.limit = ns.limit;
+      }
       if (ns.since != null) a.since = ns.since;
       return { op: "logs", args: a };
     }
@@ -832,7 +934,9 @@ function buildArgs(name, ns) {
         for (const kv of ns.set) {
           const e = kv.indexOf("=");
           if (e === -1) throw new UsageError("--set expects K=V");
-          o[kv.slice(0, e)] = scalar(kv.slice(e + 1));
+          const key = kv.slice(0, e);
+          if (!key) throw new UsageError("--set expects K=V with a non-empty key");
+          o[key] = scalar(kv.slice(e + 1));
         }
         a.set = o;
       }
@@ -841,6 +945,11 @@ function buildArgs(name, ns) {
     }
     case "tag": {
       const a = { paths: ns.paths };
+      if ((!ns.add || !ns.add.length) && (!ns.remove || !ns.remove.length))
+        throw new UsageError("tag: need --add and/or --remove");
+      for (const t of [...(ns.add || []), ...(ns.remove || [])]) {
+        if (!t) throw new UsageError("tag: tag names must not be empty");
+      }
       if (ns.add && ns.add.length) a.add = ns.add;
       if (ns.remove && ns.remove.length) a.remove = ns.remove;
       return { op: "tag", args: a };
@@ -848,6 +957,7 @@ function buildArgs(name, ns) {
     case "match":
       return { op: "match", args: { from: ns.from_path, paths: ns.to } };
     case "scatter": {
+      if (!(ns.count >= 1)) throw new UsageError("scatter: --count must be 1 or greater");
       const a = { path: ns.path, count: ns.count, radius: ns.radius, yJitter: ns.y_jitter };
       if (ns.parent) a.parent = ns.parent;
       if (ns.name) a.name = ns.name;
@@ -919,7 +1029,6 @@ function toolHelp(name) {
       const t = Array.isArray(fs) ? fs[0] : fs;
       const o = Array.isArray(fs) ? (fs[1] || {}) : {};
       let line = `  ${o.flag || "--" + d.replace(/_/g, "-")}`;
-      if (o.short) line += `, -${o.short}`;
       if (t !== "bool") line += ` <${t === "append" ? "value (repeatable)" : "value"}>`;
       if (o.choices) line += ` (${o.choices.join("|")})`;
       if (o.default !== undefined) line += ` [default: ${o.default}]`;
@@ -941,7 +1050,9 @@ function printManual() {
 async function connect(id, opts) {
   opts = opts || {};
   if (id == null) fail("connect: need the channel id from the Studio widget.", 2);
-  validateChannel(id);
+  if (!isValidChannel(id)) {
+    fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
+  }
   const data = await relayCall(id, "ping", {}, opts.timeout || 60);
   if (!data || !data.ok) {
     console.error(JSON.stringify({ ok: false, error: "connect: Studio did not answer. Is the plugin running and the id exact?" }, null, 2));
@@ -952,10 +1063,10 @@ async function connect(id, opts) {
   const place = res.place || res.placeName || data.place;
   if (!opts.print) {
     const dir = path.join(process.cwd(), ".golem");
-    removeStaleHelpers(dir);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "channel"), id + "\n");
-    console.log(`connected. channel saved to ${path.join(dir, "channel")}`);
+    const saved = saveChannel(dir, id);
+    console.log(`connected. channel saved to ${saved}`);
+    const shadow = envChannelName();
+    if (shadow) console.error(`warning: $${shadow} is set - commands will use it instead of this saved channel.`);
   }
   if (place) console.log(`place: ${place}`);
   printManual();
@@ -963,31 +1074,38 @@ async function connect(id, opts) {
 
 async function reconnect(id, opts) {
   opts = opts || {};
+  if (opts.print) fail("reconnect: --print is only for connect (reconnect always saves).", 2);
   const saved = loadChannel();
   const target = id || saved;
   if (!target) fail("reconnect: no saved channel and none given.", 2);
-  validateChannel(target);
+  if (!isValidChannel(target)) {
+    fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
+  }
   const data = await relayCall(target, "ping", {}, opts.timeout || 60);
   if (!data || !data.ok) {
     console.error(JSON.stringify({ ok: false, error: "reconnect: Studio did not answer." }, null, 2));
     process.exitCode = 1;
     return;
   }
+  const res = (data && typeof data.result === "object" && data.result) || {};
+  const place = res.place || res.placeName || data.place;
   if (target === saved) {
     console.log("already connected to this channel.");
+    if (place) console.log(`place: ${place}`);
     return;
   }
   const dir = path.join(process.cwd(), ".golem");
-  removeStaleHelpers(dir);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "channel"), target + "\n");
-  console.log(`reconnected. channel saved to ${path.join(dir, "channel")}`);
+  const file = saveChannel(dir, target);
+  console.log(`reconnected. channel saved to ${file}`);
+  const shadow = envChannelName();
+  if (shadow) console.error(`warning: $${shadow} is set - commands will use it instead of this saved channel.`);
+  if (place) console.log(`place: ${place}`);
 }
 
 function disconnect() {
   const dir = path.join(process.cwd(), ".golem");
   let removed = false;
-  for (const name of ["channel", "golem-helper.py", "golem-tools.md", "golem.py", "golem.md"]) {
+  for (const name of ["channel", ...STALE_HELPER_FILES]) {
     const f = path.join(dir, name);
     try {
       if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed = true; }
@@ -998,22 +1116,29 @@ function disconnect() {
   try { fs.rmdirSync(dir); } catch {
     // stays if not empty
   }
+  const shadow = envChannelName();
+  if (shadow) console.error(`warning: $${shadow} is still set - commands stay connected through the environment.`);
   console.log(removed ? "disconnected (local channel file removed)." : "already disconnected (nothing saved).");
 }
 
+// Slow ops need longer minimum waits, but only when the user did not pass an
+// explicit --timeout: an explicit timeout is always respected.
 const TIMEOUT_MIN = { ping: 60, debug: 90, search_assets: 180, asset_info: 180, insert_asset: 300 };
 
+function waitFor(op, timeout) {
+  if (timeout != null) return timeout;
+  return Math.max(DEFAULT_TIMEOUT, TIMEOUT_MIN[op] || 0);
+}
+
+function parseToolInvocation(name, argv) {
+  const { args, timeout } = stripTimeout(argv);
+  return { ns: parseToolArgs(name, args), timeout };
+}
+
 async function runRelayTool(name, argv) {
-  let args, timeout, ns;
+  let ns, timeout, built;
   try {
-    ({ args, timeout } = stripTimeout(argv));
-    ns = parseToolArgs(name, args);
-  } catch (err) {
-    if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
-    throw err;
-  }
-  let built;
-  try {
+    ({ ns, timeout } = parseToolInvocation(name, argv));
     built = buildArgs(name, ns);
   } catch (err) {
     if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
@@ -1021,16 +1146,14 @@ async function runRelayTool(name, argv) {
   }
   const channel = requireChannel();
   if (!channel) return;
-  const wait = Math.max(timeout != null ? timeout : DEFAULT_TIMEOUT, TIMEOUT_MIN[built.op] || 0);
-  const entry = await relayCall(channel, built.op, built.args, wait);
+  const entry = await relayCall(channel, built.op, built.args, waitFor(built.op, timeout));
   out(entry, { asJson: built.asJson, rawField: built.rawField });
 }
 
 async function runLocalTool(name, argv) {
-  let args, timeout, ns;
+  let ns, timeout;
   try {
-    ({ args, timeout } = stripTimeout(argv));
-    ns = parseToolArgs(name, args);
+    ({ ns, timeout } = parseToolInvocation(name, argv));
   } catch (err) {
     if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
     throw err;
@@ -1050,14 +1173,13 @@ async function runLocalTool(name, argv) {
     }
     const channel = requireChannel();
     if (!channel) return;
-    const wait = Math.max(timeout != null ? timeout : DEFAULT_TIMEOUT, 180);
     if (name === "search") {
       const a = { query: ns.query, category: ns.category };
-      if (ns.limit) a.limit = ns.limit;
+      if (ns.limit != null) a.limit = ns.limit;
       if (ns.cursor) a.cursor = ns.cursor;
-      out(await relayCall(channel, "search_assets", a, wait));
+      out(await relayCall(channel, "search_assets", a, waitFor("search_assets", timeout)));
     } else {
-      out(await relayCall(channel, "asset_info", { id: ns.id }, wait));
+      out(await relayCall(channel, "asset_info", { id: ns.id }, waitFor("asset_info", timeout)));
     }
   }
 }
@@ -1088,7 +1210,7 @@ async function main(argv) {
       else if (!a.startsWith("-") && id === null) id = a;
       else { console.error(`golem-bridge: ${cmd}: bad argument ${a}`); process.exitCode = 2; return; }
     }
-    if (timeout != null && !(timeout > 0)) { console.error("golem-bridge: --timeout must be a positive number of seconds"); process.exitCode = 2; return; }
+    if (timeout != null && (!(timeout > 0) || !Number.isFinite(timeout))) { console.error("golem-bridge: --timeout must be a positive, finite number of seconds"); process.exitCode = 2; return; }
     if (cmd === "connect") await connect(id, { print, timeout });
     else await reconnect(id, { timeout });
     return;
@@ -1106,4 +1228,4 @@ if (require.main === module) {
   main().catch((err) => { console.error(`golem-bridge error: ${(err && err.message) || err}`); process.exitCode = 1; });
 }
 
-module.exports = { TOOLS, GROUPS, parseToolArgs, buildArgs, vec3, scalar, loadChannel, status, mpSearch, mpInfo, marketplaceViaPlugin, relayCall, UsageError, stripTimeout, removeStaleHelpers, disconnect, main };
+module.exports = { TOOLS, GROUPS, parseToolArgs, buildArgs, vec3, scalar, loadChannel, isValidChannel, relayBase, saveChannel, envChannelName, status, mpSearch, mpInfo, marketplaceViaPlugin, relayCall, UsageError, stripTimeout, removeStaleHelpers, disconnect, main };

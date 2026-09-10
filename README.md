@@ -61,14 +61,30 @@ npx golem-bridge disconnect
 - Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
 is the secret. Studio mints a fresh one on every start and wipes the old
 channel, so a leaked line dies with the session.
-- Only `cli.js` and `golem-tools.md` ship in this package. The relay carries
-small JSON commands and results only, and `connect` writes nothing but
-the 16-char channel id.
+- Only `cli.js` and `golem-tools.md` ship as code in this package (npm
+always adds `README.md`, `LICENSE`, and `package.json` alongside). The
+relay carries small JSON commands and results only, and `connect` writes
+nothing but the channel id (mode `0600`, since it is a secret).
 - npm account `skellzy` and GitHub `nickils` are the same person.
 
 - Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
 in the plugin kills it on the spot and issues a new one. (Every Studio
 restart already rotates automatically.)
+
+## Environment variables (all optional)
+
+`GOLEM_*` names are preferred; the `AIB_*` aliases still work.
+
+- `GOLEM_CHANNEL` (`AIB_CHANNEL`) — use this channel instead of
+`./.golem/channel`. When set, `connect`/`reconnect` warn that the saved
+file is shadowed, and `disconnect` warns the session stays connected.
+- `GOLEM_FIREBASE_DB` (`AIB_FIREBASE_DB`) — relay base URL override.
+Must be HTTPS, except `http://localhost…` for emulator testing.
+- `GOLEM_POLL_INTERVAL` (`AIB_POLL_INTERVAL`) — result poll interval in
+seconds (default 2, minimum 0.25).
+- `GOLEM_MARKETPLACE` (`AIB_MARKETPLACE`) — set to `plugin` to route
+marketplace `search`/`info` through Studio instead of calling roblox.com
+directly (slower; only for networks that block roblox.com).
 
 ## Security
 

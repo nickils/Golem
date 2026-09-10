@@ -332,7 +332,7 @@ walk-through.
 **sound** — add a Sound to a parent. `--play` previews it immediately,
 `--loop` loops it.
 
-    npx golem-bridge sound Workspace Radio 1837879082 --volume 0.5 --play
+    npx golem-bridge sound Workspace 1837879082 --name Radio --volume 0.5 --play
 
 **scatter** — clone a template into a random disc around it. Trees, rocks,
 grass: build one, scatter the rest.
@@ -515,6 +515,9 @@ left unclosed blocks your next command until the note is posted.
 | op (aliases) | args | returns |
 |---|---|---|
 | `ping` | — | plugin/Studio/place info |
+| `debug` | — | relay round-trip, versions, commands served, error count |
+| `turn_begin` | — | opens a turn group in the Studio chat (via `turn begin`) |
+| `turn_end` | `note` (required) | folds the turn and posts the note as the reply (via `turn end --note`) |
 | `run` (`eval`,`exec`) | `code` | `{returnCount, values}` — runs Lua with plugin permissions |
 | `list` (`ls`) | `path`, `recursive`, `max` | children (or descendants) records |
 | `tree` | `path`, `depth`, `maxChildren`, `maxNodes` | nested tree |
