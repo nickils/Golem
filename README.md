@@ -82,9 +82,6 @@ file is shadowed, and `disconnect` warns the session stays connected.
 Must be HTTPS, except `http://localhost…` for emulator testing.
 - `GOLEM_POLL_INTERVAL` (`AIB_POLL_INTERVAL`) — result poll interval in
 seconds (default 2, minimum 0.25).
-- `GOLEM_MARKETPLACE` (`AIB_MARKETPLACE`) — set to `plugin` to route
-marketplace `search`/`info` through Studio instead of calling roblox.com
-directly (slower; only for networks that block roblox.com).
 
 ## Security
 

@@ -337,6 +337,8 @@ function readStdin() {
 }
 
 // ---------------------------------------------------------------- marketplace
+// search/info always run on this machine: Studio's HttpService cannot reach
+// roblox.com, so there is no plugin-side marketplace path.
 
 const MP_CATEGORIES = {
   model: "Model", models: "Model", mesh: "MeshPart", meshes: "MeshPart", meshpart: "MeshPart",
@@ -412,8 +414,9 @@ async function mpSearch(query, category, limit, cursor) {
 }
 
 async function mpInfo(assetId) {
-  const aid = parseInt(assetId, 10);
-  if (!Number.isFinite(aid)) throw new Error(`bad asset id '${assetId}'`);
+  const text = String(assetId == null ? "" : assetId).trim();
+  if (!/^\d+$/.test(text)) throw new Error(`bad asset id '${assetId}'`);
+  const aid = parseInt(text, 10);
   const d = await mpGet(`https://economy.roblox.com/v2/assets/${aid}/details`);
   const output = { id: aid };
   if (d && typeof d === "object") {
@@ -435,10 +438,6 @@ async function mpInfo(assetId) {
     // thumbnails are a bonus
   }
   return output;
-}
-
-function marketplaceViaPlugin() {
-  return (envOf("GOLEM_MARKETPLACE", "AIB_MARKETPLACE") || "").toLowerCase() === "plugin";
 }
 
 async function status() {
@@ -464,7 +463,7 @@ async function status() {
   }
   const results = Object.values(resKeys).filter((v) => v === true).length;
   const beacons = Object.values(beaconData)
-    .filter((e) => e && (e.op === "hello" || e.op === "paused" || e.op === "revoked"))
+    .filter((e) => e && (e.op === "hello" || e.op === "revoked"))
     .map((e) => [parseFloat(e.ts) || 0, e]);
   if (!beacons.length) {
     const verdict = results
@@ -476,6 +475,16 @@ async function status() {
   const [ts, beacon] = beacons[beacons.length - 1];
   const age = ts > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - ts)) : null;
   const ver = beacon.v || "?";
+  if (beacon.op === "revoked") {
+    const ago = age === null ? "" : age < 120 ? ` ${age}s ago` : ` ${Math.floor(age / 60)} min ago`;
+    return {
+      ok: true,
+      beacon,
+      ageSeconds: age,
+      recentResults: results,
+      verdict: `this channel was ROTATED${ago} - Studio wiped it (END SESSION or restart) and minted a new one; ask the user for the fresh setup line and run: npx golem-bridge reconnect <newId>`,
+    };
+  }
   const verdict =
     age === null
       ? `last beacon has no timestamp (v${ver}) - ask the user to check the Golem window`
@@ -491,6 +500,7 @@ async function status() {
 //   = one-or-more, 3rd element = choices, 4th = value type.
 // flags: name: "bool"|"str"|"int"|"float"|"append" or [type, {flag, choices,
 //   default}]. Default flag spelling is the name with _ as -.
+// (The relay op for each tool lives in buildArgs, the single mapping.)
 
 const GROUPS = [
   ["Connection", ["ping", "debug", "status"]],
@@ -509,10 +519,10 @@ const GROUPS = [
 
 const TOOLS = {
   ping: { help: "health check - is Studio connected?" },
-  debug: { help: "diagnostics: relay round-trip, marketplace reachability, HTTP state" },
-  status: { help: "is the plugin alive, paused, or the link revoked? (no Studio needed)", local: true },
+  debug: { help: "diagnostics: relay round-trip, versions, commands served, errors" },
+  status: { help: "is the plugin alive or the link revoked? (no Studio needed)", local: true },
   exec: { help: 'send a raw op JSON: {"op":..., "args":...}', pos: [["json"]] },
-  lua: { help: "run Lua inside Studio (code arg, or - for stdin)", op: "run", pos: [["code", null]] },
+  lua: { help: "run Lua inside Studio (code arg, or - for stdin)", pos: [["code", null]] },
   list: { help: "children of a path", pos: [["path", "game"]], flags: { recursive: "bool", max: "int" } },
   tree: { help: "recursive tree of a path", pos: [["path", "game"]], flags: { depth: "int" } },
   read: { help: "read an instance (script source by default, --json for full record)", pos: ["path"], flags: { json: "bool", props: "str" } },
@@ -531,7 +541,7 @@ const TOOLS = {
   scale: { help: "scale a part/model by a relative factor", pos: ["path", ["factor", undefined, undefined, "float"]] },
   duplicate: { help: "clone an instance (optionally N times with spacing)", pos: ["path"], flags: { count: ["int", { default: 1 }], offset: "str", parent: "str", name: "str" } },
   group: { help: "wrap instances into a Model", pos: [["paths", "+"]], flags: { name: ["str", { default: "Group" }], parent: "str" } },
-  pivot: { help: "set a model/part pivot (what it rotates around)", op: "set_pivot", pos: ["path"], flags: { position: "str", orientation: "str" } },
+  pivot: { help: "set a model/part pivot (what it rotates around)", pos: ["path"], flags: { position: "str", orientation: "str" } },
   place: { help: "absolute position via pivot (parts and models)", pos: ["path", "position"], flags: { orientation: "str" } },
   paint: { help: "set color/material/transparency/reflectance on parts", pos: [["paths", "+"]], flags: { color: "str", material: "str", transparency: "float", reflectance: "float" } },
   rename: { help: "rename an instance", pos: ["path", "name"] },
@@ -560,21 +570,24 @@ const TOOLS = {
   play: { help: "start play-testing the game (client when possible, Run mode fallback)", pos: [], flags: { mode: ["str", { choices: ["play", "run"] }] } },
   stop: { help: "stop the running play test" },
   logs: { help: "read Studio output - errors and warnings from the play test", pos: [], flags: { all: "bool", limit: "int", since: "float" } },
-  attr: { help: "read/set/clear Studio attributes on an instance", op: "attributes", pos: ["path"], flags: { set: "append", clear: "append" } },
+  attr: { help: "read/set/clear Studio attributes on an instance", pos: ["path"], flags: { set: "append", clear: "append" } },
   tag: { help: "add/remove CollectionService tags", pos: [["paths", "+"]], flags: { add: "append", remove: "append" } },
   match: { help: "copy color/material/transparency from one part onto targets", pos: ["from_path", ["to", "+"]] },
   scatter: { help: "scatter N copies of a template in a disc around it", pos: ["path"], flags: { count: ["int", { default: 10 }], radius: ["float", { default: 20 }], y_jitter: ["float", { default: 0 }], parent: "str", name: "str" } },
   terrain: { help: "fill or clear terrain (block or ball)", pos: [], flags: { action: ["str", { choices: ["fill", "clear"], default: "fill" }], shape: ["str", { choices: ["block", "ball"], default: "block" }], position: "str", size: "str", radius: "float", material: ["str", { default: "Grass" }] } },
-  search: { help: "search the Roblox Creator Store (models, meshes, images, audio)", pos: ["query"], flags: { category: ["str", { default: "model" }], limit: "int", cursor: "str" }, local: true },
+  search: { help: "search the Roblox Creator Store (models, meshes, images, audio, video, plugins)", pos: ["query"], flags: { category: ["str", { default: "model" }], limit: "int", cursor: "str" }, local: true },
   info: { help: "details + thumbnail for one marketplace asset", pos: ["id"], local: true },
-  insert: { help: "insert a marketplace asset into the place", op: "insert_asset", pos: ["id", ["parent", "Workspace"]], flags: { name: "str" } },
-  apply: { help: "apply an asset id to a property (Image, Texture, SoundId, MeshId...)", op: "apply_asset", pos: ["id", "path", "prop"] },
+  insert: { help: "insert a marketplace asset into the place", pos: ["id", ["parent", "Workspace"]], flags: { name: "str" } },
+  apply: { help: "apply an asset id to a property (Image, Texture, SoundId, MeshId...)", pos: ["id", "path", "prop"] },
 };
 function stripTimeout(argv) {
   const out = [];
   let timeout = null;
+  let ddash = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (ddash) { out.push(a); continue; }
+    if (a === "--") { ddash = true; out.push(a); continue; }
     if (a === "--timeout" && i + 1 < argv.length) { timeout = parseFloat(argv[++i]); continue; }
     if (a.startsWith("--timeout=")) { timeout = parseFloat(a.slice(10)); continue; }
     out.push(a);
@@ -734,7 +747,11 @@ function buildArgs(name, ns) {
       return { op: "move", args: { path: ns.path, parent: ns.parent } };
     case "selection": {
       if (ns.clear) return { op: "selection", args: { clear: true } };
-      if (ns.set) return { op: "selection", args: { set: ns.set.split(",").map((s) => s.trim()).filter(Boolean) } };
+      if (ns.set != null) {
+        const paths = ns.set.split(",").map((s) => s.trim()).filter(Boolean);
+        if (!paths.length) throw new UsageError("selection: --set needs at least one path");
+        return { op: "selection", args: { set: paths } };
+      }
       return { op: "selection", args: {} };
     }
     case "waypoint":
@@ -778,6 +795,8 @@ function buildArgs(name, ns) {
       return { op: "group", args: a };
     }
     case "pivot": {
+      if (ns.position == null && ns.orientation == null)
+        throw new UsageError("pivot: need --position and/or --orientation");
       const a = { path: ns.path };
       if (ns.position) a.position = V(ns.position);
       if (ns.orientation) a.orientation = V(ns.orientation);
@@ -1123,7 +1142,7 @@ function disconnect() {
 
 // Slow ops need longer minimum waits, but only when the user did not pass an
 // explicit --timeout: an explicit timeout is always respected.
-const TIMEOUT_MIN = { ping: 60, debug: 90, search_assets: 180, asset_info: 180, insert_asset: 300 };
+const TIMEOUT_MIN = { ping: 60, debug: 90, insert_asset: 300 };
 
 function waitFor(op, timeout) {
   if (timeout != null) return timeout;
@@ -1151,35 +1170,22 @@ async function runRelayTool(name, argv) {
 }
 
 async function runLocalTool(name, argv) {
-  let ns, timeout;
+  let ns;
   try {
-    ({ ns, timeout } = parseToolInvocation(name, argv));
+    ({ ns } = parseToolInvocation(name, argv));
   } catch (err) {
     if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
     throw err;
   }
   if (name === "status") { out(await status()); return; }
   if (name === "search" || name === "info") {
-    if (!marketplaceViaPlugin()) {
-      try {
-        const result = name === "search"
-          ? await mpSearch(ns.query, ns.category, ns.limit, ns.cursor)
-          : await mpInfo(ns.id);
-        out({ ok: true, op: name, result });
-      } catch (err) {
-        out({ ok: false, op: name, error: name === "search" ? `marketplace search failed: ${err.message}` : `asset info failed: ${err.message}` });
-      }
-      return;
-    }
-    const channel = requireChannel();
-    if (!channel) return;
-    if (name === "search") {
-      const a = { query: ns.query, category: ns.category };
-      if (ns.limit != null) a.limit = ns.limit;
-      if (ns.cursor) a.cursor = ns.cursor;
-      out(await relayCall(channel, "search_assets", a, waitFor("search_assets", timeout)));
-    } else {
-      out(await relayCall(channel, "asset_info", { id: ns.id }, waitFor("asset_info", timeout)));
+    try {
+      const result = name === "search"
+        ? await mpSearch(ns.query, ns.category, ns.limit, ns.cursor)
+        : await mpInfo(ns.id);
+      out({ ok: true, op: name, result });
+    } catch (err) {
+      out({ ok: false, op: name, error: name === "search" ? `marketplace search failed: ${err.message}` : `asset info failed: ${err.message}` });
     }
   }
 }
@@ -1228,4 +1234,4 @@ if (require.main === module) {
   main().catch((err) => { console.error(`golem-bridge error: ${(err && err.message) || err}`); process.exitCode = 1; });
 }
 
-module.exports = { TOOLS, GROUPS, parseToolArgs, buildArgs, vec3, scalar, loadChannel, isValidChannel, relayBase, saveChannel, envChannelName, status, mpSearch, mpInfo, marketplaceViaPlugin, relayCall, UsageError, stripTimeout, removeStaleHelpers, disconnect, main };
+module.exports = { TOOLS, GROUPS, parseToolArgs, buildArgs, vec3, scalar, loadChannel, isValidChannel, relayBase, saveChannel, envChannelName, status, mpSearch, mpInfo, relayCall, UsageError, stripTimeout, removeStaleHelpers, disconnect, main };

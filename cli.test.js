@@ -53,6 +53,7 @@ test("stripTimeout splits --timeout out of argv", () => {
   assert.deepEqual(cli.stripTimeout(["--timeout", "5", "a"]), { args: ["a"], timeout: 5 });
   assert.deepEqual(cli.stripTimeout(["a", "--timeout=7.5"]), { args: ["a"], timeout: 7.5 });
   assert.deepEqual(cli.stripTimeout(["a", "b"]), { args: ["a", "b"], timeout: null });
+  assert.deepEqual(cli.stripTimeout(["--", "--timeout"]), { args: ["--", "--timeout"], timeout: null });
   for (const bad of ["0", "-3", "abc", "Infinity", "NaN"]) {
     throwsUsage(() => cli.stripTimeout(["--timeout", bad]), /--timeout/);
   }
@@ -150,6 +151,11 @@ test("buildArgs validates tool arguments instead of sending junk to Studio", () 
     { path: "p", space: "world", axis: "y", degrees: 90 });
   // paint needs something to paint
   throwsUsage(() => cli.buildArgs("paint", { paths: ["p"] }), /at least one/);
+  // selection --set needs a real path (empty used to silently clear the selection)
+  throwsUsage(() => cli.buildArgs("selection", { set: "" }), /at least one path/);
+  throwsUsage(() => cli.buildArgs("selection", { set: "  " }), /at least one path/);
+  // pivot needs something to set
+  throwsUsage(() => cli.buildArgs("pivot", { path: "p" }), /--position/);
   // find needs a query or a tag
   throwsUsage(() => cli.buildArgs("find", { query: "", scope: "game" }), /--tag/);
   assert.equal(cli.buildArgs("find", { query: "", scope: "game", tag: "T" }).args.tag, "T");
@@ -223,22 +229,9 @@ test("loadChannel prefers GOLEM_CHANNEL, then AIB_CHANNEL, then the file", () =>
   }
 });
 
-test("marketplaceViaPlugin reads either env var", () => {
-  const saved = { GOLEM_MARKETPLACE: process.env.GOLEM_MARKETPLACE, AIB_MARKETPLACE: process.env.AIB_MARKETPLACE };
-  try {
-    delete process.env.GOLEM_MARKETPLACE;
-    delete process.env.AIB_MARKETPLACE;
-    assert.equal(cli.marketplaceViaPlugin(), false);
-    process.env.AIB_MARKETPLACE = "plugin";
-    assert.equal(cli.marketplaceViaPlugin(), true);
-    delete process.env.AIB_MARKETPLACE;
-    process.env.GOLEM_MARKETPLACE = "PLUGIN";
-    assert.equal(cli.marketplaceViaPlugin(), true);
-  } finally {
-    for (const k of Object.keys(saved)) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
+test("mpInfo rejects non-numeric asset ids before touching the network", async () => {
+  for (const bad of ["12ab", "abc", "", "  ", null, undefined, "rbxassetid://x"]) {
+    await assert.rejects(() => cli.mpInfo(bad), /bad asset id/);
   }
 });
 

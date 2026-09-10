@@ -155,7 +155,8 @@ start timing out.
 
 **status** — is the plugin alive? Reads the channel's recent beacons, no
 Studio round-trip needed. Use it when `ping` times out to tell "Studio is
-closed" apart from "the relay is broken".
+closed" apart from "the relay is broken". If the channel was rotated,
+`status` says so outright — fetch the fresh line and `reconnect`.
 
     npx golem-bridge status
 
