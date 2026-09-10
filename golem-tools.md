@@ -155,7 +155,8 @@ start timing out.
 
 **status** — is the plugin alive? Reads the channel's recent beacons, no
 Studio round-trip needed. Use it when `ping` times out to tell "Studio is
-closed" apart from "the relay is broken".
+closed" apart from "the relay is broken". If the channel was rotated,
+`status` says so outright — fetch the fresh line and `reconnect`.
 
     npx golem-bridge status
 
@@ -332,7 +333,7 @@ walk-through.
 **sound** — add a Sound to a parent. `--play` previews it immediately,
 `--loop` loops it.
 
-    npx golem-bridge sound Workspace Radio 1837879082 --volume 0.5 --play
+    npx golem-bridge sound Workspace 1837879082 --name Radio --volume 0.5 --play
 
 **scatter** — clone a template into a random disc around it. Trees, rocks,
 grass: build one, scatter the rest.
@@ -404,6 +405,10 @@ When the user asks for any UI (shop, HUD, menu, popup, note):
    palette. Before building a new screen, `read` an existing screen and
    copy its fonts, sizes, and colors exactly. A different font is allowed
    only as a deliberate choice (a parchment note, a decorative title).
+4. Prefer changing state over rebuilding: toggle visibility, update `Text`,
+   tween positions. Do not destroy and recreate screens.
+
+Positions and sizes use `"xs,xo,ys,yo"` (scachment note, a decorative title).
 4. Prefer changing state over rebuilding: toggle visibility, update `Text`,
    tween positions. Do not destroy and recreate screens.
 
@@ -515,6 +520,9 @@ left unclosed blocks your next command until the note is posted.
 | op (aliases) | args | returns |
 |---|---|---|
 | `ping` | — | plugin/Studio/place info |
+| `debug` | — | relay round-trip, versions, commands served, error count |
+| `turn_begin` | — | opens a turn group in the Studio chat (via `turn begin`) |
+| `turn_end` | `note` (required) | folds the turn and posts the note as the reply (via `turn end --note`) |
 | `run` (`eval`,`exec`) | `code` | `{returnCount, values}` — runs Lua with plugin permissions |
 | `list` (`ls`) | `path`, `recursive`, `max` | children (or descendants) records |
 | `tree` | `path`, `depth`, `maxChildren`, `maxNodes` | nested tree |

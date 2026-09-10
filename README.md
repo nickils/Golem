@@ -3,9 +3,9 @@
 `golem-bridge` connects an AI coding agent to a live Roblox Studio session
 running the Golem plugin.
 
-This repo holds the npm package (the AI side). The Studio plugin itself is
-distributed through the Roblox Creator Store; its source is published as
-a file release on this repo's Releases page.
+This repo holds the npm package (the AI side) and the Studio plugin source
+(`plugin/Golem.lua`). The built plugin (`plugin/Golem.rbxmx`) is attached
+to each GitHub Release and distributed through the Roblox Creator Store.
 
 ## How it connects
 
@@ -61,14 +61,27 @@ npx golem-bridge disconnect
 - Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
 is the secret. Studio mints a fresh one on every start and wipes the old
 channel, so a leaked line dies with the session.
-- Only `cli.js` and `golem-tools.md` ship in this package. The relay carries
-small JSON commands and results only, and `connect` writes nothing but
-the 16-char channel id.
+- Only `cli.js` and `golem-tools.md` ship as code in this package (npm
+always adds `README.md`, `LICENSE`, and `package.json` alongside). The
+relay carries small JSON commands and results only, and `connect` writes
+nothing but the channel id (mode `0600`, since it is a secret).
 - npm account `skellzy` and GitHub `nickils` are the same person.
 
 - Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
 in the plugin kills it on the spot and issues a new one. (Every Studio
 restart already rotates automatically.)
+
+## Environment variables (all optional)
+
+`GOLEM_*` names are preferred; the `AIB_*` aliases still work.
+
+- `GOLEM_CHANNEL` (`AIB_CHANNEL`) — use this channel instead of
+`./.golem/channel`. When set, `connect`/`reconnect` warn that the saved
+file is shadowed, and `disconnect` warns the session stays connected.
+- `GOLEM_FIREBASE_DB` (`AIB_FIREBASE_DB`) — relay base URL override.
+Must be HTTPS, except `http://localhost…` for emulator testing.
+- `GOLEM_POLL_INTERVAL` (`AIB_POLL_INTERVAL`) — result poll interval in
+seconds (default 2, minimum 0.25).
 
 ## Security
 
