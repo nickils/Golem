@@ -3,9 +3,9 @@
 `golem-bridge` connects an AI coding agent to a live Roblox Studio session
 running the Golem plugin.
 
-This repo holds the npm package (the AI side). The Studio plugin itself is
-distributed through the Roblox Creator Store; its source is published as
-a file release on this repo's Releases page.
+This repo holds the npm package (the AI side) and the Studio plugin source
+(`plugin/Golem.lua`). The built plugin (`plugin/Golem.rbxmx`) is attached
+to each GitHub Release and distributed through the Roblox Creator Store.
 
 ## How it connects
 

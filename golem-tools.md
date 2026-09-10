@@ -408,6 +408,10 @@ When the user asks for any UI (shop, HUD, menu, popup, note):
 4. Prefer changing state over rebuilding: toggle visibility, update `Text`,
    tween positions. Do not destroy and recreate screens.
 
+Positions and sizes use `"xs,xo,ys,yo"` (scachment note, a decorative title).
+4. Prefer changing state over rebuilding: toggle visibility, update `Text`,
+   tween positions. Do not destroy and recreate screens.
+
 Positions and sizes use `"xs,xo,ys,yo"` (scale/offset pairs); anchors use
 `"x,y"`.
 
