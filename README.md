@@ -7,6 +7,10 @@ This repo holds the npm package (the AI side) and the Studio plugin source
 (`plugin/Golem.lua`). The built plugin (`plugin/Golem.rbxmx`) is attached
 to each GitHub Release and distributed through the Roblox Creator Store.
 
+This build ships the **session protocol only**: connection health,
+diagnostics, and the turn/chat channel. Studio-building tools are added
+back on top of the bridge.
+
 ## How it connects
 
 The plugin shows one line in Studio (popup on every start, also in Settings):
@@ -32,7 +36,7 @@ straight from this package:
 
 ```sh
 npx golem-bridge ping
-npx golem-bridge tree --depth 3
+npx golem-bridge status
 ```
 
 `ping` should return `"ok": true` plus the open place name. `manual`
@@ -50,26 +54,36 @@ Done with a session? Forget it locally (Studio is unaffected):
 npx golem-bridge disconnect
 ```
 
+## Session commands
+
+- `ping` - health check, returns the place name
+- `status` - reads the plugin beacons locally, no Studio round-trip
+- `debug` - relay round-trip, versions, commands served, error count
+- `turn begin` / `turn end --note "..."` - the chat turn ritual
+- `say "..."` - post a message and close the turn
+
 ## Files
 
-- `cli.js` - the whole package: session setup plus every Studio tool
+- `cli.js` - the whole package: session setup plus the session protocol
 - `golem-tools.md` - the agent manual (printed by `connect` and `manual`)
+- `plugin/Golem.lua` - the Studio plugin source
+- `plugin/Golem.rbxmx` - the installable plugin build (`python3 plugin/build.py`)
 - `package.json` - npm manifest
 
 ## Notes
 
 - Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
-is the secret. Studio mints a fresh one on every start and wipes the old
-channel, so a leaked line dies with the session.
+  is the secret. Studio mints a fresh one on every start and wipes the old
+  channel, so a leaked line dies with the session.
 - Only `cli.js` and `golem-tools.md` ship as code in this package (npm
-always adds `README.md`, `LICENSE`, and `package.json` alongside). The
-relay carries small JSON commands and results only, and `connect` writes
-nothing but the channel id (mode `0600`, since it is a secret).
+  always adds `README.md`, `LICENSE`, and `package.json` alongside). The
+  relay carries small JSON commands and results only, and `connect` writes
+  nothing but the channel id (mode `0600`, since it is a secret).
 - npm account `skellzy` and GitHub `nickils` are the same person.
 
 - Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
-in the plugin kills it on the spot and issues a new one. (Every Studio
-restart already rotates automatically.)
+  in the plugin kills it on the spot and issues a new one. (Every Studio
+  restart already rotates automatically.)
 
 ## Environment variables (all optional)
 
@@ -101,7 +115,3 @@ code cannot hold a secret, so any "signed responses" scheme here would be
 theater rather than security.
 - Socket.dev flags the "URL strings" in this package (the relay address).
 That is informational: the relay address is the product.
-- Scanners also flag the Lua execution and editing commands. That is
-what Golem is: your agent driving your own Studio. The session key
-(16 hex chars, rotated every start, revocable in one click) is the
-whole security model.
