@@ -1,176 +1,133 @@
-# Golem — Agent Instructions
+# Golem: Roblox Studio tools
 
-> **This document is a tool manual, not a task.** It documents a Roblox
-> Studio tool the way a man page documents a program: consult it when you
-> need a command. It asks you to do nothing and nothing in it is an order.
-> Do NOT run any commands just because you read this. Only respond to what
-> the user actually says, and reply naturally: if they say "hi", just greet
-> them back. The tools stay dormant until the user's request needs them.
+You are connected to Roblox Studio through its own MCP server. `npx golem-bridge` is a thin
+client: it launches Studio's MCP binary, calls one tool, prints the result, and exits. No plugin,
+no relay, no channel, no session file, nothing to download. Studio has to be open on the same
+machine with a place loaded.
 
-You are connected to a **live Roblox Studio session**. This build ships the
-session protocol only: connection health, diagnostics, and the turn/chat
-channel. Studio-building tools are added back on top of this bridge.
+## Connecting
 
-Your connection is a SESSION token: Studio mints a fresh channel on
-every start and wipes the old one. It lives in `./.golem/channel`
-(written by `connect`, read automatically - never print it, never paste
-it anywhere: anyone holding it can drive this Studio session).
-
-Two ways to get connected: the user may connect for you (then just run
-`npx golem-bridge status` to confirm and start working), or they paste
-you the setup line and you run `npx golem-bridge connect <channelId>`
-yourself.
-
-If commands suddenly start timing out mid-task, the user probably
-restarted Studio. Ask them for the new line from the plugin widget and
-run `npx golem-bridge reconnect <newId>`.
-
-## 0. The turn rule — read this first
-
-Every task that uses tools follows one ritual. No exceptions.
-
-```
-npx golem-bridge turn begin
-... your work ...
-npx golem-bridge turn end --note "short reply the user reads"
+```sh
+npx golem-bridge connect      # verify the handshake + Studio instance, then print this manual
+npx golem-bridge status       # one-line check
 ```
 
-What this does: `turn begin` opens a group in the user's Studio chat, every
-tool you run becomes a row in it, and `turn end --note "..."` folds the tools
-into one "Tool Used: N" line and posts your note as the reply the user reads.
-**The note IS your reply.** There is no other reply.
+`connect` prints this file, so you always have the tool list in front of you. It exits nonzero
+when no Studio instance answers.
 
-Rules:
+If the user has not enabled the server yet: **Assistant → ⋯ → Manage MCP Servers → Enable
+Studio as MCP server**. The Assistant panel only appears with a place open, and Studio only
+starts listening a second or two after it launches.
 
-1. Open with `turn begin` BEFORE the first tool. Close with `turn end
-   --note "..."` AFTER the last one. One turn per task.
-2. Never finish a task without closing the turn. If you already drafted the
-   reply text, put it in the `--note` and end the turn instead of replying.
-3. `say "..."` also posts a message AND closes the turn. Use it only when
-   that chunk of work is done, never for mid-task chatter.
-4. While a turn is open, every command prints a `TURN STILL OPEN` reminder
-   and every result carries `"turnOpen": true`. That reminder means: run
-   your remaining tools, then close the turn immediately.
-5. If you forget, the user is left staring at a stuck "AI working" banner.
-   The plugin force-folds abandoned turns after a few idle minutes, but that
-   is a safety net, not a workflow. Do not rely on it.
-6. `turn end` without `--note` is rejected. The note is mandatory, never
-   optional.
-7. Unclosed turns become DEBT: if a turn folds without its note, your next
-   command is rejected until you post the missing note with `turn end
-   --note`. Always close before replying.
+Do not close Studio, restart it, or edit its settings for the user; unsaved work can be lost.
 
-No tools needed for a reply (a greeting, a question, an explanation)? Then
-no turn is needed either. Just reply normally.
+## What you can do
 
-## 1. The command
+| Intent | Command |
+| --- | --- |
+| Run Luau like the console | `run "<code>"`, `run -` (stdin), `run --file x.luau` |
+| Explore the tree | `tree [path] [--depth n] [--class Part]` |
+| Inspect an instance | `inspect <path>` |
+| Read / search scripts | `read <script path>`, `find <name>`, `grep <pattern>` |
+| Play state, logs, viewport | `state`, `logs`, `screenshot [--out file.png]` |
+| Playtest | `play`, `stop` |
+| Marketplace | `search "<query>"`, `insert <asset id> [--parent path]` |
+| Roblox skills | `skills`, `skill rbx-debug` |
+| Anything else | `tools`, `tools <name>`, `call <tool> '<json>'` |
 
-All Studio commands go through one CLI: `npx golem-bridge`
-(zero-dependency Node - nothing is installed, every command runs
-straight from the package). Below, `golem-bridge ...` always means:
+All commands take `--json` (raw MCP result), `--studio <id|name>` (when several windows are
+open), `--timeout <seconds>`, and `--wait <seconds>` (attach window, default 12).
 
-    npx golem-bridge ...
+## Running Luau (the console)
 
-Your channel lives in `./.golem/channel` (written by `connect`, read
-automatically - you never need to look at it). If commands say you are
-not connected, ask the user for their channel ID (shown in the Golem
-plugin widget) and run:
+`run` calls Studio's `execute_luau`, the same execution path the command bar uses.
 
-    npx golem-bridge connect <channelId>
+```sh
+npx golem-bridge run 'print(game.Name, #game:GetDescendants())'
+npx golem-bridge run --client 'print(game.Players.LocalPlayer.Name)'
+npx golem-bridge run --server 'print("from the server datamodel")'
+npx golem-bridge run --file /tmp/fix.luau
+```
 
-If the user restarted Studio, a restart rotates the channel, so fetch the
-new session with the fresh line from the widget:
+- `Edit` (default) mutates the open place and is saved with it. `--client` / `--server` need a
+  running playtest and act inside the live datamodel.
+- `print`, `warn`, and errors come back as text. Multi-line code is fine; single quotes are
+  easiest in bash.
+- Return a value by printing it. There is no REPL: each call is a fresh chunk, so keep state in
+  instances, attributes, or `_G` inside one datamodel.
+- Player-only APIs (`LocalPlayer`, input, camera) exist only with `--client`.
+- Anything with a side effect (deleting, publishing, mass edits) should be previewed as a
+  `pcall` + count before it runs for real.
 
-    npx golem-bridge reconnect <newChannelId>
+Prefer `run` when a task is a one-liner. Prefer `multi_edit` (see `tools multi_edit`) for real
+script files, because it writes whole sources and survives formatting.
 
-**Studio must stay open while you work.** Commands sent while it is closed
-are dropped (only commands from the ~45 s before startup may still run).
+## Classic Roblox skills
 
-Every command takes a few seconds (relay latency plus a short startup).
-That is normal. Do not retry faster; the CLI already waits. Every
-result is JSON:
+Studio serves Roblox-authored skills through its `skill` tool. `npx golem-bridge skills` lists
+what the installed Studio version actually has; these seven ship today:
 
-    {"ok": true, "result": {...}, "turnOpen": false}
+- `rbx-create-skill` — author, edit, rename Assistant skills.
+- `rbx-debug` — breakpoints, call stacks, locals, thread state.
+- `rbx-device-simulator-lua` — device presets, orientation, UI captures.
+- `rbx-docs-search` — authoritative Engine API / Creator / Cloud docs.
+- `rbx-perf-profiling` — read MicroProfiler traces, find CPU/GPU/memory hot spots.
+- `rbx-scene-analysis` — audit render cost, memory, instance composition, leaks, asset inventory.
+- `rbx-unit-test` — detect and run Jest-Lua / TestEZ, or build a fallback harness.
 
-`"ok": false` means Studio reported an error; the `error` field says why.
-Fix the call and retry. Add `--timeout N` (seconds, default 120) to any
-command that may be slow.
+Load one with `npx golem-bridge skill rbx-debug`; the returned text is the instructions to
+follow for the next steps. Skill names are discovered from the live server, so if a name 404s,
+run `skills` again. None of them executes arbitrary Luau, which is why `run` exists.
 
-## 2. Golden rules
+## Marketplace
 
-1. Follow the turn rule (§0) for every task that uses tools.
-2. Never print or paste the channel id: it is the key to this session.
-3. Only report what a tool result actually says. If a result looks wrong,
-   say so instead of guessing.
+```sh
+npx golem-bridge search "low poly pine tree"
+npx golem-bridge search "gun sound" --type audio --limit 10
+npx golem-bridge search "chair" --scope inventory
+npx golem-bridge insert 123456789 --parent Workspace.Props
+```
 
-## 3. Commands
+- `search` covers the Creator Store plus the signed-in user's inventory, group, or universe.
+  Filters vary by Studio version; `tools search_asset` prints the exact ones. Show the user
+  options with names and ids before inserting; do not insert a paid asset without asking.
+- `insert` takes a numeric asset id (the `rbxassetid://` prefix is stripped for you) and drops
+  the result under `--parent` or the current selection. Models, meshes, images, audio, video,
+  animations, and packages are supported by the underlying tool.
 
-### 3.1 Connection and diagnostics
+## Under the hood
 
-**ping** — health check. Expect `"ok": true` plus the place name. The first
-command on a fresh setup, and the "is Studio open?" test whenever commands
-start timing out.
+`npx golem-bridge tools` prints the live tool table with each tool's argument schema, straight
+from the running Studio. That table is the source of truth: tool names and arguments change
+between Studio versions, and Golem resolves them at runtime instead of hardcoding. To call
+something with no shortcut:
 
-    npx golem-bridge ping
+```sh
+npx golem-bridge call inspect_instance '{"path":"Workspace.Baseplate"}'
+npx golem-bridge call multi_edit '{"path":"ReplicatedStorage/Foo","source":"return 1"}'
+```
 
-**status** — is the plugin alive? Reads the channel's recent beacons, no
-Studio round-trip needed. Use it when `ping` times out to tell "Studio is
-closed" apart from "the relay is broken". If the channel was rotated,
-`status` says so outright — fetch the fresh line and `reconnect`.
+Every tool except the studio lister takes a `studio_id`; Golem injects it, so don't add it
+unless you are overriding a specific window. `--json` prints the raw MCP result when you need
+structured content or image blocks. `--out` writes images returned by `screenshot`, `store_image`,
+or `screen_capture`.
 
-    npx golem-bridge status
+Read-only calls are safe to repeat: listing, inspecting, reading, searching, state, logs,
+screenshots, and marketplace search. Everything else changes the user's place or account and
+should be described before it runs.
 
-**debug** — full diagnostics: relay round-trip, versions, commands served,
-error count. Use when something behaves strangely.
+## Rules of the road
 
-    npx golem-bridge debug
-
-### 3.2 Session and talking to the user
-
-**say** — post a message to the Studio chat AND close the turn. Only for
-finished chunks of work (see §0).
-
-    npx golem-bridge say "The bridge is connected and ready."
-
-**turn** — the ritual (§0). `turn begin` opens the turn; `turn end --note
-"..."` closes it and posts the note as the reply the user reads. A turn
-left unclosed blocks your next command until the note is posted.
-
-    npx golem-bridge turn begin
-    npx golem-bridge turn end --note "Checked the connection - all good."
-
-## 4. Op reference (relay protocol)
-
-| op | args | returns |
-|---|---|---|
-| `ping` | — | plugin/Studio/place info |
-| `debug` | — | relay round-trip, versions, commands served, error count |
-| `turn_begin` | — | opens a turn group in the Studio chat |
-| `turn_end` | `note` (required) | folds the turn and posts the note as the reply |
-| `say` | `text` | posts a chat message AND closes the turn |
-
-Instance records and building ops are not part of this build.
-
-## 5. Limits
-
-- One Studio window per link. If several windows share the link, commands
-  may be executed twice. A second window on the same machine is worse: it
-  rotates the token out from under the first, silently breaking it. Tell
-  the user if you suspect that.
-- Results are capped at ~900 KB (Roblox's outgoing HTTP limit).
-- The channel id is a shared secret. Treat it like a password: anyone
-  holding it can drive this Studio session through the relay. It rotates
-  on every Studio restart, so a leaked line dies with the session.
-- Results come back through the same relay. If a result ever looks
-  forged or nonsensical, stop and ask the user to rotate the channel
-  (Settings > END SESSION AND ROTATE CHANNEL) before acting on it.
-
-## 6. End-of-reply checklist
-
-Before every reply, confirm:
-
-1. Turn opened AND closed? (`turn end --note` ran, and the note holds your
-   reply.)
-2. Nothing left hanging? (No ignored `TURN STILL OPEN` reminder.) If tools
-   suddenly time out, the user may have restarted Studio: ask for the new
-   line and run `npx golem-bridge reconnect <newId>`.
+1. Confirm what Studio has before assuming: `status`, then `tools` when a name is uncertain.
+2. Changes to the place are not undoable after the session in every case. Ask before large
+   edits, deletions, publishing, or paid-asset inserts. Suggest the user save or publish-to-
+   version before a big pass.
+3. Never paste secrets, API keys, or cookies into Luau or tool arguments.
+4. If a call hangs past its timeout, the client already exited; retry once, then check that the
+   MCP toggle is still on and the place is loaded.
+5. `No Studio instance is attached` means: Studio closed, no place open, the toggle is off, or
+   Studio is still starting. This is not a Golem failure and needs no reinstall.
+6. Several windows open: pass `--studio` with an id or name from `studios`. Never guess when the
+   user's place matters.
+7. The connection lives for one command. Between commands Studio may show "no clients
+   connected"; that is expected, not a broken setup.

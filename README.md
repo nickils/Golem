@@ -1,117 +1,126 @@
 # Golem
 
-`golem-bridge` connects an AI coding agent to a live Roblox Studio session
-running the Golem plugin.
+`golem-bridge` puts an AI coding agent inside a live Roblox Studio session:
+the classic Roblox skills, the Creator Store marketplace, and a Luau console.
 
-This repo holds the npm package (the AI side) and the Studio plugin source
-(`plugin/Golem.lua`). The built plugin (`plugin/Golem.rbxmx`) is attached
-to each GitHub Release and distributed through the Roblox Creator Store.
+It talks to the MCP server that **ships inside Roblox Studio**. There is no
+plugin to install, no relay, no channel id, no Firebase project, and no state
+kept between commands. The CLI launches Studio's own MCP binary, calls one
+tool, prints the result, and exits.
 
-This build ships the **session protocol only**: connection health,
-diagnostics, and the turn/chat channel. Studio-building tools are added
-back on top of the bridge.
+## Requirements
 
-## How it connects
+- Roblox Studio on **macOS or Windows**, open with a place loaded.
+- Studio's MCP server turned on:
+  **Assistant → ⋯ → Manage MCP Servers → Enable Studio as MCP server**.
+- Node.js 18+ to run `npx golem-bridge`.
 
-The plugin shows one line in Studio (popup on every start, also in Settings):
+That is the whole setup. If Studio is not running or the toggle is off, the
+CLI says so; nothing needs reinstalling.
 
-```
-Connect to my Roblox Studio, Run: npx golem-bridge connect <channelId>
-```
-
-The line is a session token: Studio mints a fresh channel on every start
-and wipes the old one.
-
-Best flow: the user runs the line themselves, so the secret never enters
-AI chat, then tells the AI it is connected. Or the user sends the line to
-their AI and it runs it. Either way:
+## Connect
 
 ```sh
-npx golem-bridge connect <channelId>
+npx golem-bridge connect
 ```
 
-verifies Studio is alive, saves the 16-char channel to `./.golem/channel`,
-and prints the tool manual. Nothing else is installed: every command runs
-straight from this package:
+This performs the MCP handshake, lists the open Studio windows, and then
+**prints the tool manual** so the agent has every command and rule in front
+of it. `connect --brief` skips the manual; `status` prints one line.
+
+## Use
 
 ```sh
-npx golem-bridge ping
-npx golem-bridge status
+# Luau, exactly like the Studio command bar
+npx golem-bridge run 'print(game.Name, #game:GetDescendants())'
+npx golem-bridge run --client 'print(game.Players.LocalPlayer.Name)'
+npx golem-bridge run --file fix.luau
+
+# Explore and edit
+npx golem-bridge tree Workspace --depth 2
+npx golem-bridge inspect Workspace.Baseplate
+npx golem-bridge read ServerScriptService/Main
+npx golem-bridge grep "DataStoreService"
+
+# Playtest
+npx golem-bridge play
+npx golem-bridge logs
+npx golem-bridge stop
+npx golem-bridge screenshot --out viewport.png
+
+# Marketplace
+npx golem-bridge search "low poly pine tree"
+npx golem-bridge insert 123456789 --parent Workspace.Props
+
+# Roblox-authored skills
+npx golem-bridge skills
+npx golem-bridge skill rbx-perf-profiling
+
+# Anything the tool table offers
+npx golem-bridge tools
+npx golem-bridge call multi_edit '{"path":"ReplicatedStorage/Foo","source":"return 1"}'
 ```
 
-`ping` should return `"ok": true` plus the open place name. `manual`
-reprints the reference any time (`help <tool>` explains one tool).
+Every command accepts `--json` for the raw MCP result, `--studio <id|name>`
+when several Studio windows are open, and `--timeout <seconds>`.
 
-After a Studio restart, relink with the new line:
+## What the agent gets
+
+`connect` prints [`golem-tools.md`](golem-tools.md): the command map, the
+classic skills, the marketplace workflow, how Luau execution differs between
+`Edit`, `Client`, and `Server`, and the safety rules (changes to the place are
+not always undoable; ask before destructive edits or paid asset inserts).
+
+The tool list itself is read from the running Studio with `tools`, so a new
+Studio version that renames a tool or argument keeps working: Golem resolves
+tools and argument names against the live schema instead of hardcoding them.
+`call` is the escape hatch for anything without a shortcut.
+
+## Classic skills
+
+Studio's `skill` tool serves the Roblox-authored set — `rbx-create-skill`,
+`rbx-debug`, `rbx-device-simulator-lua`, `rbx-docs-search`,
+`rbx-perf-profiling`, `rbx-scene-analysis`, `rbx-unit-test` — plus anything
+newer your Studio version adds. `skills` lists what is actually installed and
+`skill <name>` loads one. None of them runs arbitrary Luau, which is what
+`run` is for.
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `Studio did not attach` | Open a place; enable the MCP toggle; wait a second after launch. |
+| `Studio MCP was not found` | Install/update Studio, or set `GOLEM_STUDIO_MCP` to the binary. |
+| `several Studio windows` | Pass `--studio` with an id or name from `studios`. |
+| `no response to 'tools/list'` | The MCP toggle is off or Studio is busy; re-enable it. |
+| Studio shows no connected clients | Expected: the connection lasts one command. |
+
+Binary locations used automatically:
+
+- macOS: `/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP`
+- Windows: `%LOCALAPPDATA%\Roblox\mcp.bat`, then
+  `%LOCALAPPDATA%\Roblox Studio\StudioMCP.exe`
+
+Set `GOLEM_STUDIO_MCP` to override the path.
+
+## Development
 
 ```sh
-npx golem-bridge reconnect <newChannelId>
+npm test
 ```
 
-Done with a session? Forget it locally (Studio is unaffected):
+The suite is dependency-free and runs against `test/fake-studio-mcp.js`, a
+stand-in that speaks Studio's JSON-RPC dialect, including pagination, late
+attach, multi-window routing, alternate schema names, timeouts, and crashes.
+No Studio install is required.
 
-```sh
-npx golem-bridge disconnect
-```
+## Safety
 
-## Session commands
+Golem can change the user's place. Edits are not always undoable, and
+publishing or paid asset inserts have real consequences. The manual tells the
+agent to describe large or destructive changes before running them; keep that
+rule if you fork this.
 
-- `ping` - health check, returns the place name
-- `status` - reads the plugin beacons locally, no Studio round-trip
-- `debug` - relay round-trip, versions, commands served, error count
-- `turn begin` / `turn end --note "..."` - the chat turn ritual
-- `say "..."` - post a message and close the turn
+## License
 
-## Files
-
-- `cli.js` - the whole package: session setup plus the session protocol
-- `golem-tools.md` - the agent manual (printed by `connect` and `manual`)
-- `plugin/Golem.lua` - the Studio plugin source
-- `plugin/Golem.rbxmx` - the installable plugin build (`python3 plugin/build.py`)
-- `package.json` - npm manifest
-
-## Notes
-
-- Relay: `https://roblox-golem-default-rtdb.firebaseio.com/`. The channel id
-  is the secret. Studio mints a fresh one on every start and wipes the old
-  channel, so a leaked line dies with the session.
-- Only `cli.js` and `golem-tools.md` ship as code in this package (npm
-  always adds `README.md`, `LICENSE`, and `package.json` alongside). The
-  relay carries small JSON commands and results only, and `connect` writes
-  nothing but the channel id (mode `0600`, since it is a secret).
-- npm account `skellzy` and GitHub `nickils` are the same person.
-
-- Leaked a line mid-session? Settings > END SESSION AND ROTATE CHANNEL
-  in the plugin kills it on the spot and issues a new one. (Every Studio
-  restart already rotates automatically.)
-
-## Environment variables (all optional)
-
-`GOLEM_*` names are preferred; the `AIB_*` aliases still work.
-
-- `GOLEM_CHANNEL` (`AIB_CHANNEL`) — use this channel instead of
-`./.golem/channel`. When set, `connect`/`reconnect` warn that the saved
-file is shadowed, and `disconnect` warns the session stays connected.
-- `GOLEM_FIREBASE_DB` (`AIB_FIREBASE_DB`) — relay base URL override.
-Must be HTTPS, except `http://localhost…` for emulator testing.
-- `GOLEM_POLL_INTERVAL` (`AIB_POLL_INTERVAL`) — result poll interval in
-seconds (default 2, minimum 0.25).
-
-## Security
-
-Trust model: whoever holds the channel ID can send commands to that Studio
-session and read the results. Treat the setup line like a password. It
-expires on every Studio restart.
-
-- `connect` verifies Studio is alive over HTTPS, saves the channel id,
-and prints the manual. Read both files here before running anything, or
-pass `--print` to verify without saving.
-- `connect` only accepts hex channel IDs, talks HTTPS to the relay only
-(never follows redirects), times out stalled requests, and caps response
-sizes. The only data it acts on is a small `ping` reply.
-- There are no baked-in Firebase credentials or signing keys: the channel
-ID itself is the capability, and transport runs over HTTPS. Public client
-code cannot hold a secret, so any "signed responses" scheme here would be
-theater rather than security.
-- Socket.dev flags the "URL strings" in this package (the relay address).
-That is informational: the relay address is the product.
+MIT.
