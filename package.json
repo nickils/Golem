@@ -1,6 +1,6 @@
 {
   "name": "golem-bridge",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "description": "Drive Roblox Studio through its built-in MCP server: skills, marketplace search/insert across every asset kind, and Luau execution.",
   "scripts": {
     "test": "node --test cli.test.js",
@@ -13,7 +13,8 @@
   "files": [
     "cli.js",
     "golem-tools.md",
-    "README.md"
+    "README.md",
+    "skills"
   ],
   "keywords": [
     "roblox",

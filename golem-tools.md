@@ -79,6 +79,23 @@ Load one with `npx golem-bridge skill rbx-debug`; the returned text is the instr
 follow for the next steps. Skill names are discovered from the live server, so if a name 404s,
 run `skills` again. None of them executes arbitrary Luau, which is why `run` exists.
 
+## Bundled Golem skills
+
+Three planning skills ship with this package as Markdown files. They are not
+installed in Studio by default, and they are not MCP tools:
+
+- `golem-game-brief` — turn an idea into a scoped vertical slice: core loop,
+  must-have systems, cut list, milestones, acceptance checks, and asset plan.
+- `golem-scaffold` — create the folders, boot scripts, module contract,
+  remotes, config, and save stub that the brief implies.
+- `golem-playtest-qa` — run the scenario matrix in play mode, assert server and
+  client state, collect logs and screenshots, and report defects by severity.
+
+Print one with `npx golem-bridge skillpack <name>` (or list with
+`npx golem-bridge skillpack`). Install it in Assistant with `rbx-create-skill`
+or **Skills → Add**; skills are account-scoped. Use them as a chain: brief,
+scaffold, playtest.
+
 ## Marketplace
 
 ```sh

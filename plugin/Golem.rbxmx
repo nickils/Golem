@@ -1,4 +1,4 @@
-<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Meta name="ExplicitAutoJoints">true</Meta><External>null</External><External>nil</External><Item class="Script" referent="RBX0"><Properties><string name="Name">Golem</string><bool name="Disabled">false</bool><ProtectedString name="Source">-- Golem 5.1 - optional Studio panel.
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Meta name="ExplicitAutoJoints">true</Meta><External>null</External><External>nil</External><Item class="Script" referent="RBX0"><Properties><string name="Name">Golem</string><bool name="Disabled">false</bool><ProtectedString name="Source">-- Golem - optional Studio panel.
 --
 -- Tool calls never pass through this plugin. Your AI talks straight to the
 -- MCP server built into Roblox Studio; this panel is a control room that
@@ -8,7 +8,7 @@
 -- 1px borders, wrapped text with AutomaticSize (nothing clipped), one scroll
 -- area per tab, and a fixed header/tab/footer so content never slides under.
 
-local VERSION = "5.1.0"
+local VERSION = "5.2.0"
 
 local Selection = game:GetService("Selection")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")

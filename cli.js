@@ -14,6 +14,11 @@ const path = require("path");
 const readline = require("readline");
 const { spawn } = require("child_process");
 
+// Piping into `head` or `less` closes stdout early; that is not an error.
+process.stdout.on("error", (error) => {
+  if (error && error.code === "EPIPE") process.exit(0);
+});
+
 let VERSION = "unknown";
 try {
   VERSION = require("./package.json").version || "unknown";
@@ -1161,7 +1166,8 @@ const COMMAND_SPECS = {
     flags: { parent: { type: "str" }, out: { type: "str" } },
     run: cmdInsert,
   },
-  skills: { help: "list Roblox-authored skills", flags: {}, run: cmdSkills },
+  skills: { help: "list Roblox skills installed in Studio", flags: {}, run: cmdSkills },
+  skillpack: { help: "list or print the bundled Golem skills", flags: {}, run: cmdSkillpack },
   skill: {
     help: "load a Roblox-authored skill (rbx-debug, rbx-unit-test, ...)",
     flags: { out: { type: "str" } },
@@ -1232,7 +1238,7 @@ function printHelp() {
     ["Connection", ["connect", "doctor", "status", "studios", "tools"]],
     ["Studio", ["run", "tree", "inspect", "read", "find", "grep", "state", "play", "stop", "logs", "screenshot"]],
     ["Marketplace", ["search", "insert"]],
-    ["Skills", ["skills", "skill"]],
+    ["Skills", ["skills", "skill", "skillpack"]],
     ["Generic", ["call", "manual"]],
   ];
   for (const [group, names] of groups) {
@@ -1270,6 +1276,7 @@ function printCommandHelp(name) {
 }
 
 const MANUAL_FILE = path.join(__dirname, "golem-tools.md");
+const SKILLS_DIR = path.join(__dirname, "skills");
 
 function printManual() {
   try {
@@ -1277,6 +1284,69 @@ function printManual() {
   } catch {
     throw new CliError("manual not found next to cli.js - reinstall the package.", 1);
   }
+}
+
+function readSkillMeta(text) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  if (!match) return {};
+  const meta = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const at = line.indexOf(":");
+    if (at > 0) meta[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  return meta;
+}
+
+function bundledSkills() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const skills = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const file = path.join(SKILLS_DIR, entry.name, "SKILL.md");
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const meta = readSkillMeta(text);
+    skills.push({ name: meta.name || entry.name, description: meta.description || "", file });
+  }
+  return skills;
+}
+
+async function cmdSkillpack(flags) {
+  const skills = bundledSkills();
+  if (!skills.length) {
+    throw new CliError("no bundled skills found next to cli.js - reinstall the package.", 1);
+  }
+  const wanted = flags._pos[0];
+  if (!wanted) {
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, skills: skills.map(({ name, description }) => ({ name, description })) }));
+      return;
+    }
+    print("Bundled Golem skills:");
+    for (const skill of skills) print(`  ${skill.name} - ${skill.description}`);
+    print("");
+    print("Print one with: npx golem-bridge skillpack <name>");
+    print("Install it in Assistant with rbx-create-skill, or Skills > Add and paste.");
+    return;
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(wanted)) {
+    throw new UsageError("skill names use lowercase letters, digits, and dashes");
+  }
+  const skill = skills.find((item) => item.name === wanted);
+  if (!skill) {
+    throw new CliError(`unknown bundled skill '${wanted}'. Run 'golem-bridge skillpack' for the list.`);
+  }
+  const text = fs.readFileSync(skill.file, "utf8");
+  process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
 }
 
 // ------------------------------------------------------------------ main

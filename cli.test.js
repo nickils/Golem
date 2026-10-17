@@ -52,6 +52,39 @@ test("plugin and package versions stay in sync", () => {
   assert.equal(match[1], VERSION);
 });
 
+test("skillpack lists and prints the bundled skills", () => {
+  const list = run(["skillpack"]);
+  assert.equal(list.status, 0, list.stderr);
+  assert.match(list.stdout, /golem-game-brief/);
+  assert.match(list.stdout, /golem-scaffold/);
+  assert.match(list.stdout, /golem-playtest-qa/);
+  assert.match(list.stdout, /rbx-create-skill/);
+
+  const one = run(["skillpack", "golem-scaffold"]);
+  assert.equal(one.status, 0, one.stderr);
+  assert.match(one.stdout, /^---\nname: golem-scaffold/);
+  assert.match(one.stdout, /Init -> Start/);
+
+  const parsed = JSON.parse(run(["skillpack", "--json"]).stdout);
+  assert.equal(parsed.skills.length, 3);
+
+  assert.equal(run(["skillpack", "nope"]).status, 1);
+  assert.equal(run(["skillpack", "../package"]).status, 2);
+});
+
+test("bundled skill frontmatter is valid", () => {
+  const dir = path.join(__dirname, "skills");
+  for (const name of ["golem-game-brief", "golem-scaffold", "golem-playtest-qa"]) {
+    const text = fs.readFileSync(path.join(dir, name, "SKILL.md"), "utf8");
+    const match = text.match(/^---\n([\s\S]*?)\n---\n/);
+    assert.ok(match, `${name} has frontmatter`);
+    assert.match(match[1], new RegExp(`^name: ${name}$`, "m"));
+    assert.match(match[1], /^description: .+$/m);
+    assert.match(match[1], /^enabled: true$/m);
+    assert.doesNotMatch(match[1], /^name: rbx-/m);
+  }
+});
+
 test("parseStudios reads the shapes Studio has returned", () => {
   assert.deepEqual(cli.parseStudios({ content: [{ type: "text", text: '{"studios":[]}' }] }), []);
   assert.deepEqual(

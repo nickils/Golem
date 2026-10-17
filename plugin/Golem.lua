@@ -1,4 +1,4 @@
--- Golem 5.1 - optional Studio panel.
+-- Golem - optional Studio panel.
 --
 -- Tool calls never pass through this plugin. Your AI talks straight to the
 -- MCP server built into Roblox Studio; this panel is a control room that
@@ -8,7 +8,7 @@
 -- 1px borders, wrapped text with AutomaticSize (nothing clipped), one scroll
 -- area per tab, and a fixed header/tab/footer so content never slides under.
 
-local VERSION = "5.1.0"
+local VERSION = "5.2.0"
 
 local Selection = game:GetService("Selection")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")

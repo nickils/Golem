@@ -59,6 +59,10 @@ npx golem-bridge insert 123456789 --parent Workspace.Props
 npx golem-bridge skills
 npx golem-bridge skill rbx-perf-profiling
 
+# Golem's own planning skills, bundled with the package
+npx golem-bridge skillpack
+npx golem-bridge skillpack golem-game-brief
+
 # Anything the tool table offers
 npx golem-bridge tools
 npx golem-bridge call multi_edit '{"path":"ReplicatedStorage/Foo","source":"return 1"}'
@@ -92,6 +96,23 @@ Studio's `skill` tool serves the Roblox-authored set — `rbx-create-skill`,
 newer your Studio version adds. `skills` lists what is actually installed and
 `skill <name>` loads one. None of them runs arbitrary Luau, which is what
 `run` is for.
+
+## Bundled skills
+
+Three Golem-authored skills ship in [`skills/`](skills/), for the part the
+`rbx-*` set does not cover: planning, scaffolding, and QA. They chain:
+
+- **`golem-game-brief`** — idea → core loop, minimum systems, milestones, and
+  acceptance checks, with an explicit cut list.
+- **`golem-scaffold`** — the brief → folders, boot scripts, module contracts,
+  remotes, config, and a save stub, verified by a clean play-mode boot.
+- **`golem-playtest-qa`** — the change → a scenario matrix, scripted inputs,
+  server/client assertions, screenshots, and a prioritized defect report.
+
+They are Markdown for Studio's Assistant, not CLI commands. Print one with
+`npx golem-bridge skillpack <name>`, then install it with `rbx-create-skill` or
+**Skills → Add**. See [`skills/README.md`](skills/README.md) for triggers,
+frontmatter rules, and editing guidance.
 
 ## Studio panel (optional)
 
