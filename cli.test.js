@@ -1,449 +1,287 @@
 "use strict";
 
-// golem-bridge tests. Zero dependencies, no network:
+// golem-bridge unit tests. Zero dependencies, no network: run with
 //   npm test
-// Every protocol test talks to test/fake-studio-mcp.js, a stand-in for
-// Studio's built-in MCP binary that speaks the same JSON-RPC dialect.
+// (every relay/marketplace test would need Studio or roblox.com, so the
+// suite covers parsing, arg-building, validation, and local file state.)
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
 
 const cli = require("./cli.js");
 
-const CLI = path.join(__dirname, "cli.js");
-const FAKE = path.join(__dirname, "test", "fake-studio-mcp.js");
-const VERSION = require("./package.json").version;
-
-function run(args, options) {
-  const opts = options || {};
-  const env = { ...process.env };
-  delete env.GOLEM_STUDIO_ID;
-  delete env.FAKE_MCP_MODE;
-  delete env.GOLEM_STUDIO_MCP;
-  delete env.ROBLOX_STUDIO_MCP_BIN;
-  if (opts.override !== false) env.GOLEM_STUDIO_MCP = FAKE;
-  if (opts.mode) env.FAKE_MCP_MODE = opts.mode;
-  Object.assign(env, opts.env || {});
-  const res = spawnSync(process.execPath, [CLI, ...args], {
-    cwd: __dirname,
-    encoding: "utf8",
-    timeout: 30000,
-    env,
-    input: opts.input === undefined ? "" : opts.input,
+function throwsUsage(fn, pattern) {
+  assert.throws(fn, (err) => {
+    assert.ok(err instanceof cli.UsageError, `expected UsageError, got ${err}`);
+    if (pattern) assert.match(err.message, pattern);
+    return true;
   });
-  assert.equal(res.error, undefined, `spawn failed: ${res.error && res.error.message}`);
-  return res;
 }
 
-function tmpdir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "golem-test-"));
-}
-
-// ---------------------------------------------------------------- parsing
-
-test("plugin and package versions stay in sync", () => {
-  const source = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
-  const match = source.match(/^local VERSION = "([^"]+)"/m);
-  assert.ok(match, "plugin has a VERSION constant");
-  assert.equal(match[1], VERSION);
+test("vec3 parses x,y,z and space-separated triples", () => {
+  assert.deepEqual(cli.vec3("1,2,3"), { x: 1, y: 2, z: 3 });
+  assert.deepEqual(cli.vec3("1 2 3"), { x: 1, y: 2, z: 3 });
+  assert.deepEqual(cli.vec3("-1.5, 0, 4"), { x: -1.5, y: 0, z: 4 });
 });
 
-test("skillpack lists and prints the bundled skills", () => {
-  const list = run(["skillpack"]);
-  assert.equal(list.status, 0, list.stderr);
-  assert.match(list.stdout, /golem-game-brief/);
-  assert.match(list.stdout, /golem-scaffold/);
-  assert.match(list.stdout, /golem-playtest-qa/);
-  assert.match(list.stdout, /rbx-create-skill/);
-
-  const one = run(["skillpack", "golem-scaffold"]);
-  assert.equal(one.status, 0, one.stderr);
-  assert.match(one.stdout, /^---\nname: golem-scaffold/);
-  assert.match(one.stdout, /Init -> Start/);
-
-  const parsed = JSON.parse(run(["skillpack", "--json"]).stdout);
-  assert.equal(parsed.skills.length, 3);
-
-  assert.equal(run(["skillpack", "nope"]).status, 1);
-  assert.equal(run(["skillpack", "../package"]).status, 2);
+test("vec3 keeps the single-value x-only shorthand", () => {
+  assert.deepEqual(cli.vec3("5"), { x: 5, y: 0, z: 0 });
 });
 
-test("bundled skill frontmatter is valid", () => {
-  const dir = path.join(__dirname, "skills");
-  for (const name of ["golem-game-brief", "golem-scaffold", "golem-playtest-qa"]) {
-    const text = fs.readFileSync(path.join(dir, name, "SKILL.md"), "utf8");
-    const match = text.match(/^---\n([\s\S]*?)\n---\n/);
-    assert.ok(match, `${name} has frontmatter`);
-    assert.match(match[1], new RegExp(`^name: ${name}$`, "m"));
-    assert.match(match[1], /^description: .+$/m);
-    assert.match(match[1], /^enabled: true$/m);
-    assert.doesNotMatch(match[1], /^name: rbx-/m);
+test("vec3 rejects garbage", () => {
+  for (const bad of ["", "  ", "a,b,c", "1,2", "1,2,3,4", "1,NaN,3", "Infinity,0,0"]) {
+    throwsUsage(() => cli.vec3(bad), /bad vector/);
   }
 });
 
-test("parseStudios reads the shapes Studio has returned", () => {
-  assert.deepEqual(cli.parseStudios({ content: [{ type: "text", text: '{"studios":[]}' }] }), []);
-  assert.deepEqual(
-    cli.parseStudios({
-      content: [{ type: "text", text: '{"studios":[{"id":"abc","name":"Place"}]}' }],
-    }),
-    [{ id: "abc", name: "Place" }]
+test("scalar parses attr values", () => {
+  assert.equal(cli.scalar("42"), 42);
+  assert.equal(cli.scalar("-7"), -7);
+  assert.equal(cli.scalar("4.5"), 4.5);
+  assert.equal(cli.scalar("1e3"), 1000);
+  assert.equal(cli.scalar("true"), true);
+  assert.equal(cli.scalar("false"), false);
+  assert.equal(cli.scalar("hello"), "hello");
+  assert.equal(cli.scalar("0x10"), "0x10"); // not decimal: stays a string
+  assert.equal(cli.scalar(" 42 "), 42);
+});
+
+test("stripTimeout splits --timeout out of argv", () => {
+  assert.deepEqual(cli.stripTimeout(["--timeout", "5", "a"]), { args: ["a"], timeout: 5 });
+  assert.deepEqual(cli.stripTimeout(["a", "--timeout=7.5"]), { args: ["a"], timeout: 7.5 });
+  assert.deepEqual(cli.stripTimeout(["a", "b"]), { args: ["a", "b"], timeout: null });
+  assert.deepEqual(cli.stripTimeout(["--", "--timeout"]), { args: ["--", "--timeout"], timeout: null });
+  for (const bad of ["0", "-3", "abc", "Infinity", "NaN"]) {
+    throwsUsage(() => cli.stripTimeout(["--timeout", bad]), /--timeout/);
+  }
+  throwsUsage(() => cli.stripTimeout(["--timeout=0"]), /--timeout/);
+});
+
+test("parseToolArgs applies defaults", () => {
+  const ns = cli.parseToolArgs("list", []);
+  assert.equal(ns.path, "game");
+  assert.equal(ns.recursive, false);
+  assert.equal(ns.max, null);
+});
+
+test("parseToolArgs handles flags, appends, and --", () => {
+  const tag = cli.parseToolArgs("tag", ["P", "--add", "a", "--add=b", "--remove", "c"]);
+  assert.deepEqual(tag.add, ["a", "b"]);
+  assert.deepEqual(tag.remove, ["c"]);
+  const grep = cli.parseToolArgs("grep", ["-i", "pat"]);
+  assert.equal(grep.i, true);
+  assert.equal(grep.pattern, "pat");
+  const lua = cli.parseToolArgs("lua", ["--", "-x"]);
+  assert.equal(lua.code, "-x");
+  const scale = cli.parseToolArgs("scale", ["P", "-2"]);
+  assert.equal(scale.factor, -2); // negative positionals are values, not flags
+});
+
+test("parseToolArgs rejects bad flags and arity", () => {
+  throwsUsage(() => cli.parseToolArgs("list", ["--nope"]), /unknown flag/);
+  throwsUsage(() => cli.parseToolArgs("list", ["-z"]), /unknown flag/);
+  throwsUsage(() => cli.parseToolArgs("list", ["--recursive=true"]), /takes no value/);
+  throwsUsage(() => cli.parseToolArgs("tree", ["--depth"]), /needs a value/);
+  throwsUsage(() => cli.parseToolArgs("tree", ["--depth", "abc"]), /bad integer/);
+  throwsUsage(() => cli.parseToolArgs("turn", ["maybe"]), /bad action/);
+  throwsUsage(() => cli.parseToolArgs("turn", []), /missing action/);
+  throwsUsage(() => cli.parseToolArgs("delete", []), /need at least one/);
+  throwsUsage(() => cli.parseToolArgs("move", ["only-one"]), /missing parent/);
+  throwsUsage(() => cli.parseToolArgs("say", ["a", "b"]), /too many arguments/);
+  throwsUsage(() => cli.parseToolArgs("play", ["--mode", "pause"]), /bad value/);
+});
+
+test("buildArgs supports ping and debug (regression: both were 'unknown tool')", () => {
+  assert.deepEqual(cli.buildArgs("ping", {}), { op: "ping", args: {} });
+  assert.deepEqual(cli.buildArgs("debug", {}), { op: "debug", args: {} });
+});
+
+test("every non-local tool has buildArgs support (never 'unknown tool')", () => {
+  for (const name of Object.keys(cli.TOOLS)) {
+    if (cli.TOOLS[name].local) continue;
+    // lua/script read stdin when no code/source is given, so hand them some.
+    const ns =
+      name === "lua"
+        ? { code: "return 1" }
+        : name === "script"
+          ? { parent: "P", name: "N", cls: "Script", mode: "create", source: "print(1)" }
+          : {};
+    try {
+      const built = cli.buildArgs(name, ns);
+      assert.equal(typeof built.op, "string", `${name}: op must be a string`);
+    } catch (err) {
+      assert.ok(err instanceof cli.UsageError, `${name}: expected UsageError, got ${err}`);
+      assert.ok(!/unknown tool/.test(err.message), `${name}: missing buildArgs case`);
+    }
+  }
+});
+
+test("every tool is listed in exactly one help group", () => {
+  const grouped = cli.GROUPS.flatMap(([, names]) => names);
+  assert.deepEqual(new Set(grouped).size, grouped.length, "a tool is listed twice");
+  assert.deepEqual(new Set(Object.keys(cli.TOOLS)), new Set(grouped), "TOOLS and GROUPS disagree");
+});
+
+test("buildArgs validates tool arguments instead of sending junk to Studio", () => {
+  // tree: --depth 0 is depth 0, not the default (regression: || turned 0 into 2)
+  assert.equal(cli.buildArgs("tree", { path: "game", depth: 0 }).args.depth, 0);
+  assert.equal(cli.buildArgs("tree", { path: "game", depth: null }).args.depth, 2);
+  throwsUsage(() => cli.buildArgs("tree", { path: "game", depth: -1 }), /--depth/);
+  // positive-only numeric caps
+  for (const [tool, ns] of [
+    ["list", { path: "g", max: 0 }],
+    ["find", { query: "q", scope: "g", max: -1 }],
+    ["grep", { pattern: "p", scope: "g", max: 0 }],
+    ["logs", { limit: 0 }],
+    ["duplicate", { path: "p", count: 0 }],
+    ["scatter", { path: "p", count: 0 }],
+  ]) {
+    throwsUsage(() => cli.buildArgs(tool, ns), /must be/);
+  }
+  // scale needs a positive factor
+  throwsUsage(() => cli.buildArgs("scale", { path: "p", factor: 0 }), /positive/);
+  throwsUsage(() => cli.buildArgs("scale", { path: "p", factor: -2 }), /positive/);
+  // rotate needs --set or both --axis and --degrees
+  throwsUsage(() => cli.buildArgs("rotate", { path: "p", space: "world" }), /--set/);
+  throwsUsage(() => cli.buildArgs("rotate", { path: "p", space: "world", axis: "y" }), /--set/);
+  assert.deepEqual(cli.buildArgs("rotate", { path: "p", space: "world", axis: "y", degrees: 90 }).args,
+    { path: "p", space: "world", axis: "y", degrees: 90 });
+  // paint needs something to paint
+  throwsUsage(() => cli.buildArgs("paint", { paths: ["p"] }), /at least one/);
+  // selection --set needs a real path (empty used to silently clear the selection)
+  throwsUsage(() => cli.buildArgs("selection", { set: "" }), /at least one path/);
+  throwsUsage(() => cli.buildArgs("selection", { set: "  " }), /at least one path/);
+  // pivot needs something to set
+  throwsUsage(() => cli.buildArgs("pivot", { path: "p" }), /--position/);
+  // find needs a query or a tag
+  throwsUsage(() => cli.buildArgs("find", { query: "", scope: "game" }), /--tag/);
+  assert.equal(cli.buildArgs("find", { query: "", scope: "game", tag: "T" }).args.tag, "T");
+  // tag needs --add and/or --remove, with non-empty names
+  throwsUsage(() => cli.buildArgs("tag", { paths: ["p"] }), /--add/);
+  throwsUsage(() => cli.buildArgs("tag", { paths: ["p"], add: [""] }), /must not be empty/);
+  // turn end needs its note (the manual calls a missing note a rejection)
+  assert.equal(cli.buildArgs("turn", { action: "begin" }).op, "turn_begin");
+  throwsUsage(() => cli.buildArgs("turn", { action: "end" }), /--note/);
+  throwsUsage(() => cli.buildArgs("turn", { action: "end", note: "" }), /--note/);
+  // exec needs a string op
+  throwsUsage(() => cli.buildArgs("exec", { json: '{"op":123}' }), /string "op"/);
+  throwsUsage(() => cli.buildArgs("exec", { json: "not json" }), /invalid JSON/);
+  assert.equal(cli.buildArgs("exec", { json: '{"op":"list","args":{"path":"g"}}' }).op, "list");
+  // attr --set needs K=V with a non-empty key
+  throwsUsage(() => cli.buildArgs("attr", { path: "p", set: ["nokey"] }), /K=V/);
+  throwsUsage(() => cli.buildArgs("attr", { path: "p", set: ["=5"] }), /non-empty key/);
+  assert.deepEqual(cli.buildArgs("attr", { path: "p", set: ["A=1", "B=x"] }).args.set, { A: 1, B: "x" });
+  // terrain requirements
+  throwsUsage(() => cli.buildArgs("terrain", {}), /--position/);
+  throwsUsage(
+    () => cli.buildArgs("terrain", { action: "fill", shape: "block", position: "0,0,0", material: "Grass" }),
+    /--size/
   );
-  assert.deepEqual(
-    cli.parseStudios({ structuredContent: { studios: [{ studio_id: "s1", place_name: "One" }] } }),
-    [{ id: "s1", name: "One" }]
+  throwsUsage(
+    () => cli.buildArgs("terrain", { action: "fill", shape: "ball", position: "0,0,0", material: "Grass" }),
+    /--radius/
   );
-  assert.deepEqual(cli.parseStudios({ content: [{ type: "text", text: '["raw-id"]' }] }), [
-    { id: "raw-id", name: "" },
-  ]);
-  assert.deepEqual(cli.parseStudios({ content: [{ type: "text", text: "not json" }] }), []);
-  assert.deepEqual(cli.parseStudios({}), []);
 });
 
-test("resolveStudio picks, matches names, and refuses ambiguity", () => {
-  const one = [{ id: "a", name: "Alpha" }];
-  const two = [
-    { id: "a", name: "Alpha" },
-    { id: "b", name: "Beta" },
-  ];
-  assert.equal(cli.resolveStudio(one), "a");
-  assert.equal(cli.resolveStudio(two, "b"), "b");
-  assert.equal(cli.resolveStudio(two, "Beta"), "b");
-  assert.equal(cli.resolveStudio(two, "bet"), "b");
-  assert.throws(() => cli.resolveStudio(two), /several Studio windows/);
-  assert.throws(() => cli.resolveStudio(two, "zzz"), /no Studio matches/);
-  assert.throws(() => cli.resolveStudio([], "a"), /no Studio instance/);
+test("isValidChannel accepts 8-64 hex only", () => {
+  assert.equal(cli.isValidChannel("0123456789abcdef"), true);
+  assert.equal(cli.isValidChannel("ABCDEF12"), true);
+  assert.equal(cli.isValidChannel("a".repeat(64)), true);
+  for (const bad of ["", "xyz", "a".repeat(7), "a".repeat(65), "0123456789abcdeg", " 0123456789abcdef ", null, undefined, 123]) {
+    assert.equal(cli.isValidChannel(bad), false, JSON.stringify(bad));
+  }
 });
 
-test("tokenSet normalizes tool names", () => {
-  assert.deepEqual([...cli.tokenSet("search_game_tree")].sort(), ["game", "search", "tree"]);
-  assert.deepEqual([...cli.tokenSet("searchGameTree")].sort(), ["game", "search", "tree"]);
+test("relayBase enforces HTTPS and strips trailing slashes", () => {
+  assert.equal(cli.relayBase("https://example.com/"), "https://example.com");
+  assert.equal(cli.relayBase("https://example.com///"), "https://example.com");
+  assert.equal(cli.relayBase("http://localhost:9000/"), "http://localhost:9000");
+  assert.equal(cli.relayBase("http://127.0.0.1:9000/x"), "http://127.0.0.1:9000/x");
+  for (const bad of ["http://evil.example.com", "ftp://x", "https-evil.com", "", null]) {
+    assert.throws(() => cli.relayBase(bad), /non-HTTPS/);
+  }
+  // default (no env override in the test process) is the production relay
+  if (process.env.GOLEM_FIREBASE_DB === undefined && process.env.AIB_FIREBASE_DB === undefined) {
+    assert.equal(cli.relayBase(), "https://roblox-golem-default-rtdb.firebaseio.com");
+  }
 });
 
-test("parseFlags validates options", () => {
-  const spec = { limit: { type: "int" }, file: { type: "str" }, client: { type: "bool" } };
-  const flags = cli.parseFlags(["--limit", "5", "--file=x.luau", "--client", "pos"], spec);
-  assert.equal(flags.limit, 5);
-  assert.equal(flags.file, "x.luau");
-  assert.equal(flags.client, true);
-  assert.deepEqual(flags._pos, ["pos"]);
-  assert.equal(cli.parseFlags(["--", "--limit"], spec)._pos[0], "--limit");
-  assert.throws(() => cli.parseFlags(["--nope"], spec), cli.UsageError);
-  assert.throws(() => cli.parseFlags(["--limit", "abc"], spec), /integer/);
-  assert.throws(() => cli.parseFlags(["--timeout", "0"], spec), /positive/);
-  assert.throws(() => cli.parseFlags(["--wait", "-1"], spec), /positive number/);
-  assert.throws(() => cli.parseFlags(["--client=true"], spec), /takes no value/);
+test("loadChannel prefers GOLEM_CHANNEL, then AIB_CHANNEL, then the file", () => {
+  const saved = { GOLEM_CHANNEL: process.env.GOLEM_CHANNEL, AIB_CHANNEL: process.env.AIB_CHANNEL };
+  try {
+    delete process.env.GOLEM_CHANNEL;
+    delete process.env.AIB_CHANNEL;
+    process.env.AIB_CHANNEL = "aaaaaaaaaaaaaaaa";
+    assert.equal(cli.loadChannel(), "aaaaaaaaaaaaaaaa");
+    process.env.GOLEM_CHANNEL = "bbbbbbbbbbbbbbbb";
+    assert.equal(cli.loadChannel(), "bbbbbbbbbbbbbbbb");
+    assert.equal(cli.envChannelName(), "GOLEM_CHANNEL");
+    delete process.env.GOLEM_CHANNEL;
+    assert.equal(cli.envChannelName(), "AIB_CHANNEL");
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
 });
 
-test("buildArgs maps logical names onto the live schema", () => {
-  const tool = {
-    name: "execute_luau",
-    inputSchema: {
-      type: "object",
-      properties: { luau: { type: "string" }, studio_id: { type: "string" } },
-      required: ["luau", "studio_id"],
-    },
-  };
-  assert.deepEqual(cli.buildArgs(tool, { code: "print(1)" }, "s1"), { luau: "print(1)", studio_id: "s1" });
-  assert.throws(() => cli.buildArgs(tool, { code: "x" }, null), /needs studio_id/);
-  assert.throws(() => cli.buildArgs(tool, {}, "s1"), /needs luau/);
-  assert.throws(() => cli.buildArgs(tool, { query: "x" }, "s1"), /does not accept 'query'/);
+test("mpInfo rejects non-numeric asset ids before touching the network", async () => {
+  for (const bad of ["12ab", "abc", "", "  ", null, undefined, "rbxassetid://x"]) {
+    await assert.rejects(() => cli.mpInfo(bad), /bad asset id/);
+  }
 });
 
-test("resolveTool falls back to token matching", () => {
-  const tools = [{ name: "search_game_tree", inputSchema: { properties: { path: {} } } }];
-  assert.equal(cli.resolveTool(tools, ["searchGameTree"]).name, "search_game_tree");
-  assert.throws(() => cli.resolveTool(tools, ["insert_asset"]), /does not expose/);
+test("saveChannel writes a 0600 channel file and removeStaleHelpers cleans 2.x leftovers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "golem-test-"));
+  try {
+    const stale = ["golem-helper.py", "golem-tools.md", "golem.py", "golem.md"];
+    for (const f of [...stale, "keep.txt"]) fs.writeFileSync(path.join(dir, f), "x");
+    const file = cli.saveChannel(dir, "0123456789abcdef");
+    assert.equal(file, path.join(dir, "channel"));
+    assert.equal(fs.readFileSync(file, "utf8"), "0123456789abcdef\n");
+    for (const f of stale) assert.equal(fs.existsSync(path.join(dir, f)), false, f);
+    assert.equal(fs.existsSync(path.join(dir, "keep.txt")), true);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-// ---------------------------------------------------------------- cli surface
-
-test("help, version, and command help", () => {
-  const help = run(["help"]);
-  assert.equal(help.status, 0);
-  assert.match(help.stdout, /Connection:/);
-  assert.match(help.stdout, /Marketplace:/);
-  assert.match(help.stdout, /Skills:/);
-
-  assert.equal(run(["--version"]).stdout.trim(), VERSION);
-
-  const cmd = run(["help", "run"]);
-  assert.equal(cmd.status, 0);
-  assert.match(cmd.stdout, /Usage: npx golem-bridge run/);
-  assert.match(cmd.stdout, /--datamodel/);
-});
-
-test("unknown commands and flags exit 2", () => {
-  const unknown = run(["frobnicate"]);
-  assert.equal(unknown.status, 2);
-  assert.match(unknown.stderr, /unknown command/);
-
-  assert.equal(run(["status", "--nope"]).status, 2);
-  assert.equal(run(["reconnect"]).status, 2);
-  assert.match(run(["connect", "secret-channel"]).stderr, /takes no channel id/);
-});
-
-test("manual prints the agent reference", () => {
-  const res = run(["manual"]);
-  assert.equal(res.status, 0);
-  assert.match(res.stdout, /Roblox Studio tools/);
-  assert.match(res.stdout, /rbx-debug/);
-  assert.match(res.stdout, /Rules of the road/);
-});
-
-// ---------------------------------------------------------------- connection
-
-test("connect --brief handshakes and lists the studio", () => {
-  const res = run(["connect", "--brief"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /Handshake: FakeStudioMCP 9\.9\.9/);
-  assert.match(res.stdout, /Tools: 15/);
-  assert.match(res.stdout, /Studio: studio-abc {2}Test Place/);
-  assert.match(res.stdout, /connected\./);
-  assert.doesNotMatch(res.stdout, /Roblox Studio tools/);
-});
-
-test("connect prints the manual after a successful handshake", () => {
-  const res = run(["connect"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /Roblox Studio tools/);
-  assert.match(res.stdout, /Marketplace/);
-});
-
-test("status and studios report the live session", () => {
-  const status = run(["status"]);
-  assert.equal(status.status, 0);
-  assert.match(status.stdout, /^CONNECTED {2}FakeStudioMCP 9\.9\.9 {2}15 tools {2}studio-abc \(Test Place\)/);
-
-  assert.equal(run(["ping"]).status, 0);
-  const studios = run(["studios", "--json"]);
-  assert.deepEqual(JSON.parse(studios.stdout).studios, [{ id: "studio-abc", name: "Test Place" }]);
-});
-
-test("no studio attached is a clear failure, not a crash", () => {
-  const res = run(["connect", "--wait", "0"], { mode: "nostudio" });
-  assert.equal(res.status, 1);
-  assert.match(res.stdout, /Studio did not attach/);
-  assert.match(res.stdout, /Enable Studio as MCP server/);
-  assert.doesNotMatch(res.stdout, /Roblox Studio tools/);
-});
-
-test("late attach is retried within the wait window", () => {
-  const quick = run(["connect", "--brief", "--wait", "0"], { mode: "late" });
-  assert.equal(quick.status, 1);
-
-  const slow = run(["connect", "--brief"], { mode: "late" });
-  assert.equal(slow.status, 0, slow.stderr);
-  assert.match(slow.stdout, /connected\./);
-});
-
-test("several windows require an explicit choice", () => {
-  const ambiguous = run(["run", "print(1)"], { mode: "multi" });
-  assert.equal(ambiguous.status, 1);
-  assert.match(ambiguous.stderr, /several Studio windows/);
-  assert.match(ambiguous.stderr, /studio-2 {2}Second Place/);
-
-  const chosen = run(["run", "--studio", "Second", "print(1)"], { mode: "multi" });
-  assert.equal(chosen.status, 0, chosen.stderr);
-  assert.match(chosen.stdout, /studio=studio-2/);
-});
-
-test("a missing Studio binary explains the platform", () => {
-  if (process.platform === "win32" || process.platform === "darwin") return;
-  const res = run(["status"], { override: false });
-  assert.equal(res.status, 1);
-  assert.match(res.stderr, /only available on macOS and Windows/);
-});
-
-test("a crashing MCP binary surfaces stderr-free exit", () => {
-  const res = run(["status"], { mode: "crash" });
-  assert.equal(res.status, 1);
-  assert.match(res.stderr, /Studio MCP (closed|could not send)/);
-});
-
-test("a silent tools/list times out instead of hanging", () => {
-  const res = run(["status", "--timeout", "1"], { mode: "silent" });
-  assert.equal(res.status, 1);
-  assert.match(res.stderr, /no response to 'tools\/list' within 1s/);
-});
-
-// ---------------------------------------------------------------- tools
-
-test("tools follows pagination and prints schemas", () => {
-  const all = run(["tools"]);
-  assert.equal(all.status, 0, all.stderr);
-  assert.match(all.stdout, /execute_luau/);
-  assert.match(all.stdout, /screen_capture/);
-  assert.match(all.stdout, /multi_edit/);
-
-  const one = run(["tools", "execute_luau"]);
-  assert.equal(one.status, 0);
-  assert.match(one.stdout, /arguments: code\*: string/);
-  assert.match(one.stdout, /"datamodel_type"/);
-
-  const missing = run(["tools", "nope"]);
-  assert.equal(missing.status, 1);
-  assert.match(missing.stderr, /unknown Studio tool/);
-});
-
-// ---------------------------------------------------------------- luau
-
-test("run executes in Edit by default and routes to the studio", () => {
-  const res = run(["run", "print(1 + 1)"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.equal(res.stdout, "datamodel=Edit\nstudio=studio-abc\ncode=print(1 + 1)\n");
-});
-
-test("run supports client, server, file, and stdin", () => {
-  assert.match(run(["run", "--client", "print(1)"]).stdout, /datamodel=Client/);
-  assert.match(run(["run", "--server", "print(1)"]).stdout, /datamodel=Server/);
-  assert.match(run(["run", "--datamodel=Client", "print(1)"]).stdout, /datamodel=Client/);
-
-  const dir = tmpdir();
-  const file = path.join(dir, "code.luau");
-  fs.writeFileSync(file, "print('from file')\n");
-  assert.match(run(["run", "--file", file]).stdout, /code=print\('from file'\)/);
-
-  assert.match(run(["run", "-"], { input: "print('stdin')\n" }).stdout, /code=print\('stdin'\)/);
-});
-
-test("run rejects empty code and bad datamodels", () => {
-  assert.equal(run(["run"]).status, 2);
-  assert.match(run(["run", "   "]).stderr, /non-empty Luau code/);
-  assert.equal(run(["run", "--datamodel", "Workspace", "x"]).status, 2);
-  assert.equal(run(["run", "--file", "/nonexistent/x.luau"]).status, 1);
-});
-
-test("run reports tool errors as failures", () => {
-  const res = run(["run", "error('x')"], { mode: "toolerror" });
-  assert.equal(res.status, 1);
-  assert.match(res.stderr, /boom: Luau failed/);
-});
-
-// ---------------------------------------------------------------- marketplace
-
-test("search defaults to every asset kind and forwards filters", () => {
-  const plain = run(["search", "chair"]);
-  assert.equal(plain.status, 0, plain.stderr);
-  assert.equal(JSON.parse(plain.stdout).type, "All");
-
-  const res = run(["search", "tree", "--type", "model", "--scope", "inventory", "--limit", "5"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.deepEqual(JSON.parse(res.stdout), { query: "tree", type: "Model", scope: "inventory", limit: 5 });
-
-  assert.equal(JSON.parse(run(["search", "logo", "--type", "image"]).stdout).type, "Image");
-  assert.equal(JSON.parse(run(["search", "boom", "--type", "AUDIO"]).stdout).type, "Audio");
-  assert.equal(JSON.parse(run(["search", "chair", "--type", "all"]).stdout).type, "All");
-
-  const bad = run(["search", "chair", "--type", "spaceship"]);
-  assert.equal(bad.status, 1);
-  assert.match(bad.stderr, /not an accepted asset_type/);
-  assert.match(bad.stderr, /Model, Image, Audio/);
-});
-
-test("search validates input", () => {
-  assert.equal(run(["search"]).status, 2);
-  assert.match(run(["search", "x", "--limit", "0"]).stderr, /positive integer/);
-  assert.match(run(["search", "x", "--limit", "1.5"]).stderr, /must be an integer/);
-});
-
-test("insert normalizes asset ids", () => {
-  const res = run(["insert", "rbxassetid://123456"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.equal(res.stdout.trim(), "inserted 123456 under Selection");
-
-  const parented = run(["insert", "42", "--parent", "Workspace.Props"]);
-  assert.match(parented.stdout, /inserted 42 under Workspace\.Props/);
-
-  assert.equal(run(["insert", "abc"]).status, 2);
-});
-
-// ---------------------------------------------------------------- skills
-
-test("skills lists the classic set and asks Studio", () => {
-  const res = run(["skills"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /rbx-create-skill/);
-  assert.match(res.stdout, /rbx-perf-profiling/);
-  assert.match(res.stdout, /rbx-unit-test/);
-  assert.match(res.stdout, /skills: rbx-debug, rbx-unit-test/);
-
-  const json = run(["skills", "--json"]);
-  const parsed = JSON.parse(json.stdout);
-  assert.equal(parsed.classic.length, 7);
-  assert.equal(parsed.studio.content[0].text, "skills: rbx-debug, rbx-unit-test");
-});
-
-test("skill loads one skill by name", () => {
-  const res = run(["skill", "rbx-debug"]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.equal(res.stdout.trim(), "SKILL:rbx-debug");
-});
-
-// ---------------------------------------------------------------- raw tools
-
-test("call passes arguments and injects studio_id", () => {
-  const res = run(["call", "inspect_instance", '{"path":"Workspace.Baseplate"}']);
-  assert.equal(res.status, 0, res.stderr);
-  assert.equal(
-    res.stdout.trim(),
-    'inspect_instance({"path":"Workspace.Baseplate","studio_id":"studio-abc"})'
-  );
-
-  const luau = run(["call", "execute_luau", '{"code":"print(2)"}']);
-  assert.match(luau.stdout, /code=print\(2\)/);
-  assert.match(luau.stdout, /studio=studio-abc/);
-});
-
-test("call validates the tool and its required arguments", () => {
-  assert.equal(run(["call"]).status, 2);
-  assert.equal(run(["call", "nope", "{}"]).status, 1);
-
-  const missing = run(["call", "execute_luau", "{}"]);
-  assert.equal(missing.status, 1);
-  assert.match(missing.stderr, /execute_luau needs code/);
-
-  assert.equal(run(["call", "execute_luau", "not json"]).status, 2);
-  assert.equal(run(["call", "execute_luau", '{"code":"x","studio_id":"zzz"}']).status, 1);
-  assert.match(run(["call", "execute_luau"]).stderr, /needs code/);
-});
-
-test("json mode returns the raw MCP result", () => {
-  const res = run(["run", "--json", "print(1)"]);
-  assert.equal(res.status, 0, res.stderr);
-  const parsed = JSON.parse(res.stdout);
-  assert.equal(parsed.content[0].type, "text");
-  assert.match(parsed.content[0].text, /code=print\(1\)/);
-});
-
-test("screenshot writes returned image blocks", () => {
-  const dir = tmpdir();
-  const out = path.join(dir, "viewport.png");
-  const res = run(["screenshot", "--out", out]);
-  assert.equal(res.status, 0, res.stderr);
-  assert.equal(fs.readFileSync(out, "utf8"), "PNGDATA");
-  assert.match(res.stdout, /viewport\.png/);
-});
-
-// ---------------------------------------------------------------- compatibility
-
-test("legacy Studio schemas resolve at runtime", () => {
-  const luau = run(["run", "print(1)"], { mode: "legacy" });
-  assert.equal(luau.status, 0, luau.stderr);
-  assert.match(luau.stdout, /datamodel=Edit/);
-  assert.match(luau.stdout, /code=print\(1\)/);
-
-  const search = run(["search", "tree"], { mode: "legacy" });
-  assert.equal(search.status, 0, search.stderr);
-  assert.equal(JSON.parse(search.stdout).query, "tree");
-
-  const insert = run(["insert", "99"], { mode: "legacy" });
-  assert.match(insert.stdout, /inserted 99/);
-
-  const skill = run(["skill", "rbx-unit-test"], { mode: "legacy" });
-  assert.equal(skill.stdout.trim(), "SKILL:rbx-unit-test");
+test("disconnect removes the channel dir (and warns when the env still connects)", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "golem-test-"));
+  const cwd = process.cwd();
+  const savedEnv = { GOLEM_CHANNEL: process.env.GOLEM_CHANNEL, AIB_CHANNEL: process.env.AIB_CHANNEL };
+  const savedLog = console.log;
+  const savedErr = console.error;
+  let logged = "";
+  let warned = "";
+  console.log = (s) => { logged += s; };
+  console.error = (s) => { warned += s; };
+  try {
+    delete process.env.GOLEM_CHANNEL;
+    delete process.env.AIB_CHANNEL;
+    process.chdir(tmp);
+    cli.saveChannel(path.join(tmp, ".golem"), "0123456789abcdef");
+    cli.disconnect();
+    assert.equal(fs.existsSync(path.join(tmp, ".golem")), false);
+    assert.match(logged, /disconnected/);
+    process.env.GOLEM_CHANNEL = "bbbbbbbbbbbbbbbb";
+    cli.disconnect();
+    assert.match(warned, /GOLEM_CHANNEL/);
+  } finally {
+    console.log = savedLog;
+    console.error = savedErr;
+    process.chdir(cwd);
+    for (const k of Object.keys(savedEnv)) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
