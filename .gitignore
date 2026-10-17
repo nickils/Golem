@@ -1,4 +1,3 @@
 node_modules/
-.golem/
 *.log
 .DS_Store

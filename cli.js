@@ -1,33 +1,23 @@
 #!/usr/bin/env node
 "use strict";
 
-// golem-bridge: drive a live Roblox Studio session from any AI agent.
-// Session setup (connect/reconnect/disconnect) plus every Studio tool,
-// all through the Firebase command relay. Zero dependencies.
+// golem-bridge: drive Roblox Studio through its built-in MCP server.
+// Zero dependencies. No plugin, no relay, no saved session.
+//
+// Every command spawns Studio's own MCP process (StudioMCP on macOS,
+// mcp.bat on Windows), speaks newline-delimited JSON-RPC over stdio,
+// calls one tool, and exits. Nothing is written to disk.
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
-const crypto = require("crypto");
+const readline = require("readline");
+const { spawn } = require("child_process");
 
-// GOLEM_* names are preferred; AIB_* are the legacy aliases kept for
-// backward compatibility with existing setups and scripts.
-function envOf(...names) {
-  for (const n of names) {
-    const v = process.env[n];
-    if (v) return v;
-  }
-  return undefined;
-}
-
-const DB_URL = envOf("GOLEM_FIREBASE_DB", "AIB_FIREBASE_DB") || "https://roblox-golem-default-rtdb.firebaseio.com";
-const POLL_INTERVAL_MS = Math.max(250, (parseFloat(envOf("GOLEM_POLL_INTERVAL", "AIB_POLL_INTERVAL")) || 2) * 1000);
-const FETCH_TIMEOUT_MS = 30000;
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_TIMEOUT = 120;
-// Channel IDs are hex tokens minted by the Studio plugin (16 chars today,
-// tolerated 8-64 for forward compatibility). Anything else is rejected so a
-// malformed ID can never alter the request URL.
-const CHANNEL_RE = /^[0-9a-fA-F]{8,64}$/;
+// Piping into `head` or `less` closes stdout early; that is not an error.
+process.stdout.on("error", (error) => {
+  if (error && error.code === "EPIPE") process.exit(0);
+});
 
 let VERSION = "unknown";
 try {
@@ -36,1202 +26,1392 @@ try {
   // running outside the package dir; version is informational only
 }
 
-// The relay must be HTTPS (plain HTTP is only allowed for localhost, for
-// local Firebase emulator testing). Trailing slashes are stripped so URL
-// joins stay clean. Takes an optional override for testability.
-function relayBase(url) {
-  const raw = String(url !== undefined ? url : DB_URL || "").replace(/\/+$/, "");
-  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(raw)) return raw;
-  if (!/^https:\/\//.test(raw)) {
-    throw new Error(
-      `refusing to talk to a non-HTTPS relay (${raw || "(empty)"}) - check GOLEM_FIREBASE_DB/AIB_FIREBASE_DB`
-    );
+const MCP_PROTOCOL = "2024-11-05";
+const CLIENT_NAME = "golem-bridge";
+const INIT_TIMEOUT_MS = 15000;
+const TOOLS_TIMEOUT_MS = 30000;
+const CALL_TIMEOUT_MS = 120000;
+const ATTACH_TIMEOUT_SEC = 12;
+const ATTACH_POLL_MS = 500;
+const MAX_FRAME_CHARS = 16 * 1024 * 1024;
+const MAX_TOOL_PAGES = 50;
+
+const STUDIO_ID_ENV = "GOLEM_STUDIO_ID";
+const MCP_BIN_ENV = "GOLEM_STUDIO_MCP";
+const MCP_BIN_LEGACY_ENV = "ROBLOX_STUDIO_MCP_BIN";
+
+const CLASSIC_SKILLS = [
+  ["rbx-create-skill", "Author, edit, or rename an Assistant skill."],
+  ["rbx-debug", "Set breakpoints and inspect call stacks, locals, and thread state."],
+  ["rbx-device-simulator-lua", "Drive Device Simulator presets, orientation, and UI captures."],
+  ["rbx-docs-search", "Retrieve authoritative Roblox API and Creator documentation."],
+  ["rbx-perf-profiling", "Read MicroProfiler traces and find CPU, GPU, and memory bottlenecks."],
+  ["rbx-scene-analysis", "Audit rendering cost, memory, instance composition, and leaks."],
+  ["rbx-unit-test", "Write, run, and debug Luau unit tests (Jest-Lua, TestEZ, or fallback)."],
+];
+
+// Logical argument -> the schema property names Studio has used or may use.
+const ARG_ALIASES = {
+  studio: ["studio_id"],
+  code: ["code", "luau", "source", "script", "command"],
+  datamodel: ["datamodel_type", "datamodelType", "datamodel", "data_model_type", "context"],
+  query: ["query", "keyword", "search", "searchQuery", "searchTerm", "search_term", "term", "q", "text"],
+  path: ["path", "instance_path", "instancePath", "target", "root", "scope"],
+  depth: ["depth", "max_depth", "maxDepth"],
+  className: ["class", "className", "class_name", "type"],
+  assetType: ["asset_type", "assetType", "assetTypes", "asset_types", "types", "type", "kind", "category", "assetTypeId"],
+  scope: ["scope", "inventory", "source", "creatorScope", "creator_scope"],
+  limit: ["limit", "max", "page_size", "pageSize"],
+  assetId: ["asset_id", "assetId", "id", "asset", "assetID"],
+  parent: ["parent", "parent_path", "parentPath"],
+  startLine: ["start_line", "startLine", "from_line", "fromLine", "line_start"],
+  endLine: ["end_line", "endLine", "to_line", "toLine", "line_end"],
+  pattern: ["pattern", "regex", "search_pattern", "searchPattern"],
+  isStart: ["is_start", "isStart", "start", "playing"],
+  captureId: ["capture_id", "captureId"],
+  skillName: ["name", "skill", "skill_name", "skillName", "id"],
+};
+
+class UsageError extends Error {}
+class CliError extends Error {
+  constructor(message, exitCode) {
+    super(message);
+    this.exitCode = exitCode || 1;
   }
-  return raw;
 }
-
-function isTooLarge(err) {
-  return !!err && typeof err.message === "string" && err.message.includes("response too large");
-}
-
-function fail(message, exitCode) {
-  console.error(`golem-bridge error: ${message}`);
-  process.exit(exitCode || 1);
-}
+class McpError extends Error {}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseRetryAfter(headers, fallback) {
-  try {
-    const v = parseFloat(headers.get("retry-after"));
-    if (Number.isFinite(v) && v >= 0) return v;
-  } catch {
-    // fall through
-  }
-  return fallback;
+function print(text) {
+  if (text === undefined || text === null) return;
+  process.stdout.write(String(text));
+  if (!String(text).endsWith("\n")) process.stdout.write("\n");
 }
 
-async function fetchText(url, opts) {
-  const o = opts || {};
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), o.timeoutMs || FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      method: o.method || (o.body === undefined ? "GET" : "POST"),
-      headers: Object.assign({ Accept: "application/json" }, o.headers || {}),
-      body: o.body,
-      signal: ctrl.signal,
-      redirect: "error", // responses must come from the relay itself
-    });
-    const text = await res.text();
-    if (text.length > MAX_BODY_BYTES) {
-      throw new Error("response too large, refusing to parse it");
-    }
-    return { ok: res.ok, status: res.status, headers: res.headers, text };
-  } catch (err) {
-    if (err && err.name === "AbortError") {
-      throw new Error(`request timed out (${(o.timeoutMs || FETCH_TIMEOUT_MS) / 1000}s)`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
+function printErr(text) {
+  if (text === undefined || text === null) return;
+  process.stderr.write(String(text));
+  if (!String(text).endsWith("\n")) process.stderr.write("\n");
 }
 
-async function relayCall(channelId, op, args, timeoutSec) {
-  let base;
-  try {
-    base = relayBase();
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-  const enc = encodeURIComponent(channelId);
-  const cmdId = `c${Date.now().toString(36)}${crypto.randomBytes(8).toString("hex")}`;
-  const payload = JSON.stringify({ id: cmdId, op, args: args || {}, ts: Math.floor(Date.now() / 1000) });
-  let sinceKey = null;
-  for (let attempt = 0; ; attempt++) {
-    let r;
-    try {
-      r = await fetchText(`${base}/channels/${enc}/cmd.json`, { method: "POST", body: payload });
-    } catch (err) {
-      return { ok: false, error: `cannot reach the relay (${err.message}) - check internet/DNS` };
-    }
-    if (r.status === 429 && attempt < 3) {
-      await sleep(parseRetryAfter(r.headers, 5 * (attempt + 1)) * 1000);
-      continue;
-    }
-    if (!r.ok) {
-      return { ok: false, error: `relay rejected the command: HTTP ${r.status}: ${r.text.slice(0, 200)}` };
-    }
-    try {
-      sinceKey = (JSON.parse(r.text) || {}).name || null;
-    } catch {
-      sinceKey = null;
-    }
-    break;
-  }
-  const deadline = Date.now() + timeoutSec * 1000;
-  let attempt = 0;
-  while (Date.now() < deadline) {
-    let r;
-    try {
-      r = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 60000 });
-    } catch (err) {
-      if (isTooLarge(err)) {
-        return {
-          ok: false,
-          error: "the result channel is too large to poll - ask the user to restart Studio to rotate to a fresh channel",
-        };
-      }
-      attempt++;
-      await sleep(Math.min(15, 0.5 * 2 ** Math.min(attempt, 5)) * 1000);
-      continue;
-    }
-    if (r.status === 429) {
-      await sleep(parseRetryAfter(r.headers, 6) * 1000);
-      continue;
-    }
-    if (!r.ok) {
-      await sleep(2000);
-      continue;
-    }
-    attempt = 0;
-    let keys;
-    try {
-      keys = r.text === "null" ? {} : JSON.parse(r.text);
-    } catch {
-      keys = {};
-    }
-    if (keys && typeof keys === "object") {
-      for (const key of Object.keys(keys).sort()) {
-        if (sinceKey !== null && !(key > sinceKey)) continue;
-        let entry;
-        try {
-          const er = await fetchText(`${base}/channels/${enc}/res/${encodeURIComponent(key)}.json`, {
-            timeoutMs: 60000,
-          });
-          if (!er.ok) continue; // transient: retry this key on the next poll
-          entry = JSON.parse(er.text);
-        } catch (err) {
-          if (isTooLarge(err)) {
-            return {
-              ok: false,
-              error: `Studio's reply to '${op}' exceeded the relay size cap - narrow the query (path, depth, max)`,
-            };
-          }
-          continue; // transient or corrupt entry: retry this key on the next poll
-        }
-        sinceKey = key;
-        if (entry && entry.id === cmdId) {
-          if (entry.resultEncoded && typeof entry.result === "string") {
-            try {
-              entry.result = JSON.parse(entry.result);
-            } catch {
-              // keep the raw string
-            }
-            delete entry.resultEncoded;
-          }
-          return entry;
-        }
-      }
-    }
-    await sleep(POLL_INTERVAL_MS);
-  }
-  return {
-    ok: false,
-    error: `timed out after ${timeoutSec}s waiting for Studio to answer '${op}'. Is Roblox Studio open with the Golem plugin connected to the relay?`,
-  };
-}
+// ------------------------------------------------------------------ launch
 
-function turnReminder(entry) {
-  if (!entry || !entry.turnOpen) return;
-  const n = entry.turnTools;
-  const head =
-    typeof n === "number"
-      ? `>> TURN STILL OPEN (${n} tools) - do NOT reply yet.`
-      : ">> TURN STILL OPEN - do NOT reply yet.";
-  console.error(`${head} When this task is done, close it with:\n>>    npx golem-bridge turn end --note "your reply"`);
-}
-
-// Exit codes: 0 = ok, 1 = Studio/relay reported an error, 2 = usage error.
-// Usage errors never go through out(); they print directly and exit 2.
-function out(data, opts) {
-  const o = opts || {};
-  if (data && data.ok) {
-    if (o.rawField && !o.asJson) {
-      const result = data.result || {};
-      if (typeof result[o.rawField] === "string") {
-        process.stdout.write(result[o.rawField]);
-        if (!result[o.rawField].endsWith("\n")) process.stdout.write("\n");
-        turnReminder(data);
-        process.exitCode = 0;
-        return;
-      }
-    }
-    console.log(JSON.stringify(data, null, 2));
-    turnReminder(data);
-    process.exitCode = 0;
-    return;
-  }
-  console.error(JSON.stringify(data, null, 2));
-  turnReminder(data);
-  process.exitCode = 1;
-}
-
-function vec3(s) {
-  const parts = String(s)
-    .replace(/,/g, " ")
-    .split(/\s+/)
-    .filter((v) => v !== "")
-    .map(Number);
-  if (parts.length === 0 || parts.some((v) => !Number.isFinite(v))) {
-    throw new UsageError(`bad vector "${s}" (expected x,y,z numbers)`);
-  }
-  if (parts.length === 1) return { x: parts[0], y: 0, z: 0 };
-  if (parts.length !== 3) throw new UsageError(`bad vector "${s}" (expected x,y,z)`);
-  return { x: parts[0], y: parts[1], z: parts[2] };
-}
-
-class UsageError extends Error {}
-
-function loadChannel() {
-  const fromEnv = envOf("GOLEM_CHANNEL", "AIB_CHANNEL");
-  if (fromEnv) return fromEnv;
-  try {
-    const raw = fs.readFileSync(path.join(process.cwd(), ".golem", "channel"), "utf8").trim();
-    if (raw) return raw;
-  } catch {
-    // fall through to the 2.x stamped helper below
-  }
-  for (const name of ["golem-helper.py", "golem.py"]) {
-    try {
-      const src = fs.readFileSync(path.join(process.cwd(), ".golem", name), "utf8");
-      const m = src.match(/CHANNEL = os\.environ\.get\("AIB_CHANNEL", "([0-9a-fA-F]+)"\)/);
-      if (m) return m[1];
-    } catch {
-      // try the next name
-    }
-  }
-  return null;
-}
-
-function isValidChannel(id) {
-  return typeof id === "string" && CHANNEL_RE.test(id);
-}
-
-function requireChannel() {
-  const id = loadChannel();
-  if (!isValidChannel(id)) {
-    out({ ok: false, error: "not connected (no channel saved) - run: npx golem-bridge connect <channelId>" });
-    return null;
-  }
-  return id;
-}
-
-// Leftover filenames from the 2.x Python helper, cleaned up on connect.
-const STALE_HELPER_FILES = ["golem-helper.py", "golem-tools.md", "golem.py", "golem.md"];
-
-function removeStaleHelpers(dir) {
-  for (const stale of STALE_HELPER_FILES) {
-    try {
-      fs.rmSync(path.join(dir, stale), { force: true });
-    } catch {
-      // cleanup must never block a connect
-    }
-  }
-}
-
-// The channel id is a capability secret, so the file must not be
-// world-readable. Returns the path of the written file.
-function saveChannel(dir, id) {
-  try {
-    removeStaleHelpers(dir);
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, "channel");
-    fs.writeFileSync(file, id + "\n", { mode: 0o600 });
-    try {
-      fs.chmodSync(file, 0o600); // tighten pre-existing files too (mode only applies on creation)
-    } catch {
-      // best effort (e.g. filesystems without unix permissions)
-    }
-  } catch (err) {
-    fail(`cannot save the channel file in ${dir}: ${err.message}`, 1);
-  }
-  return path.join(dir, "channel");
-}
-
-function envChannelName() {
-  if (process.env.GOLEM_CHANNEL) return "GOLEM_CHANNEL";
-  if (process.env.AIB_CHANNEL) return "AIB_CHANNEL";
-  return null;
-}
-
-function readStdin() {
-  try {
-    return fs.readFileSync(0, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-// ---------------------------------------------------------------- marketplace
-// search/info always run on this machine: Studio's HttpService cannot reach
-// roblox.com, so there is no plugin-side marketplace path.
-
-const MP_CATEGORIES = {
-  model: "Model", models: "Model", mesh: "MeshPart", meshes: "MeshPart", meshpart: "MeshPart",
-  decal: "Decal", decals: "Decal", image: "Decal", images: "Decal", picture: "Decal", texture: "Decal",
-  audio: "Audio", sound: "Audio", sounds: "Audio", music: "Audio",
-  video: "Video", videos: "Video", plugin: "Plugin", plugins: "Plugin",
-};
-const ASSET_TYPE_NAMES = { 1: "Image", 3: "Audio", 4: "Mesh", 9: "Decal", 10: "Model", 18: "Video", 19: "Font", 40: "MeshPart" };
-
-async function mpGet(url) {
-  const r = await fetchText(url, { headers: { "User-Agent": `golem-bridge/${VERSION}` }, timeoutMs: 20000 });
-  if (!r.ok) throw new Error(`HTTP ${r.status} from Roblox: ${r.text.slice(0, 200)}`);
-  return JSON.parse(r.text);
-}
-
-async function mpSearch(query, category, limit, cursor) {
-  const assetType = MP_CATEGORIES[String(category || "model").toLowerCase()];
-  if (!assetType) throw new Error(`unknown category '${category}' (valid: model, mesh, image, audio, video, plugin)`);
-  let n = parseInt(limit, 10);
-  if (!Number.isFinite(n)) n = 10;
-  n = Math.max(1, Math.min(n, 50));
-  let url = `https://apis.roblox.com/toolbox-service/v1/marketplace/${assetType}?keyword=${encodeURIComponent(String(query))}&limit=${n}`;
-  if (cursor) url += `&cursor=${encodeURIComponent(String(cursor))}`;
-  const data = await mpGet(url);
-  const ids = ((data && data.data) || []).filter((it) => it && it.id != null).map((it) => it.id);
-  const details = {};
-  const thumbs = {};
-  const enriched = Math.min(ids.length, 12);
-  for (let i = 0; i < enriched; i++) {
-    try {
-      details[ids[i]] = await mpGet(`https://economy.roblox.com/v2/assets/${ids[i]}/details`);
-    } catch {
-      // one bad asset must not kill the search
-    }
-    if (i < enriched - 1) await sleep(400); // the economy API rate limits hard
-  }
-  if (ids.length) {
-    try {
-      const tdata = await mpGet(
-        `https://thumbnails.roblox.com/v1/assets?assetIds=${ids.slice(0, 12).join(",")}&size=420x420&format=Png`
-      );
-      for (const th of (tdata && tdata.data) || []) {
-        if (th && th.targetId != null) thumbs[th.targetId] = th;
-      }
-    } catch {
-      // thumbnails are a bonus
-    }
-  }
-  const results = ids.map((aid) => {
-    const d = details[aid];
-    const th = thumbs[aid];
-    const entry = { id: aid, category: assetType };
-    if (d && typeof d === "object") {
-      entry.name = d.Name;
-      entry.assetTypeId = d.AssetTypeId;
-      entry.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
-      if (d.Creator && typeof d.Creator === "object") entry.creator = d.Creator.Name;
-      entry.priceInRobux = d.PriceInRobux ?? null; // null = free or unknown
-      if (d.IsForSale != null) entry.forSale = d.IsForSale;
-      if (typeof d.Description === "string" && d.Description) entry.description = d.Description.slice(0, 280);
-    } else {
-      entry.detailsUnavailable = true;
-    }
-    if (th && typeof th === "object") {
-      entry.thumbnail = th.imageUrl;
-      entry.thumbnailState = th.state;
-    }
-    return entry;
-  });
-  const output = { totalResults: (data && data.totalResults) ?? 0, results };
-  if (data && data.nextPageCursor) output.nextPageCursor = data.nextPageCursor;
-  return output;
-}
-
-async function mpInfo(assetId) {
-  const text = String(assetId == null ? "" : assetId).trim();
-  if (!/^\d+$/.test(text)) throw new Error(`bad asset id '${assetId}'`);
-  const aid = parseInt(text, 10);
-  const d = await mpGet(`https://economy.roblox.com/v2/assets/${aid}/details`);
-  const output = { id: aid };
-  if (d && typeof d === "object") {
-    output.name = d.Name;
-    output.assetTypeId = d.AssetTypeId;
-    output.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
-    if (d.Creator && typeof d.Creator === "object") output.creator = d.Creator.Name;
-    output.priceInRobux = d.PriceInRobux ?? null; // null = free or unknown
-    if (d.IsForSale != null) output.forSale = d.IsForSale;
-    if (typeof d.Description === "string") output.description = d.Description.slice(0, 1000);
-  }
-  try {
-    const tdata = await mpGet(`https://thumbnails.roblox.com/v1/assets?assetIds=${aid}&size=420x420&format=Png`);
-    if (Array.isArray(tdata && tdata.data) && tdata.data.length) {
-      output.thumbnail = tdata.data[0].imageUrl;
-      output.thumbnailState = tdata.data[0].state;
-    }
-  } catch {
-    // thumbnails are a bonus
-  }
-  return output;
-}
-
-async function status() {
-  const channel = loadChannel();
-  if (!isValidChannel(channel)) {
-    return { ok: false, error: "not connected (no channel saved) - run: npx golem-bridge connect <channelId>" };
-  }
-  let beaconData;
-  let resKeys;
-  try {
-    const base = relayBase();
-    const enc = encodeURIComponent(channel);
-    const bb = await fetchText(`${base}/channels/${enc}/beacons.json?orderBy=${encodeURIComponent('"$key"')}&limitToLast=5`, {
-      timeoutMs: 30000,
-    });
-    beaconData = bb.text === "null" ? {} : JSON.parse(bb.text);
-    if (typeof beaconData !== "object" || beaconData === null) beaconData = {};
-    const rb = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 30000 });
-    resKeys = rb.text === "null" ? {} : JSON.parse(rb.text);
-    if (typeof resKeys !== "object" || resKeys === null) resKeys = {};
-  } catch (err) {
-    return { ok: false, error: `cannot read the relay channel: ${err.message}` };
-  }
-  const results = Object.values(resKeys).filter((v) => v === true).length;
-  const beacons = Object.values(beaconData)
-    .filter((e) => e && (e.op === "hello" || e.op === "revoked"))
-    .map((e) => [parseFloat(e.ts) || 0, e]);
-  if (!beacons.length) {
-    const verdict = results
-      ? `no beacons, but ${results} cached result(s) - Studio is not running or runs an older plugin; ask the user to fully restart Studio with the current plugin`
-      : "result channel is empty - the plugin has never posted here: Studio is closed or was not restarted after a plugin update";
-    return { ok: true, beacon: null, ageSeconds: null, recentResults: results, verdict };
-  }
-  beacons.sort((a, b) => a[0] - b[0]);
-  const [ts, beacon] = beacons[beacons.length - 1];
-  const age = ts > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - ts)) : null;
-  const ver = beacon.v || "?";
-  if (beacon.op === "revoked") {
-    const ago = age === null ? "" : age < 120 ? ` ${age}s ago` : ` ${Math.floor(age / 60)} min ago`;
+function commandForPath(file) {
+  const resolved = path.resolve(file);
+  if (process.platform === "win32" && /\.(bat|cmd)$/i.test(resolved)) {
+    const comspec = process.env.ComSpec || "cmd.exe";
     return {
-      ok: true,
-      beacon,
-      ageSeconds: age,
-      recentResults: results,
-      verdict: `this channel was ROTATED${ago} - Studio wiped it (END SESSION or restart) and minted a new one; ask the user for the fresh setup line and run: npx golem-bridge reconnect <newId>`,
+      command: comspec,
+      args: ["/d", "/s", "/c", `cd /d "${path.dirname(resolved)}" && "${resolved}"`],
+      display: resolved,
     };
   }
-  const verdict =
-    age === null
-      ? `last beacon has no timestamp (v${ver}) - ask the user to check the Golem window`
-      : age <= 900
-        ? `plugin is LIVE (v${ver}, hello beacon ${age}s ago) - it should answer commands`
-        : `last hello was ${Math.floor(age / 60)} min ago (v${ver}) - Studio may be closed or hung since then; ask the user to check the Golem window`;
-  return { ok: true, beacon, ageSeconds: age, recentResults: results, verdict };
+  if (/\.(m?js)$/i.test(resolved)) {
+    return { command: process.execPath, args: [resolved], display: resolved };
+  }
+  return { command: resolved, args: [], display: resolved };
 }
 
-// ---------------------------------------------------------------- tool table
-//
-// pos: ["name"] = required, ["name", default] = optional, ["name", "+"]
-//   = one-or-more, 3rd element = choices, 4th = value type.
-// flags: name: "bool"|"str"|"int"|"float"|"append" or [type, {flag, choices,
-//   default}]. Default flag spelling is the name with _ as -.
-// (The relay op for each tool lives in buildArgs, the single mapping.)
-
-const GROUPS = [
-  ["Connection", ["ping", "debug", "status"]],
-  ["Exploring", ["list", "tree", "find", "grep", "count", "look"]],
-  ["Scripts and Lua", ["read", "script", "lua", "exec"]],
-  ["Organizing", ["delete", "move", "group", "duplicate", "rename", "selection", "waypoint", "undo", "attr", "tag"]],
-  ["Moving", ["rotate", "face", "shift", "scale", "place", "pivot"]],
-  ["Surfaces and physics", ["paint", "anchor", "collide", "terrain"]],
-  ["Gameplay", ["light", "sound", "prompt", "hitbox", "particles", "sign", "scatter", "match", "weld"]],
-  ["Effects", ["beam", "trail", "explosion"]],
-  ["UI", ["ui_screen", "ui_frame", "ui_label", "ui_button", "ui_input", "ui_image", "ui_list"]],
-  ["Marketplace", ["search", "info", "insert", "apply"]],
-  ["Playtesting", ["play", "stop", "logs"]],
-  ["Session", ["say", "turn"]],
-];
-
-const TOOLS = {
-  ping: { help: "health check - is Studio connected?" },
-  debug: { help: "diagnostics: relay round-trip, versions, commands served, errors" },
-  status: { help: "is the plugin alive or the link revoked? (no Studio needed)", local: true },
-  exec: { help: 'send a raw op JSON: {"op":..., "args":...}', pos: [["json"]] },
-  lua: { help: "run Lua inside Studio (code arg, or - for stdin)", pos: [["code", null]] },
-  list: { help: "children of a path", pos: [["path", "game"]], flags: { recursive: "bool", max: "int" } },
-  tree: { help: "recursive tree of a path", pos: [["path", "game"]], flags: { depth: "int" } },
-  read: { help: "read an instance (script source by default, --json for full record)", pos: ["path"], flags: { json: "bool", props: "str" } },
-  find: { help: "find instances by name or --tag", pos: [["query", ""]], flags: { cls: ["str", { flag: "--class" }], scope: ["str", { default: "game" }], max: "int", exact: "bool", tag: "str" } },
-  grep: { help: "search script sources", pos: ["pattern"], flags: { scope: ["str", { default: "game" }], max: "int", i: ["bool", { flag: "-i" }] } },
-  script: { help: "create/update a script (source from stdin or --source)", pos: ["parent", "name"], flags: { cls: ["str", { flag: "--class", default: "Script", choices: ["Script", "LocalScript", "ModuleScript"] }], mode: ["str", { choices: ["create", "update", "replace"], default: "create" }], source: "str" } },
-  delete: { help: "delete instances", pos: [["paths", "+"]] },
-  move: { help: "reparent an instance", pos: ["path", "parent"] },
-  selection: { help: "read or set the Studio selection", pos: [], flags: { set: "str", clear: "bool" } },
-  waypoint: { help: "set an undo checkpoint", pos: [["label", "bridge"]] },
-  say: { help: "post a message to the user's Studio chat (closes the turn)", pos: ["text"] },
-  turn: { help: "mark work turns: begin ... tools ... end --note (required protocol)", pos: [["action", undefined, ["begin", "end"]]], flags: { note: "str" } },
-  rotate: { help: "rotate: --axis y --degrees 90 (relative) or --set 0,90,0 (absolute)", pos: ["path"], flags: { axis: "str", degrees: "float", absolute: ["str", { flag: "--set" }], space: ["str", { choices: ["world", "local"], default: "world" }] } },
-  face: { help: "aim an instance's axis at a world point (keeps position)", pos: ["path", "target"], flags: { axis: ["str", { default: "forward" }] } },
-  shift: { help: "move by an offset in studs (world or local)", pos: ["path", "offset"], flags: { space: ["str", { choices: ["world", "local"], default: "world" }] } },
-  scale: { help: "scale a part/model by a relative factor", pos: ["path", ["factor", undefined, undefined, "float"]] },
-  duplicate: { help: "clone an instance (optionally N times with spacing)", pos: ["path"], flags: { count: ["int", { default: 1 }], offset: "str", parent: "str", name: "str" } },
-  group: { help: "wrap instances into a Model", pos: [["paths", "+"]], flags: { name: ["str", { default: "Group" }], parent: "str" } },
-  pivot: { help: "set a model/part pivot (what it rotates around)", pos: ["path"], flags: { position: "str", orientation: "str" } },
-  place: { help: "absolute position via pivot (parts and models)", pos: ["path", "position"], flags: { orientation: "str" } },
-  paint: { help: "set color/material/transparency/reflectance on parts", pos: [["paths", "+"]], flags: { color: "str", material: "str", transparency: "float", reflectance: "float" } },
-  rename: { help: "rename an instance", pos: ["path", "name"] },
-  look: { help: "aim the Studio editor camera at a path", pos: ["path"], flags: { distance: ["float", { default: 30 }] } },
-  count: { help: "count instances (cheap, no payloads)", pos: [["scope", "game"]], flags: { cls: ["str", { flag: "--class" }] } },
-  undo: { help: "one Studio undo step (Ctrl+Z)" },
-  anchor: { help: "anchor parts in place (models: all their parts)", pos: [["paths", "+"]], flags: { off: "bool" } },
-  collide: { help: "enable part collision (models: all their parts)", pos: [["paths", "+"]], flags: { off: "bool" } },
-  light: { help: "add or update a light inside a part", pos: ["path"], flags: { light_type: ["str", { flag: "--type", default: "point", choices: ["point", "spot", "surface"] }], color: "str", range: "float", brightness: "float", shadows: "bool" } },
-  sound: { help: "add a Sound to a parent, optionally play it", pos: ["parent", "id"], flags: { volume: "float", loop: "bool", play: "bool", name: "str" } },
-  weld: { help: "weld a model's parts together with WeldConstraints", pos: [["paths", "+"]] },
-  hitbox: { help: "invisible hitbox part sized to a target", pos: ["path"], flags: { padding: ["float", { default: 0.5 }], name: "str", collide: "bool" } },
-  prompt: { help: "add a ProximityPrompt to a part (Press E to ...)", pos: ["path", "action"], flags: { object: "str", hold: ["float", { default: 0 }], distance: ["float", { default: 8 }] } },
-  particles: { help: "attach a particle preset to a part", pos: ["path", ["preset", undefined, ["leaves", "sparks", "smoke", "magic", "fire", "snow", "rain", "bubbles", "dust", "confetti", "fireflies"]]], flags: { rate: "float", color: "str" } },
-  sign: { help: "place a readable wooden sign", pos: ["text"], flags: { position: "str", parent: "str", size: "str", name: "str" } },
-  beam: { help: "glowing beam between two parts", pos: ["from", "to"], flags: { color: "str", width: "float", curve: "float", name: "str" } },
-  trail: { help: "motion trail on a moving part", pos: ["path"], flags: { color: "str", lifetime: "float", name: "str" } },
-  explosion: { help: "one-shot explosion (visual only)", pos: [], flags: { position: "str", radius: "float" } },
-  ui_screen: { help: "create a ScreenGui under StarterGui", pos: ["name"], flags: { parent: "str", order: "int" } },
-  ui_frame: { help: "rounded panel/frame", pos: ["parent", "name"], flags: { position: "str", size: "str", anchor: "str", color: "str", transparency: "float", radius: "int", clip: "bool" } },
-  ui_label: { help: "text label", pos: ["parent", "name"], flags: { text: "str", position: "str", size: "str", anchor: "str", color: "str", align: "str", font: "str", text_size: "int", wrap: "bool" } },
-  ui_button: { help: "text button", pos: ["parent", "name"], flags: { text: "str", position: "str", size: "str", anchor: "str", color: "str", text_color: "str", radius: "int", font: "str", text_size: "int" } },
-  ui_input: { help: "TextBox the player can type into", pos: ["parent", "name"], flags: { placeholder: "str", text: "str", position: "str", size: "str", color: "str", background: "str", radius: "int", text_size: "int" } },
-  ui_image: { help: "ImageLabel from a Roblox asset id", pos: ["parent", "name"], flags: { asset: "str", position: "str", size: "str", scale: "str" } },
-  ui_list: { help: "UIListLayout that auto-arranges a container's children", pos: ["parent"], flags: { direction: "str", padding: "int", halign: "str", valign: "str" } },
-  play: { help: "start play-testing the game (client when possible, Run mode fallback)", pos: [], flags: { mode: ["str", { choices: ["play", "run"] }] } },
-  stop: { help: "stop the running play test" },
-  logs: { help: "read Studio output - errors and warnings from the play test", pos: [], flags: { all: "bool", limit: "int", since: "float" } },
-  attr: { help: "read/set/clear Studio attributes on an instance", pos: ["path"], flags: { set: "append", clear: "append" } },
-  tag: { help: "add/remove CollectionService tags", pos: [["paths", "+"]], flags: { add: "append", remove: "append" } },
-  match: { help: "copy color/material/transparency from one part onto targets", pos: ["from_path", ["to", "+"]] },
-  scatter: { help: "scatter N copies of a template in a disc around it", pos: ["path"], flags: { count: ["int", { default: 10 }], radius: ["float", { default: 20 }], y_jitter: ["float", { default: 0 }], parent: "str", name: "str" } },
-  terrain: { help: "fill or clear terrain (block or ball)", pos: [], flags: { action: ["str", { choices: ["fill", "clear"], default: "fill" }], shape: ["str", { choices: ["block", "ball"], default: "block" }], position: "str", size: "str", radius: "float", material: ["str", { default: "Grass" }] } },
-  search: { help: "search the Roblox Creator Store (models, meshes, images, audio, video, plugins)", pos: ["query"], flags: { category: ["str", { default: "model" }], limit: "int", cursor: "str" }, local: true },
-  info: { help: "details + thumbnail for one marketplace asset", pos: ["id"], local: true },
-  insert: { help: "insert a marketplace asset into the place", pos: ["id", ["parent", "Workspace"]], flags: { name: "str" } },
-  apply: { help: "apply an asset id to a property (Image, Texture, SoundId, MeshId...)", pos: ["id", "path", "prop"] },
-};
-function stripTimeout(argv) {
-  const out = [];
-  let timeout = null;
-  let ddash = false;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (ddash) { out.push(a); continue; }
-    if (a === "--") { ddash = true; out.push(a); continue; }
-    if (a === "--timeout" && i + 1 < argv.length) { timeout = parseFloat(argv[++i]); continue; }
-    if (a.startsWith("--timeout=")) { timeout = parseFloat(a.slice(10)); continue; }
-    out.push(a);
+function windowsCandidates() {
+  const local = process.env.LOCALAPPDATA;
+  if (!local) return [];
+  const out = [
+    path.join(local, "Roblox", "mcp.bat"),
+    path.join(local, "Roblox Studio", "StudioMCP.exe"),
+    path.join(local, "Roblox", "StudioMCP.exe"),
+  ];
+  const versions = path.join(local, "Roblox", "Versions");
+  try {
+    const dirs = fs
+      .readdirSync(versions)
+      .filter((name) => name.startsWith("version-"))
+      .map((name) => path.join(versions, name, "StudioMCP.exe"))
+      .sort()
+      .reverse();
+    out.push(...dirs);
+  } catch {
+    // no versions directory
   }
-  if (timeout !== null && (!(timeout > 0) || !Number.isFinite(timeout)))
-    throw new UsageError("--timeout must be a positive, finite number of seconds");
-  return { args: out, timeout };
+  return out;
 }
 
-function parseToolArgs(name, argv) {
-  const spec = TOOLS[name];
-  const ns = {};
-  const bools = {}, vals = {};
-  for (const dest of Object.keys(spec.flags || {})) {
-    const fs = spec.flags[dest];
-    const t = Array.isArray(fs) ? fs[0] : fs;
-    const o = Array.isArray(fs) ? (fs[1] || {}) : {};
-    const flag = o.flag || "--" + dest.replace(/_/g, "-");
-    if (t === "bool") { ns[dest] = false; bools[flag] = dest; }
-    else { ns[dest] = t === "append" ? [] : (o.default !== undefined ? o.default : null); vals[flag] = { dest, type: t, choices: o.choices, multi: t === "append" }; }
-  }
-  const coerce = (fl, raw) => {
-    let v = raw;
-    if (fl.type === "int") { v = parseInt(raw, 10); if (!Number.isInteger(v)) throw new UsageError(`${name}: bad integer for ${fl.dest}: ${raw}`); }
-    else if (fl.type === "float") { v = parseFloat(raw); if (!Number.isFinite(v)) throw new UsageError(`${name}: bad number for ${fl.dest}: ${raw}`); }
-    if (fl.choices && !fl.choices.includes(fl.type === "int" ? v : String(v))) throw new UsageError(`${name}: bad value for ${fl.dest}: ${raw} (need ${fl.choices.join("|")})`);
-    return v;
-  };
-  const pos = [];
-  let i = 0, ddash = false;
-  while (i < argv.length) {
-    const t = argv[i];
-    if (ddash) { pos.push(t); i++; continue; }
-    if (t === "--") { ddash = true; i++; continue; }
-    if (t.startsWith("--")) {
-      const eq = t.indexOf("=");
-      const fl = eq === -1 ? t : t.slice(0, eq);
-      if (fl in bools) {
-        if (eq !== -1) throw new UsageError(`${name}: ${fl} takes no value`);
-        ns[bools[fl]] = true; i++; continue;
-      }
-      const v = vals[fl];
-      if (!v) throw new UsageError(`${name}: unknown flag ${fl}`);
-      let raw;
-      if (eq !== -1) raw = t.slice(eq + 1);
-      else { i++; if (i >= argv.length) throw new UsageError(`${name}: ${fl} needs a value`); raw = argv[i]; }
-      const c = coerce(v, raw);
-      if (v.multi) ns[v.dest].push(c); else ns[v.dest] = c;
-      i++; continue;
+function resolveMcpCommand() {
+  const override = process.env[MCP_BIN_ENV] || process.env[MCP_BIN_LEGACY_ENV];
+  if (override) {
+    if (!fs.existsSync(override)) {
+      throw new CliError(`Studio MCP command not found at ${override} (set by ${MCP_BIN_ENV}).`, 1);
     }
-    if (t in bools) { ns[bools[t]] = true; i++; continue; }
-    if (t.startsWith("-") && t.length > 1 && !/^-[\d.]/.test(t)) {
-      throw new UsageError(`${name}: unknown flag ${t}`);
-    }
-    pos.push(t); i++;
+    return commandForPath(override);
   }
-  const out = {};
-  let pi = 0;
-  for (const p of (spec.pos || [])) {
-    const a = Array.isArray(p) ? p : [p];
-    const pname = a[0], pdef = a[1], pchoices = a[2], ptype = a[3];
-    if (pdef === "+") {
-      if (pi >= pos.length) throw new UsageError(`${name}: need at least one ${pname}`);
-      out[pname] = pos.slice(pi); pi = pos.length;
-    } else if (pi < pos.length) {
-      const raw = pos[pi++];
-      let v = raw;
-      if (ptype === "int") { v = parseInt(raw, 10); if (!Number.isInteger(v)) throw new UsageError(`${name}: bad integer for ${pname}: ${raw}`); }
-      else if (ptype === "float") { v = parseFloat(raw); if (!Number.isFinite(v)) throw new UsageError(`${name}: bad number for ${pname}: ${raw}`); }
-      if (pchoices && !pchoices.includes(ptype ? v : String(v))) throw new UsageError(`${name}: bad ${pname}: ${raw} (need ${pchoices.join("|")})`);
-      out[pname] = v;
-    } else if (pdef !== undefined) out[pname] = pdef;
-    else throw new UsageError(`${name}: missing ${pname}`);
+
+  let candidates = [];
+  if (process.platform === "darwin") {
+    candidates = [
+      "/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP",
+      path.join(os.homedir(), "Applications/RobloxStudio.app/Contents/MacOS/StudioMCP"),
+    ];
+  } else if (process.platform === "win32") {
+    candidates = windowsCandidates();
+  } else {
+    throw new CliError(
+      "Roblox Studio's MCP server is only available on macOS and Windows. " +
+        `On another platform, point ${MCP_BIN_ENV} at a compatible Studio MCP executable.`,
+      1
+    );
   }
-  if (pi < pos.length) throw new UsageError(`${name}: too many arguments (got "${pos[pi]}")`);
-  return Object.assign(ns, out);
-}
-function scalar(s) {
-  const t = s.trim();
-  if (/^[+-]?\d+$/.test(t)) { const n = parseInt(t, 10); if (Number.isSafeInteger(n)) return n; }
-  if (/^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$/.test(t)) { const f = parseFloat(t); if (Number.isFinite(f)) return f; }
-  if (t === "true") return true;
-  if (t === "false") return false;
-  return s;
+
+  for (const file of candidates) {
+    if (fs.existsSync(file)) return commandForPath(file);
+  }
+  throw new CliError(
+    `Studio MCP was not found. Looked for:\n  ${candidates.join("\n  ")}\n` +
+      `Install the latest Roblox Studio, open a place, then enable Assistant > ... > Manage MCP Servers > Enable Studio as MCP server. ` +
+      `You can also set ${MCP_BIN_ENV} to the executable path.`,
+    1
+  );
 }
 
-function buildArgs(name, ns) {
-  const V = (s) => vec3(s);
-  switch (name) {
-    case "ping":
-      return { op: "ping", args: {} };
-    case "debug":
-      return { op: "debug", args: {} };
-    case "exec": {
-      let raw;
-      try { raw = JSON.parse(ns.json); } catch { throw new UsageError("exec: invalid JSON"); }
-      if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.op !== "string" || !raw.op)
-        throw new UsageError('exec: JSON must be an object with a string "op" key');
-      return { op: raw.op, args: (raw.args && typeof raw.args === "object" && !Array.isArray(raw.args)) ? raw.args : {} };
+// ------------------------------------------------------------------ MCP client
+
+class McpClient {
+  constructor(launch) {
+    this.launch = launch;
+    this.child = null;
+    this.rl = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.stderr = "";
+    this.closed = false;
+    this.serverInfo = {};
+    this.protocolVersion = "";
+  }
+
+  async start(timeoutMs) {
+    this.child = spawn(this.launch.command, this.launch.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    this.child.on("error", (err) => {
+      this._rejectAll(new McpError(`could not launch Studio MCP (${this.launch.display}): ${err.message}`));
+    });
+    this.child.on("exit", (code, signal) => {
+      this.closed = true;
+      const detail = signal ? `signal ${signal}` : `exit code ${code}`;
+      this._rejectAll(new McpError(`Studio MCP closed (${detail}).${this.stderrSuffix()}`));
+    });
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr += chunk.toString("utf8");
+      if (this.stderr.length > 20000) this.stderr = this.stderr.slice(-20000);
+    });
+
+    this.rl = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
+    this.rl.on("line", (line) => this._onLine(line));
+
+    const result = await this.request(
+      "initialize",
+      {
+        protocolVersion: MCP_PROTOCOL,
+        capabilities: {},
+        clientInfo: { name: CLIENT_NAME, version: VERSION },
+      },
+      timeoutMs || INIT_TIMEOUT_MS
+    );
+    this.protocolVersion = String(result.protocolVersion || MCP_PROTOCOL);
+    this.serverInfo = result.serverInfo && typeof result.serverInfo === "object" ? result.serverInfo : {};
+    this.notify("notifications/initialized");
+  }
+
+  stderrSuffix() {
+    const tail = this.stderr.trim();
+    if (!tail) return "";
+    return `\nStudio MCP said:\n${tail.split("\n").slice(-8).join("\n")}`;
+  }
+
+  _onLine(line) {
+    if (this.closed) return;
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    if (trimmed.length > MAX_FRAME_CHARS) {
+      this._rejectAll(new McpError("Studio MCP sent a response larger than 16 MB."));
+      return;
     }
-    case "lua": {
-      let code = ns.code;
-      if (code === "-" || code == null) code = process.stdin.isTTY ? "" : readStdin();
-      if (!code) throw new UsageError("no Lua code given (pass it as an argument or pipe it in)");
-      return { op: "run", args: { code } };
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      return; // a log line on stdout is not a protocol frame
     }
-    case "list": {
-      const a = { path: ns.path };
-      if (ns.recursive) a.recursive = true;
-      if (ns.max != null) {
-        if (ns.max <= 0) throw new UsageError("list: --max must be a positive integer");
-        a.max = ns.max;
+    if (!msg || typeof msg !== "object") return;
+
+    // A server request: answer method-not-found so it stops waiting on us.
+    if (msg.method && msg.id !== undefined && msg.id !== null) {
+      this._write({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32601, message: "Method not found" },
+      }).catch(() => {});
+      return;
+    }
+
+    if (msg.id === undefined || msg.id === null || msg.method) return;
+    const pending = this.pending.get(msg.id);
+    if (!pending) return;
+    this.pending.delete(msg.id);
+    clearTimeout(pending.timer);
+    if (msg.error) {
+      const error = new McpError(String(msg.error.message || "Studio MCP reported an error"));
+      error.code = msg.error.code;
+      pending.reject(error);
+      return;
+    }
+    pending.resolve(msg.result && typeof msg.result === "object" ? msg.result : {});
+  }
+
+  _write(message) {
+    if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
+      return Promise.reject(new McpError("Studio MCP connection is closed."));
+    }
+    const line = `${JSON.stringify(message)}\n`;
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(line, (err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  notify(method, params) {
+    this._write({
+      jsonrpc: "2.0",
+      method,
+      ...(params === undefined ? {} : { params }),
+    }).catch(() => {});
+  }
+
+  async request(method, params, timeoutMs) {
+    if (this.closed) throw new McpError("Studio MCP connection is closed.");
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new McpError(`no response to '${method}' within ${Math.round(timeoutMs / 1000)}s.${this.stderrSuffix()}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this._write({ jsonrpc: "2.0", id, method, params: params || {} }).catch((err) => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new McpError(`could not send '${method}': ${err.message}`));
+      });
+    });
+  }
+
+  _rejectAll(err) {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+      this.pending.delete(id);
+    }
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.child.stdin.end();
+    } catch {
+      // already gone
+    }
+    await sleep(100);
+    try {
+      this.child.kill();
+    } catch {
+      // already gone
+    }
+    try {
+      this.rl.close();
+    } catch {
+      // already closed
+    }
+  }
+}
+
+// ------------------------------------------------------------------ MCP helpers
+
+async function listTools(client, timeoutMs) {
+  const tools = [];
+  let cursor = null;
+  for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+    const result = await client.request("tools/list", cursor ? { cursor } : {}, timeoutMs);
+    if (!Array.isArray(result.tools)) throw new McpError("Studio MCP returned no tools array.");
+    tools.push(...result.tools);
+    cursor = result.nextCursor;
+    if (!cursor) return tools;
+  }
+  return tools;
+}
+
+async function callTool(client, name, args, timeoutMs) {
+  return client.request("tools/call", { name, arguments: args || {} }, timeoutMs);
+}
+
+function toolText(result) {
+  const parts = [];
+  for (const item of (result && result.content) || []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
+    else if (item.type === "resource" && item.resource && typeof item.resource.text === "string") {
+      parts.push(item.resource.text);
+    }
+  }
+  if (!parts.length && result && result.structuredContent !== undefined) {
+    parts.push(JSON.stringify(result.structuredContent, null, 2));
+  }
+  return parts.join("\n");
+}
+
+function toolImages(result) {
+  return ((result && result.content) || []).filter((item) => item && item.type === "image" && item.data);
+}
+
+function schemaOf(tool) {
+  return (tool && tool.inputSchema) || {};
+}
+
+function propsOf(tool) {
+  return schemaOf(tool).properties || {};
+}
+
+function toolNeedsStudio(tool) {
+  return Object.prototype.hasOwnProperty.call(propsOf(tool), "studio_id");
+}
+
+function formatSchema(tool) {
+  const schema = schemaOf(tool);
+  const props = schema.properties || {};
+  const required = new Set(schema.required || []);
+  const parts = Object.entries(props).map(([name, spec]) => {
+    let text = `${name}${required.has(name) ? "*" : ""}`;
+    if (spec && spec.type) text += `: ${spec.type}`;
+    if (spec && Array.isArray(spec.enum)) text += ` (${spec.enum.join("|")})`;
+    return text;
+  });
+  return parts.join(", ") || "no arguments";
+}
+
+function formatToolList(tools) {
+  return tools
+    .map((tool) => {
+      const desc = String(tool.description || "").replace(/\s+/g, " ").trim();
+      const head = `${tool.name}\n  args: ${formatSchema(tool)}`;
+      return desc ? `${head}\n  ${desc}` : head;
+    })
+    .join("\n\n");
+}
+
+function tokenSet(name) {
+  return new Set(
+    String(name)
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[^A-Za-z0-9]+/g, " ")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+}
+
+function resolveTool(tools, names, expectedArgs) {
+  for (const name of names) {
+    const exact = tools.find((tool) => String(tool.name).toLowerCase() === name.toLowerCase());
+    if (exact) return exact;
+  }
+  const wanted = names.map(tokenSet);
+  const candidates = tools.filter((tool) => {
+    const tokens = tokenSet(tool.name);
+    if (!wanted.some((set) => set.size === tokens.size && [...set].every((token) => tokens.has(token)))) return false;
+    if (!expectedArgs || !expectedArgs.length) return true;
+    const props = propsOf(tool);
+    return expectedArgs.some((arg) => Object.prototype.hasOwnProperty.call(props, arg));
+  });
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) {
+    throw new CliError(`several Studio tools match ${names.join("/")}: ${candidates.map((tool) => tool.name).join(", ")}`);
+  }
+  throw new CliError(
+    `Studio does not expose a tool matching ${names.join("/")}. Run 'golem-bridge tools' to see the live list.`
+  );
+}
+
+function pickProperty(tool, aliases) {
+  const props = propsOf(tool);
+  for (const alias of aliases) {
+    if (Object.prototype.hasOwnProperty.call(props, alias)) return alias;
+  }
+  return null;
+}
+
+function normalizeEnumText(value) {
+  return String(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Studio's marketplace tool accepts a fixed list of asset kinds. Accept
+// friendly spellings (image, Image, IMAGES) and return the schema's value.
+function coerceEnum(tool, property, value) {
+  const spec = propsOf(tool)[property];
+  const values = spec && Array.isArray(spec.enum) ? spec.enum : null;
+  if (!values) return value;
+  const wanted = normalizeEnumText(value);
+  const hit = values.find((item) => normalizeEnumText(item) === wanted);
+  if (hit !== undefined) return hit;
+  if (wanted === "all" || wanted === "any" || wanted === "alltypes") {
+    const all = values.find((item) => /^(all|any|alltypes?)$/i.test(normalizeEnumText(item)));
+    if (all !== undefined) return all;
+  }
+  throw new CliError(
+    `'${value}' is not an accepted ${property} for ${tool.name}. Use one of: ${values.join(", ")}.`
+  );
+}
+
+// The value that means "every asset kind" in this Studio version, if any.
+function allEnumValue(tool, key) {
+  const property = pickProperty(tool, ARG_ALIASES[key] || [key]);
+  if (!property) return undefined;
+  const spec = propsOf(tool)[property];
+  const values = spec && Array.isArray(spec.enum) ? spec.enum : null;
+  if (!values) return undefined;
+  return values.find((item) => /^(all|any|alltypes?)$/i.test(normalizeEnumText(item)));
+}
+
+function buildArgs(tool, logical, studioId) {
+  const args = {};
+  for (const [key, value] of Object.entries(logical || {})) {
+    if (value === undefined || value === null) continue;
+    const aliases = ARG_ALIASES[key] || [key];
+    const actual = pickProperty(tool, aliases);
+    if (!actual) {
+      throw new CliError(
+        `${tool.name} does not accept '${key}'. Its arguments are: ${formatSchema(tool)}.`
+      );
+    }
+    args[actual] = key === "assetType" || key === "datamodel" ? coerceEnum(tool, actual, value) : value;
+  }
+  if (studioId && toolNeedsStudio(tool) && args.studio_id === undefined) {
+    args.studio_id = studioId;
+  }
+  const missing = (schemaOf(tool).required || []).filter((name) => args[name] === undefined);
+  if (missing.length) {
+    throw new CliError(
+      `${tool.name} needs ${missing.join(", ")}. Its arguments are: ${formatSchema(tool)}.`
+    );
+  }
+  return args;
+}
+
+function parseJsonObject(text, label) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new UsageError(`${label} must be a JSON object`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new UsageError(`${label} must be a JSON object`);
+  }
+  return value;
+}
+
+function parseStudios(result) {
+  let data = null;
+  const text = toolText(result).trim();
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (data === null && result && result.structuredContent) data = result.structuredContent;
+  if (data === null) return [];
+
+  let entries = data;
+  if (!Array.isArray(entries)) {
+    entries = data.studios || data.instances || data.roblox_studios || data.items || [];
+  }
+  if (!Array.isArray(entries)) return [];
+
+  const idKeys = ["studio_id", "id", "studioId", "instance_id"];
+  const nameKeys = ["name", "place_name", "placeName", "title", "game_name"];
+  const studios = [];
+  for (const entry of entries) {
+    if (typeof entry === "string") {
+      studios.push({ id: entry, name: "" });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") continue;
+    const id = idKeys.map((key) => entry[key]).find((value) => value !== undefined && value !== null && value !== "");
+    if (!id) continue;
+    const name = nameKeys.map((key) => entry[key]).find((value) => typeof value === "string" && value);
+    studios.push({ id: String(id), name: String(name || "") });
+  }
+  return studios;
+}
+
+function findStudioListTool(tools) {
+  return resolveTool(tools, ["list_roblox_studios", "list_studios", "studio_list"], []);
+}
+
+async function waitForStudios(client, tools, waitSeconds, callTimeoutMs) {
+  const listTool = findStudioListTool(tools);
+  const windowMs = Math.max(0, (waitSeconds === undefined ? ATTACH_TIMEOUT_SEC : waitSeconds) * 1000);
+  const deadline = Date.now() + windowMs;
+  let lastError = "";
+  let lastStudios = [];
+
+  for (;;) {
+    const remaining = Math.max(1, deadline - Date.now());
+    try {
+      const result = await callTool(client, listTool.name, {}, Math.min(callTimeoutMs, Math.max(1000, remaining)));
+      lastStudios = parseStudios(result);
+      lastError = "";
+      if (lastStudios.length) return { studios: lastStudios, lastError };
+    } catch (err) {
+      lastError = err.message;
+    }
+    if (Date.now() >= deadline) return { studios: lastStudios, lastError };
+    await sleep(Math.min(ATTACH_POLL_MS, Math.max(1, deadline - Date.now())));
+  }
+}
+
+function resolveStudio(studios, requested) {
+  const wanted = requested || process.env[STUDIO_ID_ENV];
+  if (wanted) {
+    const exact = studios.find((studio) => studio.id === wanted);
+    if (exact) return exact.id;
+    const byName = studios.filter((studio) => studio.name.toLowerCase() === String(wanted).toLowerCase());
+    if (byName.length === 1) return byName[0].id;
+    const partial = studios.filter((studio) => studio.name.toLowerCase().includes(String(wanted).toLowerCase()));
+    if (partial.length === 1) return partial[0].id;
+    if (!studios.length) throw new CliError("no Studio instance is attached");
+    throw new CliError(
+      `no Studio matches '${wanted}'. Open Studio windows:\n${studios
+        .map((studio) => `  ${studio.id}  ${studio.name}`)
+        .join("\n")}`
+    );
+  }
+  if (studios.length === 1) return studios[0].id;
+  if (!studios.length) throw new CliError("no Studio instance is attached");
+  throw new CliError(
+    `several Studio windows are open; choose one with --studio <id-or-name>:\n${studios
+      .map((studio) => `  ${studio.id}  ${studio.name}`)
+      .join("\n")}`
+  );
+}
+
+function noStudioMessage(lastError) {
+  return (
+    "Studio did not attach. Check:\n" +
+    "  1. Roblox Studio is open with a place loaded.\n" +
+    "  2. Assistant > ... > Manage MCP Servers > Enable Studio as MCP server is on.\n" +
+    "  3. You are on the latest Studio (macOS or Windows).\n" +
+    (lastError ? `Last error: ${lastError}` : "")
+  );
+}
+
+// ------------------------------------------------------------------ sessions
+
+function timeoutMs(flags, fallback, cap) {
+  const value = flags.timeout !== undefined ? flags.timeout : fallback / 1000;
+  const ms = Math.max(1, Number(value)) * 1000;
+  return cap ? Math.min(ms, cap) : ms;
+}
+
+async function withOpen(flags, fn) {
+  const launch = resolveMcpCommand();
+  const client = new McpClient(launch);
+  try {
+    await client.start(Math.min(timeoutMs(flags, INIT_TIMEOUT_MS), INIT_TIMEOUT_MS));
+    const tools = await listTools(client, Math.min(timeoutMs(flags, TOOLS_TIMEOUT_MS), TOOLS_TIMEOUT_MS));
+    return await fn({ client, tools, launch });
+  } finally {
+    await client.close();
+  }
+}
+
+async function withStudio(flags, options, fn) {
+  return withOpen(flags, async (session) => {
+    const { client, tools } = session;
+    let studios = [];
+    let studioId = null;
+    if (options.needStudios !== false) {
+      const wait = flags.wait !== undefined ? flags.wait : ATTACH_TIMEOUT_SEC;
+      const attached = await waitForStudios(client, tools, wait, timeoutMs(flags, CALL_TIMEOUT_MS));
+      studios = attached.studios;
+      if (studios.length) {
+        studioId = resolveStudio(studios, flags.studio);
+      } else if (options.requireStudio !== false) {
+        throw new CliError(noStudioMessage(attached.lastError), 1);
       }
-      return { op: "list", args: a };
     }
-    case "tree": {
-      const depth = ns.depth ?? 2;
-      if (depth < 0) throw new UsageError("tree: --depth must be 0 or greater");
-      return { op: "tree", args: { path: ns.path, depth } };
+    return fn({ ...session, studios, studioId });
+  });
+}
+
+async function runResolvedTool(flags, spec, fn) {
+  return withStudio(flags, { needStudios: true, requireStudio: true }, async (session) => {
+    const tool = resolveTool(session.tools, spec.names, spec.expectedArgs || []);
+    const logical = typeof spec.logical === "function" ? spec.logical(flags, tool, session.studioId) : spec.logical;
+    const args = buildArgs(tool, logical, session.studioId);
+    const result = await callTool(session.client, tool.name, args, timeoutMs(flags, CALL_TIMEOUT_MS));
+    return fn({ result, tool, args, ...session });
+  });
+}
+
+function outputResult(result, flags, outPath) {
+  const text = toolText(result);
+  const images = toolImages(result);
+  const written = writeImages(images, outPath);
+  if (result && result.isError) {
+    const detail = text || "Studio reported an error.";
+    throw new CliError(detail + (written.length ? `\nImages: ${written.join(", ")}` : ""), 1);
+  }
+  if (flags.json) {
+    console.log(JSON.stringify(result));
+    return;
+  }
+  if (text) print(text);
+  if (written.length) print(written.join("\n"));
+  if (!text && !written.length) print("(no text returned)");
+}
+
+function writeImages(images, outPath) {
+  if (!images.length || !outPath) return [];
+  const written = [];
+  images.forEach((image, index) => {
+    const mime = String(image.mimeType || "image/png");
+    let ext = ".png";
+    if (mime.includes("jpeg")) ext = ".jpg";
+    else if (mime.includes("webp")) ext = ".webp";
+    let file = outPath;
+    if (images.length > 1) {
+      const parsed = path.parse(outPath);
+      file = path.join(parsed.dir, `${parsed.name}-${index + 1}${parsed.ext || ext}`);
+    } else if (!path.extname(file)) {
+      file += ext;
     }
-    case "read": {
-      const a = { path: ns.path };
-      if (ns.props) a.props = ns.props.split(",").map((s) => s.trim()).filter(Boolean);
-      return { op: "read", args: a, asJson: !!ns.json, rawField: "source" };
-    }
-    case "find": {
-      const a = { scope: ns.scope };
-      if (ns.tag) a.tag = ns.tag;
-      else if (ns.query) a.query = ns.query;
-      else throw new UsageError("find: need a name query or --tag");
-      if (ns.cls) a.class = ns.cls;
-      if (ns.max != null) {
-        if (ns.max <= 0) throw new UsageError("find: --max must be a positive integer");
-        a.max = ns.max;
-      }
-      if (ns.exact) a.exact = true;
-      return { op: "find", args: a };
-    }
-    case "grep": {
-      const a = { pattern: ns.pattern, scope: ns.scope };
-      if (ns.max != null) {
-        if (ns.max <= 0) throw new UsageError("grep: --max must be a positive integer");
-        a.max = ns.max;
-      }
-      if (ns.i) a.caseSensitive = false;
-      return { op: "grep", args: a };
-    }
-    case "script": {
-      let source = ns.source;
-      if (source == null && !process.stdin.isTTY) source = readStdin();
-      if (source == null) throw new UsageError("pass the script source via stdin (heredoc/pipe) or --source");
-      return { op: "script", args: { parent: ns.parent, name: ns.name, class: ns.cls, mode: ns.mode, source } };
-    }
-    case "delete":
-      return { op: "delete", args: { paths: ns.paths } };
-    case "move":
-      return { op: "move", args: { path: ns.path, parent: ns.parent } };
-    case "selection": {
-      if (ns.clear) return { op: "selection", args: { clear: true } };
-      if (ns.set != null) {
-        const paths = ns.set.split(",").map((s) => s.trim()).filter(Boolean);
-        if (!paths.length) throw new UsageError("selection: --set needs at least one path");
-        return { op: "selection", args: { set: paths } };
-      }
-      return { op: "selection", args: {} };
-    }
-    case "waypoint":
-      return { op: "waypoint", args: { label: ns.label } };
-    case "say":
-      return { op: "say", args: { text: ns.text } };
-    case "turn": {
-      if (ns.action === "begin") return { op: "turn_begin", args: {} };
-      if (!ns.note) throw new UsageError('turn end: --note "your reply" is required');
-      return { op: "turn_end", args: { note: ns.note } };
-    }
-    case "rotate": {
-      const a = { path: ns.path, space: ns.space };
-      if (ns.absolute != null) a.orientation = V(ns.absolute);
-      else {
-        if (ns.axis == null || ns.degrees == null)
-          throw new UsageError("rotate: need --set x,y,z or both --axis and --degrees");
-        a.axis = ns.axis;
-        a.degrees = ns.degrees;
-      }
-      return { op: "rotate", args: a };
-    }
-    case "face":
-      return { op: "face", args: { path: ns.path, target: V(ns.target), axis: ns.axis } };
-    case "shift":
-      return { op: "shift", args: { path: ns.path, offset: V(ns.offset), space: ns.space } };
-    case "scale":
-      if (!(ns.factor > 0)) throw new UsageError("scale: factor must be a positive number");
-      return { op: "scale", args: { path: ns.path, factor: ns.factor } };
-    case "duplicate": {
-      if (!(ns.count >= 1)) throw new UsageError("duplicate: --count must be 1 or greater");
-      const a = { path: ns.path, count: ns.count };
-      if (ns.offset) a.offset = V(ns.offset);
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.name) a.name = ns.name;
-      return { op: "duplicate", args: a };
-    }
-    case "group": {
-      const a = { paths: ns.paths, name: ns.name };
-      if (ns.parent) a.parent = ns.parent;
-      return { op: "group", args: a };
-    }
-    case "pivot": {
-      if (ns.position == null && ns.orientation == null)
-        throw new UsageError("pivot: need --position and/or --orientation");
-      const a = { path: ns.path };
-      if (ns.position) a.position = V(ns.position);
-      if (ns.orientation) a.orientation = V(ns.orientation);
-      return { op: "set_pivot", args: a };
-    }
-    case "place": {
-      const a = { path: ns.path, position: V(ns.position) };
-      if (ns.orientation) a.orientation = V(ns.orientation);
-      return { op: "place", args: a };
-    }
-    case "paint": {
-      if (ns.color == null && ns.material == null && ns.transparency == null && ns.reflectance == null)
-        throw new UsageError("paint: need at least one of --color, --material, --transparency, --reflectance");
-      const a = { paths: ns.paths };
-      if (ns.color) a.color = ns.color;
-      if (ns.material) a.material = ns.material;
-      if (ns.transparency != null) a.transparency = ns.transparency;
-      if (ns.reflectance != null) a.reflectance = ns.reflectance;
-      return { op: "paint", args: a };
-    }
-    case "rename":
-      return { op: "rename", args: { path: ns.path, name: ns.name } };
-    case "look":
-      return { op: "look", args: { path: ns.path, distance: ns.distance } };
-    case "count": {
-      const a = { scope: ns.scope };
-      if (ns.cls) a.class = ns.cls;
-      return { op: "count", args: a };
-    }
-    case "undo":
-      return { op: "undo", args: {} };
-    case "anchor":
-      return { op: "anchor", args: { paths: ns.paths, anchored: !ns.off } };
-    case "collide":
-      return { op: "collide", args: { paths: ns.paths, canCollide: !ns.off } };
-    case "light": {
-      const a = { path: ns.path, type: ns.light_type };
-      if (ns.color) a.color = ns.color;
-      if (ns.range != null) a.range = ns.range;
-      if (ns.brightness != null) a.brightness = ns.brightness;
-      if (ns.shadows) a.shadows = true;
-      return { op: "light", args: a };
-    }
-    case "sound": {
-      const a = { parent: ns.parent, id: ns.id };
-      if (ns.volume != null) a.volume = ns.volume;
-      if (ns.loop) a.looped = true;
-      if (ns.play) a.play = true;
-      if (ns.name) a.name = ns.name;
-      return { op: "sound", args: a };
-    }
-    case "weld":
-      return { op: "weld", args: { paths: ns.paths } };
-    case "hitbox": {
-      const a = { path: ns.path, padding: ns.padding };
-      if (ns.name) a.name = ns.name;
-      if (ns.collide) a.canCollide = true;
-      return { op: "hitbox", args: a };
-    }
-    case "prompt": {
-      const a = { path: ns.path, action: ns.action, hold: ns.hold, distance: ns.distance };
-      if (ns.object) a.object = ns.object;
-      return { op: "prompt", args: a };
-    }
-    case "particles": {
-      const a = { path: ns.path, preset: ns.preset };
-      if (ns.rate != null) a.rate = ns.rate;
-      if (ns.color) a.color = ns.color;
-      return { op: "particles", args: a };
-    }
-    case "sign": {
-      const a = { text: ns.text };
-      if (ns.position) a.position = V(ns.position);
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.size) a.size = V(ns.size);
-      if (ns.name) a.name = ns.name;
-      return { op: "sign", args: a };
-    }
-    case "beam": {
-      const a = { from: ns.from, to: ns.to };
-      for (const k of ["color", "width", "curve", "name"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "beam", args: a };
-    }
-    case "trail": {
-      const a = { path: ns.path };
-      for (const k of ["color", "lifetime", "name"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "trail", args: a };
-    }
-    case "explosion": {
-      const a = {};
-      if (ns.position) a.position = V(ns.position);
-      if (ns.radius != null) a.radius = ns.radius;
-      return { op: "explosion", args: a };
-    }
-    case "ui_screen": {
-      const a = { name: ns.name };
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.order != null) a.order = ns.order;
-      return { op: "ui_screen", args: a };
-    }
-    case "ui_frame": {
-      const a = { parent: ns.parent, name: ns.name };
-      for (const k of ["position", "size", "anchor", "color", "transparency", "radius"]) if (ns[k] != null) a[k] = ns[k];
-      if (ns.clip) a.clip = true;
-      return { op: "ui_frame", args: a };
-    }
-    case "ui_label": {
-      const a = { parent: ns.parent, name: ns.name };
-      for (const k of ["text", "position", "size", "anchor", "color", "align", "font", "text_size"]) if (ns[k] != null) a[k] = ns[k];
-      if (ns.wrap) a.wrap = true;
-      return { op: "ui_label", args: a };
-    }
-    case "ui_button": {
-      const a = { parent: ns.parent, name: ns.name };
-      for (const k of ["text", "position", "size", "anchor", "color", "text_color", "radius", "font", "text_size"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "ui_button", args: a };
-    }
-    case "ui_input": {
-      const a = { parent: ns.parent, name: ns.name };
-      for (const k of ["placeholder", "text", "position", "size", "color", "background", "radius", "text_size"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "ui_input", args: a };
-    }
-    case "ui_image": {
-      const a = { parent: ns.parent, name: ns.name };
-      if (ns.asset) a.asset = ns.asset;
-      for (const k of ["position", "size", "scale"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "ui_image", args: a };
-    }
-    case "ui_list": {
-      const a = { parent: ns.parent };
-      for (const k of ["direction", "padding", "halign", "valign"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "ui_list", args: a };
-    }
-    case "play": {
-      const a = {};
-      if (ns.mode) a.mode = ns.mode;
-      return { op: "play", args: a };
-    }
-    case "stop":
-      return { op: "stop", args: {} };
-    case "logs": {
-      const a = ns.all ? { filter: "all" } : {};
-      if (ns.limit != null) {
-        if (ns.limit <= 0) throw new UsageError("logs: --limit must be a positive integer");
-        a.limit = ns.limit;
-      }
-      if (ns.since != null) a.since = ns.since;
-      return { op: "logs", args: a };
-    }
-    case "attr": {
-      const a = { path: ns.path };
-      if (ns.set && ns.set.length) {
-        const o = {};
-        for (const kv of ns.set) {
-          const e = kv.indexOf("=");
-          if (e === -1) throw new UsageError("--set expects K=V");
-          const key = kv.slice(0, e);
-          if (!key) throw new UsageError("--set expects K=V with a non-empty key");
-          o[key] = scalar(kv.slice(e + 1));
-        }
-        a.set = o;
-      }
-      if (ns.clear && ns.clear.length) a.clear = ns.clear;
-      return { op: "attributes", args: a };
-    }
-    case "tag": {
-      const a = { paths: ns.paths };
-      if ((!ns.add || !ns.add.length) && (!ns.remove || !ns.remove.length))
-        throw new UsageError("tag: need --add and/or --remove");
-      for (const t of [...(ns.add || []), ...(ns.remove || [])]) {
-        if (!t) throw new UsageError("tag: tag names must not be empty");
-      }
-      if (ns.add && ns.add.length) a.add = ns.add;
-      if (ns.remove && ns.remove.length) a.remove = ns.remove;
-      return { op: "tag", args: a };
-    }
-    case "match":
-      return { op: "match", args: { from: ns.from_path, paths: ns.to } };
-    case "scatter": {
-      if (!(ns.count >= 1)) throw new UsageError("scatter: --count must be 1 or greater");
-      const a = { path: ns.path, count: ns.count, radius: ns.radius, yJitter: ns.y_jitter };
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.name) a.name = ns.name;
-      return { op: "scatter", args: a };
-    }
-    case "terrain": {
-      if (!ns.position) throw new UsageError("terrain: --position x,y,z is required");
-      const a = { action: ns.action, shape: ns.shape, position: V(ns.position), material: ns.material };
-      if (ns.shape === "block") {
-        if (!ns.size) throw new UsageError("--size x,y,z is required for block");
-        a.size = V(ns.size);
+    fs.writeFileSync(file, Buffer.from(String(image.data), "base64"));
+    written.push(file);
+  });
+  return written;
+}
+
+// ------------------------------------------------------------------ commands
+
+async function cmdConnect(flags, brief) {
+  if (flags._pos.length) {
+    throw new UsageError(
+      "connect takes no channel id anymore. Golem now uses Studio's built-in MCP server; run 'golem-bridge connect' with Studio open."
+    );
+  }
+  return withStudio(flags, { needStudios: true, requireStudio: false }, async (session) => {
+    const { client, tools, launch, studios } = session;
+    const connected = studios.length > 0;
+    if (flags.json) {
+      console.log(
+        JSON.stringify({
+          ok: connected,
+          binary: launch.display,
+          server: client.serverInfo,
+          protocol: client.protocolVersion,
+          tools: tools.length,
+          studios,
+        })
+      );
+    } else {
+      print(`Studio MCP: ${launch.display}`);
+      print(
+        `Handshake: ${client.serverInfo.name || "StudioMCP"} ${client.serverInfo.version || ""} (protocol ${client.protocolVersion})`
+      );
+      print(`Tools: ${tools.length}`);
+      if (studios.length) {
+        for (const studio of studios) print(`Studio: ${studio.id}${studio.name ? `  ${studio.name}` : ""}`);
+        print("connected.");
       } else {
-        if (ns.radius == null) throw new UsageError("--radius is required for ball");
-        a.radius = ns.radius;
+        print(noStudioMessage(""));
       }
-      return { op: "terrain", args: a };
     }
-    case "insert": {
-      const a = { id: ns.id, parent: ns.parent };
-      if (ns.name) a.name = ns.name;
-      return { op: "insert_asset", args: a };
+    if (!connected) {
+      process.exitCode = 1;
+      return;
     }
-    case "apply":
-      return { op: "apply_asset", args: { id: ns.id, path: ns.path, prop: ns.prop } };
-    default:
-      throw new UsageError(`unknown tool: ${name}`);
-  }
+    if (!brief && !flags.json) printManual();
+  });
 }
-function toolUsage(name) {
-  const spec = TOOLS[name];
-  const parts = [`npx golem-bridge ${name}`];
-  for (const p of (spec.pos || [])) {
-    const a = Array.isArray(p) ? p : [p];
-    if (a[1] === "+") parts.push(`<${a[0]}...>`);
-    else if (a[1] !== undefined) parts.push(`[${a[0]}]`);
-    else parts.push(`<${a[0]}>`);
+
+async function cmdStatus(flags) {
+  return withStudio(flags, { needStudios: true, requireStudio: false }, async (session) => {
+    const { client, tools, launch, studios } = session;
+    const connected = studios.length > 0;
+    if (flags.json) {
+      console.log(
+        JSON.stringify({
+          ok: connected,
+          binary: launch.display,
+          server: client.serverInfo,
+          tools: tools.length,
+          studios,
+        })
+      );
+    } else if (connected) {
+      print(
+        `CONNECTED  ${client.serverInfo.name || "StudioMCP"} ${client.serverInfo.version || ""}  ${tools.length} tools  ${studios
+          .map((studio) => `${studio.id}${studio.name ? ` (${studio.name})` : ""}`)
+          .join(", ")}`
+      );
+    } else {
+      print(noStudioMessage(""));
+    }
+    if (!connected) process.exitCode = 1;
+  });
+}
+
+async function cmdStudios(flags) {
+  return withStudio(flags, { needStudios: true, requireStudio: false }, async ({ studios }) => {
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, studios }));
+      return;
+    }
+    if (!studios.length) {
+      print(noStudioMessage(""));
+      process.exitCode = 1;
+      return;
+    }
+    for (const studio of studios) print(`${studio.id}${studio.name ? `  ${studio.name}` : ""}`);
+  });
+}
+
+async function cmdTools(flags) {
+  return withOpen(flags, async ({ tools }) => {
+    const wanted = flags._pos[0];
+    if (wanted) {
+      const tool = tools.find((item) => String(item.name).toLowerCase() === wanted.toLowerCase());
+      if (!tool) throw new CliError(`unknown Studio tool '${wanted}'. Run 'golem-bridge tools' for the list.`);
+      if (flags.json) {
+        console.log(JSON.stringify(tool));
+        return;
+      }
+      print(`${tool.name}`);
+      print(tool.description || "");
+      print(`arguments: ${formatSchema(tool)}`);
+      print(JSON.stringify(schemaOf(tool), null, 2));
+      return;
+    }
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, tools }));
+      return;
+    }
+    print(formatToolList(tools));
+  });
+}
+
+async function cmdCall(flags) {
+  const name = flags._pos[0];
+  if (!name) throw new UsageError("call needs a tool name: golem-bridge call <tool> [json]");
+  const rawArgs = flags.args || flags._pos[1] || "{}";
+  const args = parseJsonObject(rawArgs, "tool arguments");
+
+  return withOpen(flags, async (session) => {
+    const tool = session.tools.find((item) => String(item.name).toLowerCase() === name.toLowerCase());
+    if (!tool) throw new CliError(`unknown Studio tool '${name}'. Run 'golem-bridge tools' for the list.`);
+
+    if (toolNeedsStudio(tool) && args.studio_id === undefined) {
+      const attached = await waitForStudios(
+        session.client,
+        session.tools,
+        flags.wait !== undefined ? flags.wait : ATTACH_TIMEOUT_SEC,
+        timeoutMs(flags, CALL_TIMEOUT_MS)
+      );
+      if (!attached.studios.length) throw new CliError(noStudioMessage(attached.lastError), 1);
+      args.studio_id = resolveStudio(attached.studios, flags.studio);
+    }
+    const missing = (schemaOf(tool).required || []).filter((key) => args[key] === undefined);
+    if (missing.length) {
+      throw new CliError(`${tool.name} needs ${missing.join(", ")}. Its arguments are: ${formatSchema(tool)}.`);
+    }
+    const result = await callTool(session.client, tool.name, args, timeoutMs(flags, CALL_TIMEOUT_MS));
+    outputResult(result, flags, flags.out);
+  });
+}
+
+async function cmdRun(flags) {
+  const datamodel = flags.client ? "Client" : flags.server ? "Server" : flags.datamodel || "Edit";
+  if (!["Edit", "Client", "Server"].includes(datamodel)) {
+    throw new UsageError("--datamodel must be Edit, Client, or Server");
   }
+  let code = flags.file ? fs.readFileSync(flags.file, "utf8") : flags._pos[0];
+  if (code === undefined || code === "-") {
+    if (process.stdin.isTTY) throw new UsageError("run needs Luau code, '-' for stdin, or --file <path>");
+    code = fs.readFileSync(0, "utf8");
+  }
+  if (!code || !String(code).trim()) throw new UsageError("run needs non-empty Luau code");
+
+  return runResolvedTool(
+    flags,
+    {
+      names: ["execute_luau", "run_luau"],
+      expectedArgs: ["code", "source", "luau"],
+      logical: { code: String(code), datamodel },
+    },
+    ({ result }) => outputResult(result, flags, flags.out)
+  );
+}
+
+async function cmdSearch(flags) {
+  const query = flags._pos[0];
+  if (!query) throw new UsageError('search needs a query: golem-bridge search "low poly tree"');
+  if (flags.limit !== undefined && (!(flags.limit > 0) || !Number.isInteger(flags.limit))) {
+    throw new UsageError("--limit must be a positive integer");
+  }
+  return runResolvedTool(
+    flags,
+    {
+      names: ["search_asset", "search_assets"],
+      expectedArgs: ["query", "keyword", "search"],
+      logical: (searchFlags, tool) => ({
+        query,
+        assetType: searchFlags.type || allEnumValue(tool, "assetType"),
+        scope: searchFlags.scope,
+        limit: searchFlags.limit,
+      }),
+    },
+    ({ result }) => outputResult(result, flags, flags.out)
+  );
+}
+
+async function cmdInsert(flags) {
+  const raw = flags._pos[0];
+  if (!raw) throw new UsageError("insert needs an asset id: golem-bridge insert 123456");
+  const id = String(raw).replace(/^rbxassetid:\/\//i, "");
+  if (!/^\d+$/.test(id)) throw new UsageError("asset id must be numeric");
+  return runResolvedTool(
+    flags,
+    {
+      names: ["insert_asset", "insert_assets"],
+      expectedArgs: ["asset_id", "assetId", "id"],
+      logical: { assetId: id, parent: flags.parent },
+    },
+    ({ result }) => outputResult(result, flags, flags.out)
+  );
+}
+
+async function cmdSkills(flags) {
+  return withStudio(flags, { needStudios: true, requireStudio: true }, async (session) => {
+    let result;
+    let error = "";
+    try {
+      const tool = resolveTool(session.tools, ["skill", "skills"], []);
+      const args = buildArgs(tool, {}, session.studioId);
+      result = await callTool(session.client, tool.name, args, timeoutMs(flags, CALL_TIMEOUT_MS));
+      if (result && result.isError) error = toolText(result);
+    } catch (err) {
+      error = err.message;
+    }
+
+    if (flags.json) {
+      console.log(
+        JSON.stringify({
+          ok: !error,
+          classic: CLASSIC_SKILLS.map(([name, description]) => ({ name, description })),
+          studio: result || null,
+          error: error || undefined,
+        })
+      );
+      if (error) process.exitCode = 1;
+      return;
+    }
+    print("Roblox-authored skills (load one with: golem-bridge skill <name>):");
+    for (const [name, description] of CLASSIC_SKILLS) print(`  ${name} - ${description}`);
+    if (result && !error) {
+      const live = toolText(result).trim();
+      if (live) {
+        print("");
+        print(live);
+      }
+    } else if (error) {
+      print("");
+      print(`Studio's skill tool did not list skills: ${error}`);
+      process.exitCode = 1;
+    }
+  });
+}
+
+async function cmdSkill(flags) {
+  if (!flags._pos[0]) return cmdSkills(flags);
+  const name = flags._pos[0];
+  return withStudio(flags, { needStudios: true, requireStudio: true }, async (session) => {
+    const tool = resolveTool(session.tools, ["skill", "skills"], []);
+    const args = buildArgs(tool, { skillName: name }, session.studioId);
+    const result = await callTool(session.client, tool.name, args, timeoutMs(flags, CALL_TIMEOUT_MS));
+    outputResult(result, flags, flags.out);
+  });
+}
+
+function simpleCommand(spec) {
+  return async function run(flags) {
+    const logical = spec.logical ? spec.logical(flags) : {};
+    return runResolvedTool(
+      flags,
+      {
+        names: spec.names,
+        expectedArgs: spec.expectedArgs || [],
+        logical,
+      },
+      ({ result }) => outputResult(result, flags, flags.out)
+    );
+  };
+}
+
+const cmdTree = simpleCommand({
+  names: ["search_game_tree", "tree"],
+  expectedArgs: ["path"],
+  logical: (flags) => ({
+    path: flags._pos[0] || "game",
+    depth: flags.depth,
+    className: flags.class,
+  }),
+});
+
+const cmdInspect = simpleCommand({
+  names: ["inspect_instance", "inspect"],
+  expectedArgs: ["path"],
+  logical: (flags) => ({ path: flags._pos[0] }),
+});
+
+const cmdRead = simpleCommand({
+  names: ["script_read", "read_script"],
+  expectedArgs: ["path"],
+  logical: (flags) => ({
+    path: flags._pos[0],
+    startLine: flags.start,
+    endLine: flags.end,
+  }),
+});
+
+const cmdFind = simpleCommand({
+  names: ["script_search", "find_script"],
+  expectedArgs: ["query"],
+  logical: (flags) => ({ query: flags._pos[0] }),
+});
+
+const cmdGrep = simpleCommand({
+  names: ["script_grep", "grep_scripts"],
+  expectedArgs: ["pattern"],
+  logical: (flags) => ({ pattern: flags._pos[0] }),
+});
+
+const cmdState = simpleCommand({
+  names: ["get_studio_state", "studio_state"],
+});
+
+const cmdPlay = simpleCommand({
+  names: ["start_stop_play", "playtest"],
+  expectedArgs: ["is_start"],
+  logical: () => ({ isStart: true }),
+});
+
+const cmdStop = simpleCommand({
+  names: ["start_stop_play", "playtest"],
+  expectedArgs: ["is_start"],
+  logical: () => ({ isStart: false }),
+});
+
+const cmdLogs = simpleCommand({
+  names: ["get_console_output", "console_output"],
+});
+
+async function cmdScreenshot(flags) {
+  const out = flags.out || "studio-capture.png";
+  return runResolvedTool(
+    flags,
+    {
+      names: ["screen_capture", "screenshot"],
+      expectedArgs: ["capture_id"],
+      logical: () => ({
+        captureId: `golem-${Date.now().toString(36)}`,
+      }),
+    },
+    ({ result }) => outputResult(result, flags, out)
+  );
+}
+
+// ------------------------------------------------------------------ parsing
+
+const COMMON_FLAGS = {
+  json: { type: "bool" },
+  studio: { type: "str" },
+  timeout: { type: "float" },
+  wait: { type: "float" },
+};
+
+function parseFlags(argv, spec) {
+  const flags = { _pos: [] };
+  const merged = { ...COMMON_FLAGS, ...spec };
+  let i = 0;
+  let ddash = false;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (ddash) {
+      flags._pos.push(arg);
+      i++;
+      continue;
+    }
+    if (arg === "--") {
+      ddash = true;
+      i++;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      flags.help = true;
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      const key = (eq === -1 ? arg : arg.slice(0, eq)).slice(2);
+      const def = merged[key];
+      if (!def) throw new UsageError(`unknown option --${key}`);
+      const dest = def.dest || key;
+      if (def.type === "bool") {
+        if (eq !== -1) throw new UsageError(`--${key} takes no value`);
+        flags[dest] = true;
+        i++;
+        continue;
+      }
+      let raw;
+      if (eq !== -1) raw = arg.slice(eq + 1);
+      else {
+        i++;
+        if (i >= argv.length) throw new UsageError(`--${key} needs a value`);
+        raw = argv[i];
+      }
+      if (def.type === "int") {
+        if (!/^-?\d+$/.test(raw)) throw new UsageError(`--${key} must be an integer`);
+        flags[dest] = parseInt(raw, 10);
+      } else if (def.type === "float") {
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value < 0) throw new UsageError(`--${key} must be a positive number`);
+        flags[dest] = value;
+      } else {
+        flags[dest] = raw;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith("-") && arg !== "-") throw new UsageError(`unknown option ${arg}`);
+    flags._pos.push(arg);
+    i++;
+  }
+  if (flags.wait !== undefined && flags.wait < 0) throw new UsageError("--wait cannot be negative");
+  if (flags.timeout !== undefined && flags.timeout <= 0) throw new UsageError("--timeout must be a positive number");
+  return flags;
+}
+
+const COMMAND_SPECS = {
+  connect: {
+    help: "verify Studio and print the agent manual (no files written)",
+    flags: { brief: { type: "bool" } },
+    run: (flags) => cmdConnect(flags, flags.brief),
+  },
+  doctor: {
+    help: "same as connect --brief",
+    flags: {},
+    run: (flags) => cmdConnect(flags, true),
+  },
+  status: { help: "short connection check", flags: {}, run: cmdStatus },
+  ping: { help: "alias for status", flags: {}, run: cmdStatus },
+  studios: { help: "list open Studio windows", flags: {}, run: cmdStudios },
+  tools: {
+    help: "list Studio MCP tools, or show one tool's schema",
+    flags: {},
+    run: cmdTools,
+  },
+  call: {
+    help: "call any Studio MCP tool: call <tool> [json]",
+    flags: { args: { type: "str" }, out: { type: "str" } },
+    run: cmdCall,
+  },
+  run: {
+    help: "run Luau like the Studio console",
+    flags: {
+      file: { type: "str" },
+      datamodel: { type: "str" },
+      client: { type: "bool" },
+      server: { type: "bool" },
+      out: { type: "str" },
+    },
+    run: cmdRun,
+  },
+  search: {
+    help: "search the market: models, images, audio, video, meshes, and more",
+    flags: {
+      type: { type: "str" },
+      "asset-type": { type: "str", dest: "type" },
+      scope: { type: "str" },
+      limit: { type: "int" },
+      out: { type: "str" },
+    },
+    run: cmdSearch,
+  },
+  insert: {
+    help: "insert a marketplace asset by id",
+    flags: { parent: { type: "str" }, out: { type: "str" } },
+    run: cmdInsert,
+  },
+  skills: { help: "list Roblox skills installed in Studio", flags: {}, run: cmdSkills },
+  skillpack: { help: "list or print the bundled Golem skills", flags: {}, run: cmdSkillpack },
+  skill: {
+    help: "load a Roblox-authored skill (rbx-debug, rbx-unit-test, ...)",
+    flags: { out: { type: "str" } },
+    run: cmdSkill,
+  },
+  tree: {
+    help: "explore the instance tree",
+    flags: { depth: { type: "int" }, class: { type: "str" }, out: { type: "str" } },
+    run: cmdTree,
+  },
+  inspect: {
+    help: "inspect one instance and its properties",
+    flags: { out: { type: "str" } },
+    run: cmdInspect,
+  },
+  read: {
+    help: "read a script",
+    flags: {
+      start: { type: "int", dest: "start" },
+      end: { type: "int", dest: "end" },
+      out: { type: "str" },
+    },
+    run: cmdRead,
+  },
+  find: {
+    help: "find scripts by name",
+    flags: { out: { type: "str" } },
+    run: cmdFind,
+  },
+  grep: {
+    help: "search inside scripts",
+    flags: { out: { type: "str" } },
+    run: cmdGrep,
+  },
+  state: { help: "Studio play state and datamodel availability", flags: {}, run: cmdState },
+  play: { help: "start playtesting", flags: {}, run: cmdPlay },
+  stop: { help: "stop playtesting", flags: {}, run: cmdStop },
+  logs: { help: "read Studio console output", flags: {}, run: cmdLogs },
+  screenshot: {
+    help: "capture the Studio viewport",
+    flags: { out: { type: "str" } },
+    run: cmdScreenshot,
+  },
+  manual: { help: "print the full agent manual", flags: {}, run: () => printManual() },
+};
+
+function toolUsage(name, spec) {
+  const parts = [`npx golem-bridge ${name}`];
+  if (name === "call") parts.push("<tool> [json]");
+  else if (name === "run") parts.push("<code|->");
+  else if (name === "search") parts.push("<query>");
+  else if (name === "insert") parts.push("<asset-id>");
+  else if (name === "skill") parts.push("[name]");
+  else if (["tree", "inspect", "read", "find", "grep"].includes(name)) parts.push("<path-or-query>");
   if (spec.flags && Object.keys(spec.flags).length) parts.push("[options]");
   return parts.join(" ");
 }
 
 function printHelp() {
-  console.log("golem-bridge: drive a live Roblox Studio session from any AI agent.");
-  console.log("");
-  console.log("  Connect to my Roblox Studio, Run: npx golem-bridge connect <id>");
-  console.log("");
-  console.log("Session: connect <id> | reconnect [id] | disconnect | manual | help [tool]");
-  for (const [group, names] of GROUPS) {
-    console.log("");
-    console.log(`${group}:`);
-    for (const n of names) console.log(`  ${n} - ${TOOLS[n].help}`);
+  print("golem-bridge: drive Roblox Studio through its built-in MCP server.");
+  print("");
+  print("  Setup: open Studio, enable Assistant > ... > Manage MCP Servers > Enable Studio as MCP server.");
+  print("  Nothing is installed in Studio and no session files are written.");
+  print("");
+  print("Usage: npx golem-bridge <command> [options]");
+  print("");
+  const groups = [
+    ["Connection", ["connect", "doctor", "status", "studios", "tools"]],
+    ["Studio", ["run", "tree", "inspect", "read", "find", "grep", "state", "play", "stop", "logs", "screenshot"]],
+    ["Marketplace", ["search", "insert"]],
+    ["Skills", ["skills", "skill", "skillpack"]],
+    ["Generic", ["call", "manual"]],
+  ];
+  for (const [group, names] of groups) {
+    print(`${group}:`);
+    for (const name of names) print(`  ${name} - ${COMMAND_SPECS[name].help}`);
+    print("");
   }
-  console.log("");
-  console.log("See one tool: npx golem-bridge help <tool>. Full reference: npx golem-bridge manual.");
+  print("Options: --studio <id|name>  --json  --timeout <seconds>  --wait <seconds>");
+  print("See one command: npx golem-bridge help <command>.");
 }
 
-function toolHelp(name) {
-  const spec = TOOLS[name];
-  console.log(`${name} - ${spec.help}`);
-  console.log("");
-  console.log(`Usage: ${toolUsage(name)}`);
+function printCommandHelp(name) {
+  const spec = COMMAND_SPECS[name];
+  if (!spec) {
+    printErr(`golem-bridge: unknown command "${name}"`);
+    process.exitCode = 2;
+    return;
+  }
+  print(`${name} - ${spec.help}`);
+  print("");
+  print(`Usage: ${toolUsage(name, spec)}`);
   const flags = spec.flags || {};
-  const names = Object.keys(flags);
-  if (names.length) {
-    console.log("");
-    console.log("Options:");
-    for (const d of names) {
-      const fs = flags[d];
-      const t = Array.isArray(fs) ? fs[0] : fs;
-      const o = Array.isArray(fs) ? (fs[1] || {}) : {};
-      let line = `  ${o.flag || "--" + d.replace(/_/g, "-")}`;
-      if (t !== "bool") line += ` <${t === "append" ? "value (repeatable)" : "value"}>`;
-      if (o.choices) line += ` (${o.choices.join("|")})`;
-      if (o.default !== undefined) line += ` [default: ${o.default}]`;
-      console.log(line);
+  if (Object.keys(flags).length) {
+    print("");
+    print("Options:");
+    for (const [key, def] of Object.entries(flags)) {
+      if (key === def.dest) continue;
+      print(`  --${key}${def.type === "bool" ? "" : ` <${def.type}>`}`);
     }
   }
+  print("  --studio <id|name>   choose a Studio window when several are open");
+  print("  --json               print the raw MCP result");
+  print("  --timeout <seconds>  per-request timeout");
+  print("  --wait <seconds>     how long to wait for Studio to attach (default 12)");
 }
 
 const MANUAL_FILE = path.join(__dirname, "golem-tools.md");
+const SKILLS_DIR = path.join(__dirname, "skills");
 
 function printManual() {
   try {
     process.stdout.write(fs.readFileSync(MANUAL_FILE, "utf8").trimEnd() + "\n");
   } catch {
-    fail("manual not found next to cli.js - reinstall the package.", 1);
+    throw new CliError("manual not found next to cli.js - reinstall the package.", 1);
   }
 }
 
-async function connect(id, opts) {
-  opts = opts || {};
-  if (id == null) fail("connect: need the channel id from the Studio widget.", 2);
-  if (!isValidChannel(id)) {
-    fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
+function readSkillMeta(text) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  if (!match) return {};
+  const meta = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const at = line.indexOf(":");
+    if (at > 0) meta[line.slice(0, at).trim()] = line.slice(at + 1).trim();
   }
-  const data = await relayCall(id, "ping", {}, opts.timeout || 60);
-  if (!data || !data.ok) {
-    console.error(JSON.stringify({ ok: false, error: "connect: Studio did not answer. Is the plugin running and the id exact?" }, null, 2));
-    process.exitCode = 1;
-    return;
-  }
-  const res = (data && typeof data.result === "object" && data.result) || {};
-  const place = res.place || res.placeName || data.place;
-  if (!opts.print) {
-    const dir = path.join(process.cwd(), ".golem");
-    const saved = saveChannel(dir, id);
-    console.log(`connected. channel saved to ${saved}`);
-    const shadow = envChannelName();
-    if (shadow) console.error(`warning: $${shadow} is set - commands will use it instead of this saved channel.`);
-  }
-  if (place) console.log(`place: ${place}`);
-  printManual();
+  return meta;
 }
 
-async function reconnect(id, opts) {
-  opts = opts || {};
-  if (opts.print) fail("reconnect: --print is only for connect (reconnect always saves).", 2);
-  const saved = loadChannel();
-  const target = id || saved;
-  if (!target) fail("reconnect: no saved channel and none given.", 2);
-  if (!isValidChannel(target)) {
-    fail("bad channel ID (expect 8-64 hex characters — copy the full line from the Studio widget).", 2);
+function bundledSkills() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(SKILLS_DIR, { withFileTypes: true });
+  } catch {
+    return [];
   }
-  const data = await relayCall(target, "ping", {}, opts.timeout || 60);
-  if (!data || !data.ok) {
-    console.error(JSON.stringify({ ok: false, error: "reconnect: Studio did not answer." }, null, 2));
-    process.exitCode = 1;
-    return;
-  }
-  const res = (data && typeof data.result === "object" && data.result) || {};
-  const place = res.place || res.placeName || data.place;
-  if (target === saved) {
-    console.log("already connected to this channel.");
-    if (place) console.log(`place: ${place}`);
-    return;
-  }
-  const dir = path.join(process.cwd(), ".golem");
-  const file = saveChannel(dir, target);
-  console.log(`reconnected. channel saved to ${file}`);
-  const shadow = envChannelName();
-  if (shadow) console.error(`warning: $${shadow} is set - commands will use it instead of this saved channel.`);
-  if (place) console.log(`place: ${place}`);
-}
-
-function disconnect() {
-  const dir = path.join(process.cwd(), ".golem");
-  let removed = false;
-  for (const name of ["channel", ...STALE_HELPER_FILES]) {
-    const f = path.join(dir, name);
+  const skills = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const file = path.join(SKILLS_DIR, entry.name, "SKILL.md");
+    let text;
     try {
-      if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed = true; }
+      text = fs.readFileSync(file, "utf8");
     } catch {
-      // keep going
+      continue;
     }
+    const meta = readSkillMeta(text);
+    skills.push({ name: meta.name || entry.name, description: meta.description || "", file });
   }
-  try { fs.rmdirSync(dir); } catch {
-    // stays if not empty
-  }
-  const shadow = envChannelName();
-  if (shadow) console.error(`warning: $${shadow} is still set - commands stay connected through the environment.`);
-  console.log(removed ? "disconnected (local channel file removed)." : "already disconnected (nothing saved).");
+  return skills;
 }
 
-// Slow ops need longer minimum waits, but only when the user did not pass an
-// explicit --timeout: an explicit timeout is always respected.
-const TIMEOUT_MIN = { ping: 60, debug: 90, insert_asset: 300 };
-
-function waitFor(op, timeout) {
-  if (timeout != null) return timeout;
-  return Math.max(DEFAULT_TIMEOUT, TIMEOUT_MIN[op] || 0);
-}
-
-function parseToolInvocation(name, argv) {
-  const { args, timeout } = stripTimeout(argv);
-  return { ns: parseToolArgs(name, args), timeout };
-}
-
-async function runRelayTool(name, argv) {
-  let ns, timeout, built;
-  try {
-    ({ ns, timeout } = parseToolInvocation(name, argv));
-    built = buildArgs(name, ns);
-  } catch (err) {
-    if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
-    throw err;
+async function cmdSkillpack(flags) {
+  const skills = bundledSkills();
+  if (!skills.length) {
+    throw new CliError("no bundled skills found next to cli.js - reinstall the package.", 1);
   }
-  const channel = requireChannel();
-  if (!channel) return;
-  const entry = await relayCall(channel, built.op, built.args, waitFor(built.op, timeout));
-  out(entry, { asJson: built.asJson, rawField: built.rawField });
-}
-
-async function runLocalTool(name, argv) {
-  let ns;
-  try {
-    ({ ns } = parseToolInvocation(name, argv));
-  } catch (err) {
-    if (err instanceof UsageError) { console.error(`golem-bridge: ${err.message}`); process.exitCode = 2; return; }
-    throw err;
-  }
-  if (name === "status") { out(await status()); return; }
-  if (name === "search" || name === "info") {
-    try {
-      const result = name === "search"
-        ? await mpSearch(ns.query, ns.category, ns.limit, ns.cursor)
-        : await mpInfo(ns.id);
-      out({ ok: true, op: name, result });
-    } catch (err) {
-      out({ ok: false, op: name, error: name === "search" ? `marketplace search failed: ${err.message}` : `asset info failed: ${err.message}` });
+  const wanted = flags._pos[0];
+  if (!wanted) {
+    if (flags.json) {
+      console.log(JSON.stringify({ ok: true, skills: skills.map(({ name, description }) => ({ name, description })) }));
+      return;
     }
+    print("Bundled Golem skills:");
+    for (const skill of skills) print(`  ${skill.name} - ${skill.description}`);
+    print("");
+    print("Print one with: npx golem-bridge skillpack <name>");
+    print("Install it in Assistant with rbx-create-skill, or Skills > Add and paste.");
+    return;
   }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(wanted)) {
+    throw new UsageError("skill names use lowercase letters, digits, and dashes");
+  }
+  const skill = skills.find((item) => item.name === wanted);
+  if (!skill) {
+    throw new CliError(`unknown bundled skill '${wanted}'. Run 'golem-bridge skillpack' for the list.`);
+  }
+  const text = fs.readFileSync(skill.file, "utf8");
+  process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
 }
+
+// ------------------------------------------------------------------ main
 
 async function main(argv) {
   const args = argv || process.argv.slice(2);
-  if (!args.length || args[0] === "--help" || args[0] === "-h") { printHelp(); return; }
-  if (args[0] === "--version" || args[0] === "-v") { console.log(VERSION); return; }
-  const cmd = args[0];
-  const rest = args.slice(1);
-  if (cmd === "help") {
-    if (!rest.length) { printHelp(); return; }
-    if (Object.hasOwn(TOOLS, rest[0])) { toolHelp(rest[0]); return; }
-    console.error(`golem-bridge: unknown tool "${rest[0]}"`);
+  if (!args.length) {
+    printHelp();
+    return;
+  }
+  if (args[0] === "--version" || args[0] === "-v") {
+    print(VERSION);
+    return;
+  }
+  if (args[0] === "--help" || args[0] === "-h") {
+    printHelp();
+    return;
+  }
+  if (args[0] === "help") {
+    if (args[1]) printCommandHelp(args[1]);
+    else printHelp();
+    return;
+  }
+  if (args[0] === "reconnect" || args[0] === "disconnect") {
+    throw new UsageError(
+      `${args[0]} is gone: Golem no longer keeps a channel or a session. Every command connects to Studio's built-in MCP server directly.`
+    );
+  }
+
+  const name = args[0];
+  const spec = COMMAND_SPECS[name];
+  if (!spec) {
+    printErr(`golem-bridge: unknown command "${name}" (try: help)`);
     process.exitCode = 2;
     return;
   }
-  if (cmd === "manual") { printManual(); return; }
-  if (cmd === "disconnect") { disconnect(); return; }
-  if (cmd === "connect" || cmd === "reconnect") {
-    let print = false, timeout = null, id = null;
-    for (let k = 0; k < rest.length; k++) {
-      const a = rest[k];
-      if (a === "--print") print = true;
-      else if (a === "--yes" || a === "-y") { /* accepted for 2.x scripts; nothing to confirm anymore */ }
-      else if (a === "--timeout" && k + 1 < rest.length) timeout = parseFloat(rest[++k]);
-      else if (a.startsWith("--timeout=")) timeout = parseFloat(a.slice(10));
-      else if (!a.startsWith("-") && id === null) id = a;
-      else { console.error(`golem-bridge: ${cmd}: bad argument ${a}`); process.exitCode = 2; return; }
-    }
-    if (timeout != null && (!(timeout > 0) || !Number.isFinite(timeout))) { console.error("golem-bridge: --timeout must be a positive, finite number of seconds"); process.exitCode = 2; return; }
-    if (cmd === "connect") await connect(id, { print, timeout });
-    else await reconnect(id, { timeout });
+  const flags = parseFlags(args.slice(1), spec.flags || {});
+  if (flags.help) {
+    printCommandHelp(name);
     return;
   }
-  if (Object.hasOwn(TOOLS, cmd)) {
-    if (TOOLS[cmd].local) await runLocalTool(cmd, rest);
-    else await runRelayTool(cmd, rest);
-    return;
-  }
-  console.error(`golem-bridge: unknown command "${cmd}" (try: help)`);
-  process.exitCode = 2;
+  await spec.run(flags);
 }
 
 if (require.main === module) {
-  main().catch((err) => { console.error(`golem-bridge error: ${(err && err.message) || err}`); process.exitCode = 1; });
+  main().catch((err) => {
+    const code = err instanceof UsageError ? 2 : err.exitCode || 1;
+    printErr(`golem-bridge: ${err.message}`);
+    process.exitCode = code;
+  });
 }
 
-module.exports = { TOOLS, GROUPS, parseToolArgs, buildArgs, vec3, scalar, loadChannel, isValidChannel, relayBase, saveChannel, envChannelName, status, mpSearch, mpInfo, relayCall, UsageError, stripTimeout, removeStaleHelpers, disconnect, main };
+module.exports = {
+  CLASSIC_SKILLS,
+  McpClient,
+  UsageError,
+  buildArgs,
+  callTool,
+  commandForPath,
+  formatSchema,
+  listTools,
+  main,
+  parseFlags,
+  parseStudios,
+  resolveStudio,
+  resolveTool,
+  tokenSet,
+};

@@ -1,16 +1,29 @@
 {
   "name": "golem-bridge",
-  "version": "3.2.0",
-  "description": "Connects an AI coding agent to a running Roblox Studio session via the Golem plugin.",
+  "version": "5.2.0",
+  "description": "Drive Roblox Studio through its built-in MCP server: skills, marketplace search/insert across every asset kind, and Luau execution.",
   "scripts": {
-    "test": "node --test cli.test.js"
+    "test": "node --test cli.test.js",
+    "test:plugin": "node test/plugin-smoke.js"
   },
   "bin": {
     "golem-bridge": "./cli.js"
   },
   "type": "commonjs",
-  "files": ["cli.js", "golem-tools.md", "README.md"],
-  "keywords": ["roblox", "roblox-studio", "ai", "cli"],
+  "files": [
+    "cli.js",
+    "golem-tools.md",
+    "README.md",
+    "skills"
+  ],
+  "keywords": [
+    "roblox",
+    "roblox-studio",
+    "mcp",
+    "ai",
+    "cli",
+    "luau"
+  ],
   "engines": {
     "node": ">=18"
   },
@@ -22,5 +35,8 @@
   "homepage": "https://github.com/nickils/Golem#readme",
   "bugs": {
     "url": "https://github.com/nickils/Golem/issues"
+  },
+  "devDependencies": {
+    "fengari": "^0.1.4"
   }
 }
