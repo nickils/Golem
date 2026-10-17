@@ -509,8 +509,7 @@ const GROUPS = [
   ["Organizing", ["delete", "move", "group", "duplicate", "rename", "selection", "waypoint", "undo", "attr", "tag"]],
   ["Moving", ["rotate", "face", "shift", "scale", "place", "pivot"]],
   ["Surfaces and physics", ["paint", "anchor", "collide", "terrain"]],
-  ["Gameplay", ["light", "sound", "prompt", "hitbox", "particles", "sign", "scatter", "match", "weld"]],
-  ["Effects", ["beam", "trail", "explosion"]],
+  ["Gameplay", ["light", "sound", "weld"]],
   ["UI", ["ui_screen", "ui_frame", "ui_label", "ui_button", "ui_input", "ui_image", "ui_list"]],
   ["Marketplace", ["search", "info", "insert", "apply"]],
   ["Playtesting", ["play", "stop", "logs"]],
@@ -553,13 +552,6 @@ const TOOLS = {
   light: { help: "add or update a light inside a part", pos: ["path"], flags: { light_type: ["str", { flag: "--type", default: "point", choices: ["point", "spot", "surface"] }], color: "str", range: "float", brightness: "float", shadows: "bool" } },
   sound: { help: "add a Sound to a parent, optionally play it", pos: ["parent", "id"], flags: { volume: "float", loop: "bool", play: "bool", name: "str" } },
   weld: { help: "weld a model's parts together with WeldConstraints", pos: [["paths", "+"]] },
-  hitbox: { help: "invisible hitbox part sized to a target", pos: ["path"], flags: { padding: ["float", { default: 0.5 }], name: "str", collide: "bool" } },
-  prompt: { help: "add a ProximityPrompt to a part (Press E to ...)", pos: ["path", "action"], flags: { object: "str", hold: ["float", { default: 0 }], distance: ["float", { default: 8 }] } },
-  particles: { help: "attach a particle preset to a part", pos: ["path", ["preset", undefined, ["leaves", "sparks", "smoke", "magic", "fire", "snow", "rain", "bubbles", "dust", "confetti", "fireflies"]]], flags: { rate: "float", color: "str" } },
-  sign: { help: "place a readable wooden sign", pos: ["text"], flags: { position: "str", parent: "str", size: "str", name: "str" } },
-  beam: { help: "glowing beam between two parts", pos: ["from", "to"], flags: { color: "str", width: "float", curve: "float", name: "str" } },
-  trail: { help: "motion trail on a moving part", pos: ["path"], flags: { color: "str", lifetime: "float", name: "str" } },
-  explosion: { help: "one-shot explosion (visual only)", pos: [], flags: { position: "str", radius: "float" } },
   ui_screen: { help: "create a ScreenGui under StarterGui", pos: ["name"], flags: { parent: "str", order: "int" } },
   ui_frame: { help: "rounded panel/frame", pos: ["parent", "name"], flags: { position: "str", size: "str", anchor: "str", color: "str", transparency: "float", radius: "int", clip: "bool" } },
   ui_label: { help: "text label", pos: ["parent", "name"], flags: { text: "str", position: "str", size: "str", anchor: "str", color: "str", align: "str", font: "str", text_size: "int", wrap: "bool" } },
@@ -572,8 +564,6 @@ const TOOLS = {
   logs: { help: "read Studio output - errors and warnings from the play test", pos: [], flags: { all: "bool", limit: "int", since: "float" } },
   attr: { help: "read/set/clear Studio attributes on an instance", pos: ["path"], flags: { set: "append", clear: "append" } },
   tag: { help: "add/remove CollectionService tags", pos: [["paths", "+"]], flags: { add: "append", remove: "append" } },
-  match: { help: "copy color/material/transparency from one part onto targets", pos: ["from_path", ["to", "+"]] },
-  scatter: { help: "scatter N copies of a template in a disc around it", pos: ["path"], flags: { count: ["int", { default: 10 }], radius: ["float", { default: 20 }], y_jitter: ["float", { default: 0 }], parent: "str", name: "str" } },
   terrain: { help: "fill or clear terrain (block or ball)", pos: [], flags: { action: ["str", { choices: ["fill", "clear"], default: "fill" }], shape: ["str", { choices: ["block", "ball"], default: "block" }], position: "str", size: "str", radius: "float", material: ["str", { default: "Grass" }] } },
   search: { help: "search the Roblox Creator Store (models, meshes, images, audio, video, plugins)", pos: ["query"], flags: { category: ["str", { default: "model" }], limit: "int", cursor: "str" }, local: true },
   info: { help: "details + thumbnail for one marketplace asset", pos: ["id"], local: true },
@@ -850,47 +840,6 @@ function buildArgs(name, ns) {
     }
     case "weld":
       return { op: "weld", args: { paths: ns.paths } };
-    case "hitbox": {
-      const a = { path: ns.path, padding: ns.padding };
-      if (ns.name) a.name = ns.name;
-      if (ns.collide) a.canCollide = true;
-      return { op: "hitbox", args: a };
-    }
-    case "prompt": {
-      const a = { path: ns.path, action: ns.action, hold: ns.hold, distance: ns.distance };
-      if (ns.object) a.object = ns.object;
-      return { op: "prompt", args: a };
-    }
-    case "particles": {
-      const a = { path: ns.path, preset: ns.preset };
-      if (ns.rate != null) a.rate = ns.rate;
-      if (ns.color) a.color = ns.color;
-      return { op: "particles", args: a };
-    }
-    case "sign": {
-      const a = { text: ns.text };
-      if (ns.position) a.position = V(ns.position);
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.size) a.size = V(ns.size);
-      if (ns.name) a.name = ns.name;
-      return { op: "sign", args: a };
-    }
-    case "beam": {
-      const a = { from: ns.from, to: ns.to };
-      for (const k of ["color", "width", "curve", "name"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "beam", args: a };
-    }
-    case "trail": {
-      const a = { path: ns.path };
-      for (const k of ["color", "lifetime", "name"]) if (ns[k] != null) a[k] = ns[k];
-      return { op: "trail", args: a };
-    }
-    case "explosion": {
-      const a = {};
-      if (ns.position) a.position = V(ns.position);
-      if (ns.radius != null) a.radius = ns.radius;
-      return { op: "explosion", args: a };
-    }
     case "ui_screen": {
       const a = { name: ns.name };
       if (ns.parent) a.parent = ns.parent;
@@ -972,15 +921,6 @@ function buildArgs(name, ns) {
       if (ns.add && ns.add.length) a.add = ns.add;
       if (ns.remove && ns.remove.length) a.remove = ns.remove;
       return { op: "tag", args: a };
-    }
-    case "match":
-      return { op: "match", args: { from: ns.from_path, paths: ns.to } };
-    case "scatter": {
-      if (!(ns.count >= 1)) throw new UsageError("scatter: --count must be 1 or greater");
-      const a = { path: ns.path, count: ns.count, radius: ns.radius, yJitter: ns.y_jitter };
-      if (ns.parent) a.parent = ns.parent;
-      if (ns.name) a.name = ns.name;
-      return { op: "scatter", args: a };
     }
     case "terrain": {
       if (!ns.position) throw new UsageError("terrain: --position x,y,z is required");

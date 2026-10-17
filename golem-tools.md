@@ -119,7 +119,7 @@ command that may be slow.
 5. Report paths in slash form (`ServerScriptService/Main`) so the user can
    find them in the Explorer.
 6. Follow the turn rule (§0) for every task that uses tools.
-7. Build UI as instances, never as runtime code (see §4.10).
+7. Build UI as instances, never as runtime code (see §4.9).
 8. Protect the user's work: only the user's Ctrl+S commits to the place
    file. After every meaningful milestone, tell the user "press Ctrl+S to
    keep my work" and wait for their confirmation before moving on.
@@ -303,11 +303,6 @@ their parts. Combine flags freely.
 
     npx golem-bridge paint Workspace/Wall --color #B0B0B0 --material SmoothPlastic
 
-**match** — copy color, material, transparency, and reflectance from one
-part onto others. Keeps builds visually consistent.
-
-    npx golem-bridge match Workspace/WallA Workspace/WallB Workspace/WallC
-
 **anchor** — anchor parts so physics never moves them (models: all parts).
 `--off` unanchors. Static builds should always be anchored.
 
@@ -335,35 +330,10 @@ walk-through.
 
     npx golem-bridge sound Workspace 1837879082 --name Radio --volume 0.5 --play
 
-**scatter** — clone a template into a random disc around it. Trees, rocks,
-grass: build one, scatter the rest.
-
-    npx golem-bridge scatter Workspace/Tree --count 20 --radius 60 --y-jitter 2
-
 **weld** — join a model's parts with WeldConstraints so the whole build
 moves as one.
 
     npx golem-bridge weld Workspace/Cart
-
-**hitbox** — invisible part sized to the target's bounding box. Click and
-chop targets, interaction zones. `--collide` makes it solid.
-
-    npx golem-bridge hitbox Workspace/Tree --padding 1
-
-**prompt** — ProximityPrompt ("Press E to ...") on a part. `--object` is
-the title above it, `--hold` the hold time in seconds.
-
-    npx golem-bridge prompt Workspace/Tree "Chop" --object Tree --hold 0.5
-
-**particles** — attach a ParticleEmitter with a preset: `leaves`, `sparks`,
-`smoke`, `magic`, `fire`, `snow`, `rain`, `bubbles`, `dust`, `confetti`,
-`fireflies`.
-
-    npx golem-bridge particles Workspace/Torch fire --rate 40
-
-**sign** — a readable wooden sign: board part with text on its face.
-
-    npx golem-bridge sign "Camp rules: no griefing" --position 0,6,10
 
 **attr** — Studio attributes: typed config on instances without scripts.
 `--set` repeats; values parse as integer, float, `true`/`false`, or string.
@@ -375,23 +345,7 @@ with `find --tag`.
 
     npx golem-bridge tag Workspace/Tree --add Choppable
 
-### 4.9 VFX
-
-**beam** — glowing beam between two parts. Lasers, tethers, energy links.
-
-    npx golem-bridge beam Workspace/TowerA Workspace/TowerB --color #78B4FF --width 0.4
-
-**trail** — motion trail on a part. Shows when the part moves: sword
-swipes, comet tails.
-
-    npx golem-bridge trail Workspace/Sword --lifetime 0.6
-
-**explosion** — one-shot visual explosion. Harmless by default: no physics
-damage.
-
-    npx golem-bridge explosion --position 0,10,0 --radius 8
-
-### 4.10 UI — build interfaces as instances, not code
+### 4.9 UI — build interfaces as instances, not code
 
 When the user asks for any UI (shop, HUD, menu, popup, note):
 
@@ -444,7 +398,7 @@ Positions and sizes use `"xs,xo,ys,yo"` (scale/offset pairs); anchors use
 
     npx golem-bridge ui_list StarterGui/MainMenu/Panel --direction vertical --padding 8
 
-### 4.11 Marketplace — browse and add assets
+### 4.10 Marketplace — browse and add assets
 
 `search` and `info` run on YOUR machine (Studio itself is blocked from
 roblox.com), so they work even while Studio is closed. Each takes ~5-15 s.
@@ -477,7 +431,7 @@ Workflow: search, open thumbnails, `info` the shortlist, `insert`, verify
 with `tree`/`read`, set a `waypoint`. Tell the user what you added and
 where it landed.
 
-### 4.12 Playtesting
+### 4.11 Playtesting
 
 **play** — start a play test (`play` = full client when Studio allows it,
 `run` = server simulation). The bridge keeps serving your commands while
@@ -495,7 +449,7 @@ Workflow: build, Ctrl+S, `play`, wait 10-20 s so scripts can run and fail,
     npx golem-bridge logs
     npx golem-bridge stop
 
-### 4.13 Session and talking to the user
+### 4.12 Session and talking to the user
 
 **waypoint** — named undo checkpoint ("one clean undo away"). Set one
 before risky edits and at every milestone.
@@ -540,18 +494,9 @@ left unclosed blocks your next command until the note is posted.
 | `collide` | `path`/`paths`, `canCollide?` (default true) | `{count}` — collision toggled |
 | `light` | `path`, `type?` point/spot/surface, `color?` "#RRGGBB", `range?` 0-60, `brightness?`, `shadows?` | the light's record |
 | `sound` | `parent`, `id`, `volume?`, `looped?`, `play?`, `name?` | the sound's record (plays immediately with `play`) |
-| `scatter` | `path`, `count` (max 200), `radius`, `yJitter?`, `parent?`, `name?` | `{count, copies}` — random disc placement of clones |
 | `weld` | `path`/`paths` | `{count}` — WeldConstraints joining every part to the first |
-| `hitbox` | `path`, `padding?`, `name?`, `canCollide?`, `anchored?` | invisible hitbox part sized to the target's bounding box |
-| `prompt` | `path`, `action`, `object?`, `hold?`, `distance?` | ProximityPrompt ("Press E to ...") on the part |
-| `particles` | `path`, `preset` leaves/sparks/smoke/magic/fire/snow/rain/bubbles/dust/confetti/fireflies, `rate?`, `color?` | ParticleEmitter with the preset applied |
-| `sign` | `text`, `position?`, `parent?`, `size?`, `name?` | a wooden sign part with readable text (SurfaceGui) |
 | `attributes` (`attr`) | `path`, `set?` {k: string/number/boolean/{x,y,z}}, `clear?` [k] | the instance's attributes |
 | `tag` | `path`/`paths`, `add?` [tag], `remove?` [tag] | tags applied; find them again with `find --tag <tag>` |
-| `match` | `from` (a part), `paths`/`to` | copies color/material/transparency/reflectance onto targets |
-| `beam` | `from`, `to` (two parts), `color?`, `width?`, `curve?`, `name?` | glowing beam between the parts |
-| `trail` | `path` (a part), `color?`, `lifetime?`, `name?` | motion Trail, visible when the part moves |
-| `explosion` | `position?` {x,y,z}, `radius?` | one-shot Explosion, visual only, harmless by default |
 | `ui_screen` | `name`, `parent?` (default StarterGui), `order?` | ScreenGui container, the root of every interface |
 | `ui_frame` | `parent`, `name`, `position?`/`size?` ("xs,xo,ys,yo"), `color?`, `radius?`, `anchor?` ("x,y"), `transparency?`, `clip?` | rounded panel |
 | `ui_label` | `parent`, `name`, `text`, `align?`, `wrap?`, `color?`, `font?` (regular/medium/semibold/bold/mono), `text_size?` | text label |

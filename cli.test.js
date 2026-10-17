@@ -137,7 +137,6 @@ test("buildArgs validates tool arguments instead of sending junk to Studio", () 
     ["grep", { pattern: "p", scope: "g", max: 0 }],
     ["logs", { limit: 0 }],
     ["duplicate", { path: "p", count: 0 }],
-    ["scatter", { path: "p", count: 0 }],
   ]) {
     throwsUsage(() => cli.buildArgs(tool, ns), /must be/);
   }
