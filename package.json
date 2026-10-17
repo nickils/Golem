@@ -1,9 +1,10 @@
 {
   "name": "golem-bridge",
-  "version": "5.0.0",
-  "description": "Drive Roblox Studio through its built-in MCP server: classic skills, marketplace search/insert, and Luau execution. No plugin, no relay.",
+  "version": "5.1.0",
+  "description": "Drive Roblox Studio through its built-in MCP server: skills, marketplace search/insert across every asset kind, and Luau execution.",
   "scripts": {
-    "test": "node --test cli.test.js"
+    "test": "node --test cli.test.js",
+    "test:plugin": "node test/plugin-smoke.js"
   },
   "bin": {
     "golem-bridge": "./cli.js"
@@ -33,5 +34,8 @@
   "homepage": "https://github.com/nickils/Golem#readme",
   "bugs": {
     "url": "https://github.com/nickils/Golem/issues"
+  },
+  "devDependencies": {
+    "fengari": "^0.1.4"
   }
 }

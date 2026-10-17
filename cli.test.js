@@ -45,6 +45,13 @@ function tmpdir() {
 
 // ---------------------------------------------------------------- parsing
 
+test("plugin and package versions stay in sync", () => {
+  const source = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
+  const match = source.match(/^local VERSION = "([^"]+)"/m);
+  assert.ok(match, "plugin has a VERSION constant");
+  assert.equal(match[1], VERSION);
+});
+
 test("parseStudios reads the shapes Studio has returned", () => {
   assert.deepEqual(cli.parseStudios({ content: [{ type: "text", text: '{"studios":[]}' }] }), []);
   assert.deepEqual(
@@ -286,13 +293,23 @@ test("run reports tool errors as failures", () => {
 
 // ---------------------------------------------------------------- marketplace
 
-test("search forwards filters and prints results", () => {
+test("search defaults to every asset kind and forwards filters", () => {
+  const plain = run(["search", "chair"]);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(JSON.parse(plain.stdout).type, "All");
+
   const res = run(["search", "tree", "--type", "model", "--scope", "inventory", "--limit", "5"]);
   assert.equal(res.status, 0, res.stderr);
-  assert.deepEqual(JSON.parse(res.stdout), { query: "tree", type: "model", scope: "inventory", limit: 5 });
+  assert.deepEqual(JSON.parse(res.stdout), { query: "tree", type: "Model", scope: "inventory", limit: 5 });
 
-  const plain = run(["search", "chair"]);
-  assert.deepEqual(JSON.parse(plain.stdout), { query: "chair" });
+  assert.equal(JSON.parse(run(["search", "logo", "--type", "image"]).stdout).type, "Image");
+  assert.equal(JSON.parse(run(["search", "boom", "--type", "AUDIO"]).stdout).type, "Audio");
+  assert.equal(JSON.parse(run(["search", "chair", "--type", "all"]).stdout).type, "All");
+
+  const bad = run(["search", "chair", "--type", "spaceship"]);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /not an accepted asset_type/);
+  assert.match(bad.stderr, /Model, Image, Audio/);
 });
 
 test("search validates input", () => {

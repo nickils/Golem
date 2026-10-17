@@ -95,7 +95,10 @@ const SCHEMA = {
     type: "object",
     properties: {
       query: { type: "string" },
-      asset_type: { type: "string" },
+      asset_type: {
+        type: "string",
+        enum: ["All", "Model", "Image", "Audio", "Video", "Mesh", "Animation", "Plugin", "Package"],
+      },
       scope: { type: "string" },
       limit: { type: "number" },
       studio_id: { type: "string" },

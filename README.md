@@ -4,9 +4,10 @@
 the classic Roblox skills, the Creator Store marketplace, and a Luau console.
 
 It talks to the MCP server that **ships inside Roblox Studio**. There is no
-plugin to install, no relay, no channel id, no Firebase project, and no state
-kept between commands. The CLI launches Studio's own MCP binary, calls one
-tool, prints the result, and exits.
+relay, no channel id, no Firebase project, and no state kept between commands.
+The CLI launches Studio's own MCP binary, calls one tool, prints the result,
+and exits. An optional Studio panel (`plugin/`) adds onboarding, a Luau
+console, and insert-by-id; the CLI does not need it.
 
 ## Requirements
 
@@ -48,8 +49,10 @@ npx golem-bridge logs
 npx golem-bridge stop
 npx golem-bridge screenshot --out viewport.png
 
-# Marketplace
+# Marketplace, every asset kind
 npx golem-bridge search "low poly pine tree"
+npx golem-bridge search "gun sound" --type audio
+npx golem-bridge search "metal texture" --type image --limit 10
 npx golem-bridge insert 123456789 --parent Workspace.Props
 
 # Roblox-authored skills
@@ -60,6 +63,11 @@ npx golem-bridge skill rbx-perf-profiling
 npx golem-bridge tools
 npx golem-bridge call multi_edit '{"path":"ReplicatedStorage/Foo","source":"return 1"}'
 ```
+
+`search` covers models, images, audio, video, meshes, animations, plugins, and
+packages. `--type` narrows it (`model`, `image`, `audio`, `video`, `mesh`,
+`animation`, `plugin`, `package`); omit it to search everything, and the value
+is matched against whatever Studio's current schema actually accepts.
 
 Every command accepts `--json` for the raw MCP result, `--studio <id|name>`
 when several Studio windows are open, and `--timeout <seconds>`.
@@ -85,6 +93,18 @@ newer your Studio version adds. `skills` lists what is actually installed and
 `skill <name>` loads one. None of them runs arbitrary Luau, which is what
 `run` is for.
 
+## Studio panel (optional)
+
+`plugin/Golem.rbxmx` is a dockable panel for Studio: setup steps with a copy
+button, a Luau console with captured output, insert-by-id for models, images,
+audio, meshes, animations, and packages, and the skill list with prompts.
+It never relays tool calls — search and everything else still go through the
+MCP server, because plugins cannot query the Creator Store.
+
+Install by dropping `Golem.rbxmx` into **Plugins → Plugins Folder**. Build it
+from source with `cd plugin && python3 build.py`; see `plugin/README.md` for
+the visual changes and the test harness.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -106,13 +126,17 @@ Set `GOLEM_STUDIO_MCP` to override the path.
 ## Development
 
 ```sh
-npm test
+npm test                      # CLI: fake Studio MCP server, zero deps
+npm install && npm run test:plugin   # panel: fengari + strict Roblox stub
+cd plugin && python3 build.py # rebuild Golem.rbxmx
 ```
 
-The suite is dependency-free and runs against `test/fake-studio-mcp.js`, a
-stand-in that speaks Studio's JSON-RPC dialect, including pagination, late
-attach, multi-window routing, alternate schema names, timeouts, and crashes.
-No Studio install is required.
+The CLI suite runs against `test/fake-studio-mcp.js`, a stand-in that speaks
+Studio's JSON-RPC dialect, including pagination, late attach, multi-window
+routing, alternate schema names, timeouts, and crashes. The panel suite builds
+the real UI against `test/plugin-stub.lua`, which rejects unknown Instance
+properties like Studio does. Neither needs a Studio install; neither can check
+pixels, so the panel still deserves one visual pass in Studio.
 
 ## Safety
 

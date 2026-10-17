@@ -84,12 +84,17 @@ run `skills` again. None of them executes arbitrary Luau, which is why `run` exi
 ```sh
 npx golem-bridge search "low poly pine tree"
 npx golem-bridge search "gun sound" --type audio --limit 10
+npx golem-bridge search "metal texture" --type image
 npx golem-bridge search "chair" --scope inventory
 npx golem-bridge insert 123456789 --parent Workspace.Props
 ```
 
-- `search` covers the Creator Store plus the signed-in user's inventory, group, or universe.
-  Filters vary by Studio version; `tools search_asset` prints the exact ones. Show the user
+- `search` searches **every asset kind**, not just models: models, images, audio, video,
+  meshes, animations, plugins, and packages. Without `--type` it asks Studio for the "all"
+  value, so images and sounds show up in the same result set. `--type` accepts friendly
+  spellings (`image`, `Image`, `AUDIO`) and is matched against the live schema; an unknown
+  type fails with the list Studio actually supports.
+- `search` also covers the signed-in user's inventory, group, or universe. Show the user
   options with names and ids before inserting; do not insert a paid asset without asking.
 - `insert` takes a numeric asset id (the `rbxassetid://` prefix is stripped for you) and drops
   the result under `--parent` or the current selection. Models, meshes, images, audio, video,

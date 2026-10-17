@@ -50,11 +50,11 @@ const ARG_ALIASES = {
   studio: ["studio_id"],
   code: ["code", "luau", "source", "script", "command"],
   datamodel: ["datamodel_type", "datamodelType", "datamodel", "data_model_type", "context"],
-  query: ["query", "keyword", "search", "searchQuery", "q", "text"],
+  query: ["query", "keyword", "search", "searchQuery", "searchTerm", "search_term", "term", "q", "text"],
   path: ["path", "instance_path", "instancePath", "target", "root", "scope"],
   depth: ["depth", "max_depth", "maxDepth"],
   className: ["class", "className", "class_name", "type"],
-  assetType: ["asset_type", "assetType", "type", "category", "assetTypeId"],
+  assetType: ["asset_type", "assetType", "assetTypes", "asset_types", "types", "type", "kind", "category", "assetTypeId"],
   scope: ["scope", "inventory", "source", "creatorScope", "creator_scope"],
   limit: ["limit", "max", "page_size", "pageSize"],
   assetId: ["asset_id", "assetId", "id", "asset", "assetID"],
@@ -445,6 +445,38 @@ function pickProperty(tool, aliases) {
   return null;
 }
 
+function normalizeEnumText(value) {
+  return String(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Studio's marketplace tool accepts a fixed list of asset kinds. Accept
+// friendly spellings (image, Image, IMAGES) and return the schema's value.
+function coerceEnum(tool, property, value) {
+  const spec = propsOf(tool)[property];
+  const values = spec && Array.isArray(spec.enum) ? spec.enum : null;
+  if (!values) return value;
+  const wanted = normalizeEnumText(value);
+  const hit = values.find((item) => normalizeEnumText(item) === wanted);
+  if (hit !== undefined) return hit;
+  if (wanted === "all" || wanted === "any" || wanted === "alltypes") {
+    const all = values.find((item) => /^(all|any|alltypes?)$/i.test(normalizeEnumText(item)));
+    if (all !== undefined) return all;
+  }
+  throw new CliError(
+    `'${value}' is not an accepted ${property} for ${tool.name}. Use one of: ${values.join(", ")}.`
+  );
+}
+
+// The value that means "every asset kind" in this Studio version, if any.
+function allEnumValue(tool, key) {
+  const property = pickProperty(tool, ARG_ALIASES[key] || [key]);
+  if (!property) return undefined;
+  const spec = propsOf(tool)[property];
+  const values = spec && Array.isArray(spec.enum) ? spec.enum : null;
+  if (!values) return undefined;
+  return values.find((item) => /^(all|any|alltypes?)$/i.test(normalizeEnumText(item)));
+}
+
 function buildArgs(tool, logical, studioId) {
   const args = {};
   for (const [key, value] of Object.entries(logical || {})) {
@@ -456,7 +488,7 @@ function buildArgs(tool, logical, studioId) {
         `${tool.name} does not accept '${key}'. Its arguments are: ${formatSchema(tool)}.`
       );
     }
-    args[actual] = value;
+    args[actual] = key === "assetType" || key === "datamodel" ? coerceEnum(tool, actual, value) : value;
   }
   if (studioId && toolNeedsStudio(tool) && args.studio_id === undefined) {
     args.studio_id = studioId;
@@ -622,7 +654,7 @@ async function withStudio(flags, options, fn) {
 async function runResolvedTool(flags, spec, fn) {
   return withStudio(flags, { needStudios: true, requireStudio: true }, async (session) => {
     const tool = resolveTool(session.tools, spec.names, spec.expectedArgs || []);
-    const logical = typeof spec.logical === "function" ? spec.logical(flags) : spec.logical;
+    const logical = typeof spec.logical === "function" ? spec.logical(flags, tool, session.studioId) : spec.logical;
     const args = buildArgs(tool, logical, session.studioId);
     const result = await callTool(session.client, tool.name, args, timeoutMs(flags, CALL_TIMEOUT_MS));
     return fn({ result, tool, args, ...session });
@@ -839,12 +871,12 @@ async function cmdSearch(flags) {
     {
       names: ["search_asset", "search_assets"],
       expectedArgs: ["query", "keyword", "search"],
-      logical: {
+      logical: (searchFlags, tool) => ({
         query,
-        assetType: flags.type,
-        scope: flags.scope,
-        limit: flags.limit,
-      },
+        assetType: searchFlags.type || allEnumValue(tool, "assetType"),
+        scope: searchFlags.scope,
+        limit: searchFlags.limit,
+      }),
     },
     ({ result }) => outputResult(result, flags, flags.out)
   );
@@ -1114,7 +1146,7 @@ const COMMAND_SPECS = {
     run: cmdRun,
   },
   search: {
-    help: "search the Creator Store and your inventory",
+    help: "search the market: models, images, audio, video, meshes, and more",
     flags: {
       type: { type: "str" },
       "asset-type": { type: "str", dest: "type" },
