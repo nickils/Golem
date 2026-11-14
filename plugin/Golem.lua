@@ -4021,14 +4021,56 @@ end
 local KEY_ALIASES = {
   [" "] = "Space", enter = "Return", esc = "Escape", ctrl = "LeftControl",
   shift = "LeftShift", alt = "LeftAlt", tab = "Tab", backspace = "Backspace",
+  up = "Up", down = "Down", left = "Left", right = "Right", delete = "Delete",
+  insert = "Insert", home = "Home", pageup = "PageUp", pagedown = "PageDown",
+  ["end"] = "End",
 }
+
+-- Enum.KeyCode is case-sensitive and capitalised: Enum.KeyCode.Space exists,
+-- Enum.KeyCode.space is nil. Accepting "space" (as the docs do) therefore needs
+-- a canonical spelling, or the documented `input w,space` presses nothing. Every
+-- name the plugin advertises is listed here; anything else is passed through so
+-- an exact name like "F5" still works.
+local KEY_CANONICAL = {}
+do
+  local names = {
+    "Space", "Return", "Escape", "Tab", "Backspace", "Delete", "Insert",
+    "LeftShift", "RightShift", "LeftControl", "RightControl", "LeftAlt", "RightAlt",
+    "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown",
+    "Minus", "Equals", "Comma", "Period", "Slash", "Semicolon", "Quote",
+    "LeftBracket", "RightBracket", "BackSlash", "Grave", "CapsLock",
+    "NumLock", "ScrollLock", "Print", "Pause", "Space",
+  }
+  for _, name in ipairs(names) do
+    KEY_CANONICAL[string.lower(name)] = name
+  end
+  local digits = { "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine" }
+  for value, name in ipairs(digits) do
+    KEY_CANONICAL[tostring(value - 1)] = name
+  end
+  local punctuation = {
+    ["-"] = "Minus", ["="] = "Equals", [","] = "Comma", ["."] = "Period",
+    ["/"] = "Slash", [";"] = "Semicolon", ["["] = "LeftBracket",
+    ["]"] = "RightBracket", ["\\"] = "BackSlash", ["`"] = "Grave",
+  }
+  for symbol, name in pairs(punctuation) do
+    KEY_ALIASES[symbol] = name
+  end
+  for letter in string.gmatch("ABCDEFGHIJKLMNOPQRSTUVWXYZ", ".") do
+    KEY_CANONICAL[string.lower(letter)] = letter
+  end
+  for i = 1, 15 do
+    KEY_CANONICAL[string.lower("F" .. i)] = "F" .. i
+  end
+end
 
 local function keyCodeFor(name)
   local text = tostring(name or "")
-  if #text == 1 then
+  if #text == 1 and string.match(text, "%a") then
     text = string.upper(text)
   end
-  text = KEY_ALIASES[string.lower(text)] or text
+  local lower = string.lower(text)
+  text = KEY_ALIASES[lower] or KEY_CANONICAL[lower] or text
   local ok, code = pcall(function()
     return Enum.KeyCode[text]
   end)
@@ -4064,6 +4106,69 @@ local function pressKey(vim, name)
     return false, "the game rejected the key event (" .. vim.kind .. "): " .. tostring(err)
   end
   return true
+end
+
+-- Holding a key is down, wait, up - and either half can fail independently. If
+-- the down fails the key never went down, so the whole hold is a failure; if the
+-- up fails the key is stuck down in the game, which is worse than a plain error
+-- (the player keeps moving), so it is reported as such.
+local function setKeyDown(vim, code, down)
+  local ok, err
+  if vim.kind == "VirtualInput" then
+    ok, err = pcall(function()
+      vim.handle:SendKey(down, code)
+    end)
+  else
+    ok, err = pcall(function()
+      vim.handle:SendKeyEvent(down, code, false, game)
+    end)
+  end
+  if not ok then
+    return false, tostring(err)
+  end
+  return true
+end
+
+local function holdKeys(vim, names, seconds, keyDelay)
+  local codes, sent = {}, {}
+  for _, name in ipairs(names) do
+    local code = keyCodeFor(name)
+    if code == nil then
+      return false, "unknown key '" .. tostring(name) .. "'"
+    end
+    codes[#codes + 1] = { name = name, code = code }
+  end
+  if #codes == 0 then
+    return false, "hold needs at least one key"
+  end
+  -- press them in order, with the same gap between keys as typed input
+  for index, entry in ipairs(codes) do
+    local ok, err = setKeyDown(vim, entry.code, true)
+    if not ok then
+      -- release whatever did go down, so a failed hold cannot leave the game
+      -- with a key held forever
+      for i = 1, index - 1 do
+        setKeyDown(vim, codes[i].code, false)
+      end
+      return false, "the game rejected holding '" .. tostring(entry.name) .. "' (" .. vim.kind .. "): " .. tostring(err)
+    end
+    sent[#sent + 1] = tostring(entry.name)
+    if index < #codes then
+      task.wait(math.clamp(tonumber(keyDelay) or 0.08, 0, 2))
+    end
+  end
+  task.wait(math.clamp(tonumber(seconds) or 1, 0.05, 10))
+  local stuck = {}
+  for i = #codes, 1, -1 do
+    local ok, err = setKeyDown(vim, codes[i].code, false)
+    if not ok then
+      table.insert(stuck, string.format("%s (%s)", tostring(codes[i].name), tostring(err)))
+    end
+  end
+  if #stuck > 0 then
+    return false, "the key is still held in the game - releasing failed for " .. table.concat(stuck, ", ")
+  end
+  return true, sent
 end
 
 local function clickAt(vim, x, y, holdSeconds)
@@ -4206,16 +4311,25 @@ handlers.input = function(args)
   end
   local sent = {}
   if type(args.text) == "string" and #args.text > 0 then
+    local typed, typeErr
     if vim.kind == "VirtualInput" then
-      pcall(function()
+      typed, typeErr = pcall(function()
         vim.handle:SendTextInput(args.text)
       end)
     else
+      typed, typeErr = true, nil
       for i = 1, #args.text do
-        pcall(function()
+        local okChar, errChar = pcall(function()
           vim.handle:SendTextInputCharacterEvent(string.sub(args.text, i, i), game)
         end)
+        if not okChar then
+          typed, typeErr = false, errChar
+          break
+        end
       end
+    end
+    if not typed then
+      return { ok = false, error = "the game rejected the text input (" .. vim.kind .. "): " .. tostring(typeErr), sent = sent }
     end
     table.insert(sent, "text")
   end
@@ -4233,35 +4347,17 @@ handlers.input = function(args)
       task.wait(tonumber(args.keyDelay) or 0.08)
     end
   end
-  if type(args.hold) == "table" then
-    local held = false
-    for _, key in ipairs(args.hold) do
-      local code = keyCodeFor(key)
-      if code ~= nil then
-        pcall(function()
-          if vim.kind == "VirtualInput" then
-            vim.handle:SendKey(true, code)
-          else
-            vim.handle:SendKeyEvent(true, code, false, game)
-          end
-        end)
-        held = true
-      end
+  local holdList = args.hold
+  if type(holdList) == "string" then
+    holdList = {}
+    for piece in string.gmatch(args.hold, "[^,]+") do
+      table.insert(holdList, (string.gsub(piece, "^%s*(.-)%s*$", "%1")))
     end
-    if held then
-      task.wait(math.clamp(tonumber(args.holdSeconds) or 1, 0.05, 10))
-      for _, key in ipairs(args.hold) do
-        local code = keyCodeFor(key)
-        if code ~= nil then
-          pcall(function()
-            if vim.kind == "VirtualInput" then
-              vim.handle:SendKey(false, code)
-            else
-              vim.handle:SendKeyEvent(false, code, false, game)
-            end
-          end)
-        end
-      end
+  end
+  if type(holdList) == "table" then
+    local held, heldErr = holdKeys(vim, holdList, args.holdSeconds, args.keyDelay)
+    if not held then
+      return { ok = false, error = heldErr, sent = sent }
     end
     table.insert(sent, "hold")
   end

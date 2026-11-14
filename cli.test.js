@@ -159,9 +159,41 @@ test("buildArgs maps the new playtesting tools", () => {
   assert.equal(cli.buildArgs("click", cli.parseToolArgs("click", ["1", "2", "--hold-ms", "150"])).args.holdMs, 150);
   assert.equal(cli.buildArgs("input", cli.parseToolArgs("input", ["w", "--key-delay", "0.2"])).args.keyDelay, 0.2);
   assert.equal(cli.buildArgs("input", cli.parseToolArgs("input", ["w", "--hold-seconds", "1.5"])).args.holdSeconds, 1.5);
+  // Holding keys is its own thing: --hold is the key list, --hold-seconds the
+  // duration. Keys are optional when --hold or --text supplies the input.
+  assert.deepEqual(cli.buildArgs("input", cli.parseToolArgs("input", ["--hold", "w,space", "--hold-seconds", "2"])).args, {
+    hold: ["w", "space"],
+    holdSeconds: 2,
+  });
+  assert.deepEqual(cli.buildArgs("input", cli.parseToolArgs("input", ["--hold", "shift"])).args, { hold: ["shift"] });
+  // the documented positional form is a comma list too
+  assert.deepEqual(cli.buildArgs("input", cli.parseToolArgs("input", ["w,space"])).args, { keys: ["w", "space"] });
+  // and holding the same key twice must not silently collapse
+  assert.deepEqual(cli.buildArgs("input", cli.parseToolArgs("input", ["--hold", "w", "--hold", "w"])).args.hold, ["w", "w"]);
+  throwsUsage(() => cli.buildArgs("input", cli.parseToolArgs("input", [])), /give keys/);
   assert.equal(cli.buildArgs("scatter", cli.parseToolArgs("scatter", ["Workspace/X", "--y-jitter", "2"])).args.yJitter, 2);
-  throwsUsage(() => cli.parseToolArgs("input", []), /at least one key/);
+  assert.deepEqual(cli.parseToolArgs("input", []).key, undefined, "keys are optional now");
   throwsUsage(() => cli.buildArgs("click", cli.parseToolArgs("click", ["a", "b"])), /must be numbers/);
+});
+
+test("every documented input form actually parses", () => {
+  // These are the examples in `help input` and golem-tools.md. `input w,space`
+  // and `input --hold ...` are documented as working; both used to fail (one
+  // produced a single bogus key, the other demanded a positional key first).
+  const forms = [
+    [["w", "space"], { keys: ["w", "space"] }],
+    [["w,space"], { keys: ["w", "space"] }],
+    [["--text", "hello"], { text: "hello" }],
+    [["--hold", "w", "--hold-seconds", "2"], { hold: ["w"], holdSeconds: 2 }],
+    [["--hold", "shift,w", "--hold-seconds", "1"], { hold: ["shift", "w"], holdSeconds: 1 }],
+  ];
+  for (const [argv, expected] of forms) {
+    assert.deepEqual(
+      cli.buildArgs("input", cli.parseToolArgs("input", argv)).args,
+      expected,
+      `documented form \`input ${argv.join(" ")}\` does not produce what the docs say`
+    );
+  }
 });
 
 test("there is no turn/say/note tool left", () => {

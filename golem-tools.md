@@ -196,8 +196,23 @@ The loop that works:
 5. `stop` when the test is done, then fix what you found.
 
 Keys are ordinary names: `w`, `a`, `space`, `enter`, `shift`, `escape`, `f`,
-`up`, `tab`. Mouse coordinates are viewport pixels, which is the same coordinate
-space as the screenshot you just looked at, scaled by `--max-width`.
+`up`, `tab`, `0`-`9`, `f1`-`f15`, and the punctuation keys. Any list can be
+comma-separated: `input w,space` and `input w space` both send two keys. Mouse
+coordinates are viewport pixels, which is the same coordinate space as the
+screenshot you just looked at, scaled by `--max-width`.
+
+To **hold** a key down — walk forward, charge a shot, hold shift — use `--hold`:
+
+```
+input --hold w --hold-seconds 2        # hold W for two seconds
+input --hold shift,w --hold-seconds 1  # hold both, then release together
+```
+
+The key goes down, stays down for `--hold-seconds` (0.05-10, default 1), then
+comes up. If the game refuses the release, the tool says the key is **still held**
+rather than reporting success — that is the failure mode worth knowing about,
+because the player keeps moving after the AI thinks it stopped. Holding several
+keys presses them in order with `--key-delay` between each (default 0.08 s).
 
 `--max-width` defaults to 522 px and that is also the maximum: it is the widest
 capture that still fits through the relay even when the screen is white (a

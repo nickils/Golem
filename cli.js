@@ -579,7 +579,7 @@ const TOOLS = {
   logs: { help: "read the play session's errors and warnings", pos: [], flags: { all: "bool", limit: "int", since: "float" } },
   screenshot: { help: "capture the viewport (or the running game) to a PNG", pos: [], flags: { label: "str", max_width: ["int", { flag: "--max-width", default: DEFAULT_SHOT_WIDTH }] } },
   click: { help: "click at viewport x,y inside the running game", pos: ["x", "y"], flags: { hold_ms: "int", button: ["str", { default: "left" }] } },
-  input: { help: "send keys/text to the running game (e.g. w,space or --text hello)", pos: [["key", "+"]], flags: { text: "str", hold: "append", hold_seconds: "float", key_delay: "float" } },
+  input: { help: "send keys/text to the running game (e.g. w,space, --text hello, or --hold w --hold-seconds 2)", pos: [["key", "*"]], flags: { text: "str", hold: "append", hold_seconds: "float", key_delay: "float" } },
   look_through: { help: "point the in-game camera at a path", pos: ["path"] },
   attr: { help: "read/set/clear Studio attributes on an instance", pos: ["path"], flags: { set: "append", clear: "append" } },
   tag: { help: "add/remove CollectionService tags", pos: [["paths", "+"]], flags: { add: "append", remove: "append" } },
@@ -645,7 +645,12 @@ function parseToolArgs(name, argv) {
       if (eq !== -1) raw = t.slice(eq + 1);
       else { i++; if (i >= argv.length) throw new UsageError(`${name}: ${fl} needs a value`); raw = argv[i]; }
       const c = coerce(v, raw);
-      if (v.multi) ns[v.dest].push(c); else ns[v.dest] = c;
+      // repeatable flags also accept a comma list: the help text says
+      // `--hold w,space`, so one comma-separated value must mean two keys
+      if (v.multi && (v.type === "str" || v.type === "append") && typeof c === "string" && c.includes(",")) {
+        for (const piece of c.split(",").map((x) => x.trim()).filter(Boolean)) ns[v.dest].push(piece);
+      } else if (v.multi) ns[v.dest].push(c);
+      else ns[v.dest] = c;
       i++; continue;
     }
     if (t in bools) { ns[bools[t]] = true; i++; continue; }
@@ -659,9 +664,18 @@ function parseToolArgs(name, argv) {
   for (const p of (spec.pos || [])) {
     const a = Array.isArray(p) ? p : [p];
     const pname = a[0], pdef = a[1], pchoices = a[2], ptype = a[3];
-    if (pdef === "+") {
-      if (pi >= pos.length) throw new UsageError(`${name}: need at least one ${pname}`);
-      outNs[pname] = pos.slice(pi); pi = pos.length;
+    if (pdef === "+" || pdef === "*") {
+      // "+" needs at least one, "*" may be empty (other flags may supply it)
+      if (pdef === "+" && pi >= pos.length) throw new UsageError(`${name}: need at least one ${pname}`);
+      if (pi < pos.length) {
+        // `input w,space` means two keys; the help text says so
+        const rest = [];
+        for (const raw of pos.slice(pi)) {
+          for (const piece of String(raw).split(",").map((x) => x.trim()).filter(Boolean)) rest.push(piece);
+        }
+        outNs[pname] = rest;
+      }
+      pi = pos.length;
     } else if (pi < pos.length) {
       const raw = pos[pi++];
       let v = raw;
@@ -1093,6 +1107,7 @@ function toolUsage(name) {
   for (const p of (spec.pos || [])) {
     const a = Array.isArray(p) ? p : [p];
     if (a[1] === "+") parts.push(`<${a[0]}...>`);
+    else if (a[1] === "*") parts.push(`[${a[0]}...]`);
     else if (a[1] !== undefined) parts.push(`[${a[0]}]`);
     else parts.push(`<${a[0]}>`);
   }
