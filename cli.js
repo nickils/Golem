@@ -230,7 +230,10 @@ function turnReminder(entry) {
 
 const FIREBASE_DB = envOf("GOLEM_FIREBASE_DB", "AIB_FIREBASE_DB") || "https://roblox-golem-default-rtdb.firebaseio.com";
 const FETCH_TIMEOUT_MS = 30000;
-const MAX_BODY_BYTES = 2 * 1024 * 1024;
+// A screenshot reply is the biggest thing on the wire: the plugin caps captures
+// so they fit ~3.5 MB, and this must stay comfortably above that or a valid
+// capture is rejected while it is being read.
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 function pollIntervalMs() {
   const secs = parseFloat(envOf("GOLEM_POLL_INTERVAL", "AIB_POLL_INTERVAL")) || 2;
   return Math.max(100, secs * 1000);
@@ -238,6 +241,25 @@ function pollIntervalMs() {
 // Channel ids are 16 hex chars today; tolerate 8-64 for forward compatibility.
 // Anything else is rejected so a malformed id can never alter the request URL.
 const CHANNEL_RE = /^[0-9a-fA-F]{8,64}$/;
+
+// Screenshots travel as "r,g,b,a;" text, so a pixel costs up to 17 bytes
+// ("255,255,255,255;"). Sizing from the average 11 B instead is a trap that
+// actually bit us: a bright capture came out 5 MB and the relay rejected it, so
+// the "safe" default never arrived. This uses the worst case, keeps room for the
+// envelope, and is also the ceiling - a wider capture is just a bigger picture
+// that dies on the way home. The plugin derives the same number.
+const RELAY_RESULT_BUDGET = 3500000 - 20000;
+// Worst case: every pixel at full brightness and opaque. Saturation, so this
+// holds for any picture, not just a dark one.
+const MAX_BYTES_PER_PIXEL = 17; // "255,255,255,255;" = 16 chars + separator
+const DEFAULT_SHOT_WIDTH = (() => {
+  let best = 8;
+  for (let width = 8; width <= 2000; width++) {
+    const height = Math.ceil((width * 3) / 4);
+    if (width * height * MAX_BYTES_PER_PIXEL <= RELAY_RESULT_BUDGET) best = width;
+  }
+  return best;
+})();
 
 /**
  * The relay must be HTTPS (plain HTTP only for a local emulator). Trailing
@@ -555,7 +577,7 @@ const TOOLS = {
   stop: { help: "stop the running play test" },
   playstate: { help: "is a test running, and are the in-game drivers alive?" },
   logs: { help: "read the play session's errors and warnings", pos: [], flags: { all: "bool", limit: "int", since: "float" } },
-  screenshot: { help: "capture the viewport (or the running game) to a PNG", pos: [], flags: { label: "str", max_width: ["int", { flag: "--max-width", default: 900 }] } },
+  screenshot: { help: "capture the viewport (or the running game) to a PNG", pos: [], flags: { label: "str", max_width: ["int", { flag: "--max-width", default: DEFAULT_SHOT_WIDTH }] } },
   click: { help: "click at viewport x,y inside the running game", pos: ["x", "y"], flags: { hold_ms: "int", button: ["str", { default: "left" }] } },
   input: { help: "send keys/text to the running game (e.g. w,space or --text hello)", pos: [["key", "+"]], flags: { text: "str", hold: "append", hold_seconds: "float", key_delay: "float" } },
   look_through: { help: "point the in-game camera at a path", pos: ["path"] },
@@ -651,7 +673,16 @@ function parseToolArgs(name, argv) {
     else throw new UsageError(`${name}: missing ${pname}`);
   }
   if (pi < pos.length) throw new UsageError(`${name}: too many arguments (got "${pos[pi]}")`);
-  return Object.assign(ns, outNs);
+  const merged = Object.assign(ns, outNs);
+  // Flags are declared snake_case (`--max-width` -> max_width) but buildArgs
+  // reads some of them in camelCase. Expose both spellings so a declared flag
+  // can never be silently ignored - that bug silently dropped five of them.
+  for (const key of Object.keys(merged)) {
+    if (!key.includes("_")) continue;
+    const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+    if (!(camel in merged)) merged[camel] = merged[key];
+  }
+  return merged;
 }
 
 function vec3(s) {
@@ -973,6 +1004,13 @@ function buildArgs(name, ns) {
       if (ns.label) a.label = ns.label;
       if (ns.maxWidth != null) {
         if (ns.maxWidth < 64) throw new UsageError("screenshot: --max-width must be at least 64");
+        if (ns.maxWidth > DEFAULT_SHOT_WIDTH) {
+          throw new UsageError(
+            `screenshot: --max-width ${ns.maxWidth} would not fit through the relay; ` +
+              `the largest capture that arrives intact is ${DEFAULT_SHOT_WIDTH}. ` +
+              `Use look_through to get closer instead.`
+          );
+        }
         a.maxWidth = ns.maxWidth;
       }
       return { op: "screenshot", args: a, screenshot: true, label: ns.label };

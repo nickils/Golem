@@ -199,6 +199,13 @@ Keys are ordinary names: `w`, `a`, `space`, `enter`, `shift`, `escape`, `f`,
 `up`, `tab`. Mouse coordinates are viewport pixels, which is the same coordinate
 space as the screenshot you just looked at, scaled by `--max-width`.
 
+`--max-width` defaults to 522 px and that is also the maximum: it is the widest
+capture that still fits through the relay even when the screen is white (a
+bright pixel is 17 bytes of `r,g,b,a;` text, a dark one 9). Asking for more is
+refused up front rather than failing in transit. To see fine detail,
+`look_through` the thing and take another screenshot instead of raising the
+width.
+
 Outside a play session, input tools refuse to run with a message telling you to
 `play` first — that is deliberate. `screenshot` works in both modes: in the
 editor it captures the Studio viewport, in a test it captures the game.

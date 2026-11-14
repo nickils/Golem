@@ -136,16 +136,30 @@ test("buildArgs maps the new playtesting tools", () => {
     op: "input",
     args: { keys: ["w", "space"] },
   });
+  // --max-width is always sent now: the plugin needs it to size the capture,
+  // and a width that cannot fit the relay is rejected before the round trip.
+  const shotDefault = cli.TOOLS.screenshot.flags.max_width[1].default;
   assert.deepEqual(cli.buildArgs("screenshot", cli.parseToolArgs("screenshot", ["--label", "menu"])), {
     op: "screenshot",
-    args: { label: "menu" },
+    args: { label: "menu", maxWidth: shotDefault },
     screenshot: true,
     label: "menu",
   });
+  assert.deepEqual(
+    cli.buildArgs("screenshot", cli.parseToolArgs("screenshot", ["--max-width", "320"])).args,
+    { maxWidth: 320 },
+    "--max-width must reach the plugin"
+  );
   assert.deepEqual(cli.buildArgs("undo", cli.parseToolArgs("undo", ["--times", "3"])), {
     op: "undo",
     args: { times: 3 },
   });
+  // Flags are declared snake_case but read camelCase. Both spellings now exist,
+  // so these five can no longer be silently dropped on the way to the plugin.
+  assert.equal(cli.buildArgs("click", cli.parseToolArgs("click", ["1", "2", "--hold-ms", "150"])).args.holdMs, 150);
+  assert.equal(cli.buildArgs("input", cli.parseToolArgs("input", ["w", "--key-delay", "0.2"])).args.keyDelay, 0.2);
+  assert.equal(cli.buildArgs("input", cli.parseToolArgs("input", ["w", "--hold-seconds", "1.5"])).args.holdSeconds, 1.5);
+  assert.equal(cli.buildArgs("scatter", cli.parseToolArgs("scatter", ["Workspace/X", "--y-jitter", "2"])).args.yJitter, 2);
   throwsUsage(() => cli.parseToolArgs("input", []), /at least one key/);
   throwsUsage(() => cli.buildArgs("click", cli.parseToolArgs("click", ["a", "b"])), /must be numbers/);
 });
@@ -536,6 +550,88 @@ test("the shipped plugin talks over the relay and keeps the session capability",
   assert.match(src, /CaptureScreenshot/, "screenshot needs CaptureService");
   assert.ok(!/guestExec\("editor"/.test(src), "screenshot must not ask for a nonexistent editor driver");
 });
+
+test("screenshot: the default capture fits the relay, and the size is derived", () => {
+  // A 900px RGBA capture is ~5 MB of "r,g,b,a;" text; the relay rejects that, so
+  // the advertised default must be a width that actually survives the trip.
+  const width = cli.TOOLS.screenshot.flags.max_width[1].default;
+  const height = Math.ceil((width * 3) / 4);
+  // Worst case, not average: every pixel at full brightness. Sizing on the
+  // average 11 bytes is exactly the mistake that shipped a 5 MB "safe" default.
+  const worst = width * height * 17;
+  assert.ok(
+    worst <= 3480000,
+    `a bright ${width}px capture is ${Math.round(worst / 1024)}KB, over the relay cap`
+  );
+  assert.ok(width >= 480, `default ${width}px is smaller than it needs to be`);
+
+  // And the same check on a real saturated payload: encode a full-white capture
+  // the way the plugin does and measure it.
+  const cell = "255,255,255,255";
+  const sample = [];
+  for (let i = 0; i < 1000; i++) sample.push(cell);
+  const perPixel = sample.join(";").length / 1000;
+  assert.ok(
+    width * height * perPixel <= 3480000,
+    `saturated capture uses ${perPixel} B/px and would be rejected in transit`
+  );
+
+  // The CLI must refuse a width it cannot deliver rather than let it die in
+  // transit, and the message must say why.
+  throwsUsage(
+    () => cli.buildArgs("screenshot", cli.parseToolArgs("screenshot", ["--max-width", "1200"])),
+    /fit through the relay/
+  );
+
+  // The plugin derives the same number from its own cap; if they drift, one side
+  // asks for a capture the other cannot deliver.
+  const src = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
+  assert.match(src, /SCREENSHOT_MAX_WIDTH = best/, "the plugin no longer derives its capture width");
+
+  // Derive the plugin's cap from its own constants and require the two sides to
+  // agree: otherwise the CLI asks for a capture the plugin will not deliver, or
+  // the plugin sends one the CLI cannot read.
+  const cap = Number(/local RELAY_MAX_RESULT = (\d+)/.exec(src)?.[1]);
+  const pluginPerPixel = Number(/local BYTES_PER_PIXEL_MAX = (\d+)/.exec(src)?.[1]);
+  assert.ok(cap && pluginPerPixel, "the plugin's screenshot sizing constants are gone");
+  let pluginWidth = 8;
+  for (let w = 8; w <= 2000; w++) {
+    if (w * Math.ceil((w * 3) / 4) * pluginPerPixel <= cap - 20000) pluginWidth = w;
+  }
+  assert.equal(
+    width,
+    pluginWidth,
+    `CLI default ${width}px and plugin cap ${pluginWidth}px disagree - one side cannot deliver`
+  );
+  // And the plugin's own worst case must clear the transport guard.
+  assert.ok(
+    pluginWidth * Math.ceil((pluginWidth * 3) / 4) * pluginPerPixel < cap,
+    "the plugin would reject its own capture"
+  );
+});
+
+test("screenshot: a captured PNG decodes back to the pixels that were sent", inTempCwd(async () => {
+  // A gradient 8x4 capture, as the plugin emits it ("r,g,b,a;" per pixel).
+  const w = 8, h = 4;
+  const px = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) px.push(`${x * 30},${y * 60},${(x + y) * 20},255`);
+  }
+  const shot = cli.writeScreenshot({ width: w, height: h, pixels: px.join(";"), label: "grad" }, undefined);
+  const png = fs.readFileSync(shot.file);
+  assert.deepEqual([...png.slice(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = png.indexOf(Buffer.from("IHDR", "ascii")) + 4;
+  assert.equal(png.readUInt32BE(ihdr), w, "PNG width must match the capture");
+  assert.equal(png.readUInt32BE(ihdr + 4), h, "PNG height must match the capture");
+  // inflate the IDAT and check real pixel values survived the round trip
+  const idat = png.indexOf(Buffer.from("IDAT", "ascii")) + 4;
+  const raw = zlib.inflateSync(png.slice(idat, idat + png.readUInt32BE(idat - 8)));
+  const stride = w * 4;
+  // row 2, column 5 -> r = 150, g = 120, b = 140
+  const off = 2 * (stride + 1) + 1 + 5 * 4;
+  assert.deepEqual([...raw.slice(off, off + 4)], [150, 120, 140, 255]);
+  assert.equal(raw[0], 0, "each PNG row must start with a filter byte");
+}));
 
 test("the play gate covers exactly the ops that work while a test runs", () => {
   const src = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");

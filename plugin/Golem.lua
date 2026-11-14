@@ -3477,9 +3477,33 @@ local PLAY_SAFE = {
 	logs = true, click = true, input = true, look_through = true, play = true,
 }
 
--- Firebase caps a write around 1 MB; stay well under it so a big reply becomes a
--- clear error instead of an opaque HTTP 400.
-local RELAY_MAX_RESULT = 900000
+-- Screenshots are by far the biggest thing that crosses the relay: a 900px
+-- RGBA capture is ~5 MB of CSV, and the old 900 KB cap silently rejected every
+-- default capture in transit. Firebase's own per-write ceiling is 16 MB, but
+-- decoding and downloading that much per poll is slow, so the budget is kept
+-- well under it. SCREENSHOT_MAX_WIDTH below is derived from this number rather
+-- than picked by eye: raise the cap and the capture grows with it.
+local RELAY_MAX_RESULT = 3500000
+
+-- Derive the screenshot size from that budget instead of guessing. Each pixel
+-- is sent as "r,g,b,a;", and a bright pixel is 17 bytes ("255,255,255,255;"),
+-- not the 11 an average pixel costs. Sizing on the average is how a "safe"
+-- capture ended up 5 MB and got rejected in transit, so this uses the worst
+-- case: it has to hold for a white screen, not a dim one. 4:3 is the
+-- pessimistic shape and 20 KB of envelope is left over deliberately.
+local BYTES_PER_PIXEL_MAX = 17
+local SCREENSHOT_MAX_WIDTH = 8
+do
+	local budget = RELAY_MAX_RESULT - 20000
+	local best = 8
+	for width = 8, 2000 do
+		local height = math.ceil(width * 3 / 4)
+		if width * height * BYTES_PER_PIXEL_MAX <= budget then
+			best = width
+		end
+	end
+	SCREENSHOT_MAX_WIDTH = best
+end
 -- A single command may run for at most this long before the loop gives up on it.
 local COMMAND_TIMEOUT_SECONDS = 180
 
@@ -4014,50 +4038,66 @@ local function keyCodeFor(name)
   return code
 end
 
+-- Input must never claim success it did not have: if the call errored, the
+-- synthetic click/key never reached the game and the AI has to know, or it will
+-- keep "clicking" a button that was never pressed.
 local function pressKey(vim, name)
   local code = keyCodeFor(name)
   if code == nil then
     return false, "unknown key '" .. tostring(name) .. "'"
   end
+  local ok, err
   if vim.kind == "VirtualInput" then
-    pcall(function()
+    ok, err = pcall(function()
       vim.handle:SendKey(true, code)
       task.wait(0.03)
       vim.handle:SendKey(false, code)
     end)
-    return true
+  else
+    ok, err = pcall(function()
+      vim.handle:SendKeyEvent(true, code, false, game)
+      task.wait(0.03)
+      vim.handle:SendKeyEvent(false, code, false, game)
+    end)
   end
-  pcall(function()
-    vim.handle:SendKeyEvent(true, code, false, game)
-    task.wait(0.03)
-    vim.handle:SendKeyEvent(false, code, false, game)
-  end)
+  if not ok then
+    return false, "the game rejected the key event (" .. vim.kind .. "): " .. tostring(err)
+  end
   return true
 end
 
 local function clickAt(vim, x, y, holdSeconds)
+  if type(x) ~= "number" or type(y) ~= "number" then
+    return false, "click needs numeric x and y (viewport pixels)"
+  end
   local point = Vector2.new(x, y)
+  local ok, err
   if vim.kind == "VirtualInput" then
-    pcall(function()
+    ok, err = pcall(function()
       vim.handle:SendMousePosition(point)
       vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, true)
       task.wait(holdSeconds or 0.06)
       vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, false)
     end)
-    return true
+  else
+    ok, err = pcall(function()
+      vim.handle:SendMouseMoveEvent(x, y, game)
+      vim.handle:SendMouseButtonEvent(x, y, 1, true, game, 0)
+      task.wait(holdSeconds or 0.06)
+      vim.handle:SendMouseButtonEvent(x, y, 1, false, game, 0)
+    end)
   end
-  pcall(function()
-    vim.handle:SendMouseMoveEvent(x, y, game)
-    vim.handle:SendMouseButtonEvent(x, y, 1, true, game, 0)
-    task.wait(holdSeconds or 0.06)
-    vim.handle:SendMouseButtonEvent(x, y, 1, false, game, 0)
-  end)
+  if not ok then
+    return false, "the game rejected the click (" .. vim.kind .. "): " .. tostring(err)
+  end
   return true
 end
 
 -- Crop + downscale RGBA into a PNG-friendly payload.
 local function captureScreenshot(args)
-  local maxWidth = tonumber(args and args.maxWidth) or 900
+  -- The driver builds the payload that goes over the relay, so it clamps too:
+  -- a capture wider than this is rejected in transit and never reaches the AI.
+  local maxWidth = math.max(8, math.min(tonumber(args and args.maxWidth) or @MAXWIDTH@, @MAXWIDTH@))
   local contentId = nil
   local finished = false
   CaptureService:CaptureScreenshot(function(id)
@@ -4086,27 +4126,41 @@ local function captureScreenshot(args)
   local opaque = 0
   local stepX = size.X / width
   local stepY = size.Y / height
+  local readFailures = 0
+  -- One read per row: a per-pixel ReadPixels is hundreds of thousands of calls
+  -- inside the running game and stalls the very session we are testing.
   for y = 0, height - 1 do
-    for x = 0, width - 1 do
-      local okPixel, r, g, b, a = pcall(function()
-        local px = image:ReadPixels(Vector2.new(math.floor(x * stepX), math.floor(y * stepY)), Vector2.new(1, 1))
-        return px[1], px[2], px[3], px[4]
-      end)
-      if okPixel and r ~= nil then
-        if (a or 1) > 0.01 then
-          opaque = opaque + 1
-        end
-        table.insert(points, string.format("%d,%d,%d,%d",
-          math.floor((r or 0) * 255), math.floor((g or 0) * 255), math.floor((b or 0) * 255),
-          math.floor((a or 1) * 255)))
-      else
+    local rowOk, row = pcall(function()
+      return image:ReadPixels(Vector2.new(0, math.floor(y * stepY)), Vector2.new(size.X, 1))
+    end)
+    if not rowOk or type(row) ~= "table" then
+      readFailures = readFailures + 1
+      for _ = 1, width do
         table.insert(points, "0,0,0,0")
+      end
+    else
+      for x = 0, width - 1 do
+        local src = math.floor(x * stepX) * 4 + 1
+        local r, g, b, a = row[src], row[src + 1], row[src + 2], row[src + 3]
+        if r ~= nil then
+          if (a or 1) > 0.01 then
+            opaque = opaque + 1
+          end
+          table.insert(points, string.format("%d,%d,%d,%d",
+            math.floor((r or 0) * 255), math.floor((g or 0) * 255), math.floor((b or 0) * 255),
+            math.floor((a or 1) * 255)))
+        else
+          table.insert(points, "0,0,0,0")
+        end
       end
     end
   end
   pcall(function()
     image:Destroy()
   end)
+  if readFailures >= height then
+    return { ok = false, error = "the capture was taken but no pixels could be read (EditableImage unavailable?)" }
+  end
   return {
     ok = true,
     label = tostring(args and args.label or "viewport"),
@@ -4299,6 +4353,7 @@ local function buildGuestSource(role)
 		text = string.gsub(text, "@ROLE@", role)
 		text = string.gsub(text, "@RELAY@", FIREBASE_DB)
 		text = string.gsub(text, "@CHANNEL@", tostring(bridge.channel))
+		text = string.gsub(text, "@MAXWIDTH@", tostring(SCREENSHOT_MAX_WIDTH))
 		return text
 	end)
 	if not ok then
@@ -4685,29 +4740,49 @@ local function captureViewport(maxWidth)
 		return nil, "could not read the capture: " .. tostring(errImage)
 	end
 	local size = image.Size
-	local scale = math.min(1, (tonumber(maxWidth) or 900) / math.max(1, size.X))
+	-- Clamp whatever arrived: the plugin is what builds the reply, so it - not
+	-- just the CLI - has to keep a capture small enough to survive the relay.
+	local asked = tonumber(maxWidth) or SCREENSHOT_MAX_WIDTH
+	asked = math.max(8, math.min(asked, SCREENSHOT_MAX_WIDTH))
+	local scale = math.min(1, asked / math.max(1, size.X))
 	local width = math.max(8, math.floor(size.X * scale))
 	local height = math.max(8, math.floor(size.Y * scale))
 	local stepX = size.X / width
 	local stepY = size.Y / height
 	local points = {}
+	local readFailures = 0
+	-- Read one row at a time: a per-pixel ReadPixels is 300k+ calls for a single
+	-- capture and drags the session down. One call per row is ~500.
 	for y = 0, height - 1 do
-		for x = 0, width - 1 do
-			local okPixel, px = pcall(function()
-				return image:ReadPixels(Vector2.new(math.floor(x * stepX), math.floor(y * stepY)), Vector2.new(1, 1))
-			end)
-			if okPixel and px ~= nil and px[1] ~= nil then
-				table.insert(points, string.format("%d,%d,%d,%d",
-					math.floor((px[1] or 0) * 255), math.floor((px[2] or 0) * 255),
-					math.floor((px[3] or 0) * 255), math.floor((px[4] or 1) * 255)))
-			else
+		local rowOk, row = pcall(function()
+			return image:ReadPixels(
+				Vector2.new(0, math.floor(y * stepY)),
+				Vector2.new(size.X, 1))
+		end)
+		if not rowOk or type(row) ~= "table" then
+			readFailures = readFailures + 1
+			for _ = 1, width do
 				table.insert(points, "0,0,0,0")
+			end
+		else
+			for x = 0, width - 1 do
+				local src = math.floor(x * stepX) * 4 + 1
+				if row[src] ~= nil then
+					table.insert(points, string.format("%d,%d,%d,%d",
+						math.floor((row[src] or 0) * 255), math.floor((row[src + 1] or 0) * 255),
+						math.floor((row[src + 2] or 0) * 255), math.floor((row[src + 3] or 1) * 255)))
+				else
+					table.insert(points, "0,0,0,0")
+				end
 			end
 		end
 	end
 	pcall(function()
 		image:Destroy()
 	end)
+	if readFailures >= height then
+		return nil, "Studio returned a capture but none of its pixels could be read (EditableImage may be unavailable in this build)"
+	end
 	return {
 		ok = true,
 		width = width,
