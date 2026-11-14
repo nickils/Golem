@@ -24,8 +24,10 @@ node test/plugin/run.js sweep    # one suite: ui | switch | restart | sweep
 node test/plugin/lint.js plugin/Golem.lua
 ```
 
-- `ui` — the setup window: close hides it, COPY copies without stealing focus,
-  the line is not editable, ASK YOUR AI acts, the switch persists.
+- `ui` — the setup window: close hides it, the SET UP AI pill reopens it, no
+  copy button exists and the panel says to press Ctrl+C, focusing the line
+  selects all of it, both copies of the line are read-only, the switch
+  persists.
 - `switch` — off really stops commands, rotates the channel, and on resumes.
 - `restart` — a saved OFF survives a reload with zero polls.
 - `sweep` — every op is driven in the correct phase and must return a result.
@@ -62,10 +64,16 @@ sitting on "connecting" forever.
   one, so a line you already pasted into a chat stops working; a saved OFF
   survives a Studio restart. On mints a fresh channel and resumes.
 - **The setup window behaves.** Close dismisses the popup (the SET UP AI pill
-  reopens it); COPY copies and nothing else — it no longer steals focus or
-  moves the cursor; the line itself is selectable but not editable, because an
-  edited line is a broken line; and ASK YOUR AI now puts the line on the
-  clipboard instead of being a button that did nothing.
+  reopens it); the line is selectable but not editable, in both the popup and
+  Settings, because an edited line is a broken line.
+- **No copy button, on purpose.** A Roblox plugin cannot write the clipboard:
+  the only clipboard member in the API dump is
+  `StudioService:CopyToClipboard`, and it is `RobloxScriptSecurity`. Forcing a
+  Ctrl+C through `UserInputService:CreateVirtualInput` was tried twice and did
+  not work. Rather than ship a button that may silently do nothing, the panel
+  says "Click the line to select it, then press Ctrl+C (Cmd+C on Mac)" and
+  clicking the line selects all of it — so copying is the one keystroke you
+  already know.
 
 ## What changed in 4.0.0 adds code execution inside the running test, honest input reporting,
 screenshots that fit the relay, and the first-run HTTP warning described below.)
