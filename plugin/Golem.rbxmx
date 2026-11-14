@@ -6571,6 +6571,13 @@ local function buildUi(widget, linkWidget)
  Visible = false,
  }, ui.root)
  addCorner(ui.setupPill, 16)
+ -- This pill is the only way back to the linking window once it is closed, and
+ -- it had no handler at all: pressing it did nothing. It reopens the popup.
+ ui.setupPill.Activated:Connect(function()
+ 	if ui.showSetupPopup ~= nil then
+ 		ui.showSetupPopup()
+ 	end
+ end)
 
  ui.jumpPill = button({
  AnchorPoint = Vector2.new(1, 1),

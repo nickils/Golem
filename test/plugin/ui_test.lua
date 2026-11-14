@@ -1,6 +1,6 @@
--- Drives the panel controls a user actually touched. Every assertion here maps to
--- a complaint: popup cannot close, a dead button, copy stealing focus, and an
--- editable line.
+-- Drives the panel controls a user actually touched. Every assertion here maps
+-- to a complaint: the popup cannot close, the SET UP AI pill does nothing, a
+-- button that only looked wired, copy stealing focus, and an editable line.
 local M = {}
 
 local function find(root, predicate, acc)
@@ -26,6 +26,19 @@ local function assertTrue(cond, msg)
   if not cond then error("UI TEST FAILED: " .. msg, 0) end
 end
 
+-- Every TextButton the user can see must be wired to something. A button with
+-- no handler is the bug this suite exists for, and it is invisible by reading.
+local function assertEveryButtonIsWired(root, where)
+  local dead = {}
+  for _, b in ipairs(find(root, function(n) return n.ClassName == "TextButton" end)) do
+    if #b.Activated.handlers == 0 then
+      dead[#dead + 1] = "'" .. tostring(b.Text) .. "'"
+    end
+  end
+  assertTrue(#dead == 0,
+    "these buttons are connected to nothing in " .. where .. ": " .. table.concat(dead, ", "))
+end
+
 function M.run()
   __chunk_shim()
   _G.__jsonEncode = __chunk_json().encode
@@ -38,20 +51,15 @@ function M.run()
   local panel = widgets[1]
   local settings = widgets[2]
 
-  -- the setup popup opens on a first run, which is the state the user was in
   -- The popup is the SMALLEST frame that DIRECTLY contains the copy button.
-  -- Taking "the first frame with it somewhere inside" matches the root window,
-  -- which is exactly how a test ends up asserting nothing about the popup.
+  -- "the first frame with it somewhere inside" matches the root window, which is
+  -- exactly how a test ends up asserting nothing about the popup.
   local popup
   for _, f in ipairs(find(panel, function(n) return n.ClassName == "Frame" end)) do
     for _, c in ipairs(f:GetChildren()) do
       if tostring(c.Text) == "COPY THE LINE" then popup = f break end
     end
     if popup ~= nil then break end
-  end
-  if popup == nil then
-
-
   end
   assertTrue(popup ~= nil, "the setup popup never opened")
   assertTrue(popup.Visible == true or popup.Visible == nil, "the popup did not open visibly")
@@ -62,20 +70,26 @@ function M.run()
     if b.ClassName == "TextButton" and tostring(b.Text) == "" then closeBtn = b end
   end
   assertTrue(closeBtn ~= nil, "the setup popup has no close control")
-  assertTrue(#closeBtn.Activated.handlers > 0, "the close button is connected to nothing - it cannot close the popup")
+  assertTrue(#closeBtn.Activated.handlers > 0,
+    "the close button is connected to nothing - it cannot close the popup")
   closeBtn.Activated:Fire()
   _G.__advance(1)
-  if popup.Visible ~= false then
-    print("DBG close children:", #closeBtn.Activated.handlers, "uiErrors:", table.concat(_G.__uiErrors, "|"))
-    local btns = {}
-    for _, b in ipairs(popup:GetChildren()) do
-      if b.ClassName == "TextButton" then btns[#btns+1] = "'" .. tostring(b.Text) .. "'" end
-    end
-    print("DBG popup buttons:", table.concat(btns, ","))
-  end
   assertTrue(popup.Visible == false, "pressing close did not hide the popup")
 
-  -- 2. the line is selectable but NOT editable
+  -- 2. the SET UP AI pill is the only way back - it must reopen the popup
+  local pill
+  for _, b in ipairs(find(panel, function(n) return n.ClassName == "TextButton" end)) do
+    if tostring(b.Text) == "SET UP AI" then pill = b end
+  end
+  assertTrue(pill ~= nil, "there is no SET UP AI pill")
+  assertTrue(#pill.Activated.handlers > 0,
+    "the SET UP AI pill is connected to nothing - pressing it does nothing")
+  assertTrue(pill.Visible == true, "the pill is hidden, so a closed popup has no way back")
+  pill.Activated:Fire()
+  _G.__advance(1)
+  assertTrue(popup.Visible == true, "pressing the SET UP AI pill did not reopen the popup")
+
+  -- 3. the line is selectable but NOT editable
   local lineBox
   for _, tb in ipairs(popup:GetChildren()) do
     if tb.ClassName == "TextBox" then
@@ -86,7 +100,7 @@ function M.run()
   assertTrue(lineBox.TextEditable == false, "the setup line is editable - it must be selectable only")
   assertTrue(lineBox.ClearTextOnFocus ~= true, "focusing the line would clear it")
 
-  -- 3. COPY copies, and does not steal focus
+  -- 4. COPY copies, and does not steal focus
   local copyBtn
   for _, b in ipairs(popup:GetChildren()) do
     if b.ClassName == "TextButton" and string.find(tostring(b.Text), "COPY") then copyBtn = b end
@@ -99,12 +113,11 @@ function M.run()
   assertTrue(_G.__clipboard ~= nil, "COPY did not put anything on the clipboard")
   assertTrue(string.find(_G.__clipboard, "golem%-bridge connect") ~= nil,
     "the clipboard does not hold the setup line: " .. tostring(_G.__clipboard))
-  assertTrue(lineBox:IsFocused() == focusedBefore,
-    "COPY stole focus - it must only copy")
+  assertTrue(lineBox:IsFocused() == focusedBefore, "COPY stole focus - it must only copy")
   assertTrue(string.find(feedback, "COPIED") ~= nil,
     "COPY gave no feedback, text is now '" .. feedback .. "'")
 
-  -- 4. ASK YOUR AI TO CONNECT must do something real, not return silently
+  -- 5. ASK YOUR AI TO CONNECT must do something real, not return silently
   local askBtn
   for _, b in ipairs(popup:GetChildren()) do
     if b.ClassName == "TextButton" and string.find(tostring(b.Text), "ASK YOUR AI") then askBtn = b end
@@ -118,7 +131,28 @@ function M.run()
     "ASK YOUR AI did not copy the line")
   assertTrue(tostring(askBtn.Text) ~= before, "ASK YOUR AI gave no feedback")
 
-  -- 5. the master switch exists, stops the relay, and persists
+  -- 6. a reopened popup must show a line that still works. The channel rotates
+  -- on END SESSION and on the switch, so a cached line would be dead on arrival.
+  local shownBefore = tostring(lineBox.Text)
+  local endBtn
+  -- END SESSION lives in the Settings widget
+  for _, b in ipairs(find(settings, function(n) return n.ClassName == "TextButton" end)) do
+    if string.find(tostring(b.Text), "END SESSION") then endBtn = b end
+  end
+  assertTrue(endBtn ~= nil, "there is no END SESSION button")
+  endBtn.Activated:Fire()   -- first click arms the confirm
+  endBtn.Activated:Fire()   -- second click rotates the channel
+  _G.__advance(3)
+  closeBtn.Activated:Fire()
+  _G.__advance(1)
+  pill.Activated:Fire()
+  _G.__advance(1)
+  assertTrue(tostring(lineBox.Text) ~= shownBefore,
+    "after END SESSION the reopened popup still shows the retired line: " .. tostring(lineBox.Text))
+  assertTrue(string.find(tostring(lineBox.Text), "golem%-bridge connect") ~= nil,
+    "the reopened popup does not show a setup line at all")
+
+  -- 7. the master switch exists, stops the relay, and persists
   local toggle
   for _, b in ipairs(find(settings, function(n) return n.ClassName == "TextButton" end)) do
     if tostring(b.Text) == "ON" or tostring(b.Text) == "OFF" then toggle = b end
@@ -132,14 +166,18 @@ function M.run()
     "the off state was not persisted, so it would come back on after a restart")
   local offText = textOf(settings)
   assertTrue(string.find(offText, "off") ~= nil, "the panel does not say Golem is off")
-  -- and back on
   toggle.Activated:Fire()
   _G.__advance(2)
   assertTrue(tostring(toggle.Text) == "ON", "the switch did not turn back on")
   assertTrue(_G.plugin._settings.Golem_Enabled == true, "turning back on was not persisted")
 
+  -- 8. nothing may be left dead by construction
+  assertEveryButtonIsWired(panel, "the panel")
+  assertEveryButtonIsWired(settings, "Settings")
+
   assertTrue(#_G.__uiErrors == 0, "UI errors: " .. table.concat(_G.__uiErrors, " | "))
-  print("UI OK - close works, copy only copies, the line is read-only, the switch persists")
+  print("UI OK - close works, the pill reopens, copy only copies, the line is read-only, "
+    .. "a reopened line is live, no dead buttons, the switch persists")
 end
 
 return M
