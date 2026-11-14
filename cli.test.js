@@ -537,6 +537,24 @@ test("the shipped plugin talks over the relay and keeps the session capability",
   assert.ok(!/guestExec\("editor"/.test(src), "screenshot must not ask for a nonexistent editor driver");
 });
 
+test("the play gate covers exactly the ops that work while a test runs", () => {
+  const src = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
+  const block = src.match(/local PLAY_SAFE = \{([^}]*)\}/);
+  assert.ok(block, "the plugin has no PLAY_SAFE table");
+  const safe = new Set(block[1].match(/[a-z_0-9]+\s*=/g).map((m) => m.replace(/\s*=$/, "")));
+  // These must never be refused mid-test, or playtesting is impossible:
+  for (const op of ["play", "stop", "playstate", "screenshot", "click", "input", "look_through", "logs"]) {
+    assert.ok(safe.has(op), `'${op}' is refused while the game runs, so it cannot be tested`);
+  }
+  // ...and nothing that edits the place may be waved through:
+  for (const op of ["create", "delete", "script", "lua", "insert_asset", "terrain", "undo"]) {
+    assert.ok(!safe.has(op), `'${op}' edits the place but is allowed during a play test`);
+  }
+  // every name in the gate must be a real op, or the gate has grown weeds
+  const ops = new Set([...src.matchAll(/^function OPS\.([a-z_0-9]+)/gm)].map((m) => m[1]));
+  for (const op of safe) assert.ok(ops.has(op), `PLAY_SAFE names '${op}', which is not an op`);
+});
+
 test("every op the CLI can send exists in the plugin", () => {
   const src = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
   const ops = new Set([...src.matchAll(/^function OPS\.([a-z_0-9]+)/gm)].map((m) => m[1]));

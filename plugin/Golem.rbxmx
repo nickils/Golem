@@ -3452,6 +3452,441 @@ function OPS.ui_list(args)
  return { layout = slashPath(listLayout), parent = slashPath(parent) }
 end
 
+local executeCommand
+-- ---------------------------------------------------------------- transport
+-- The relay. This plugin can only make outgoing calls, and the AI driving it
+-- may be a cloud sandbox that cannot reach this computer, so both sides meet at
+-- a Firebase Realtime Database:
+--
+--   channels/&lt;id&gt;/cmd       the AI's commands land here; we poll, run, delete
+--   channels/&lt;id&gt;/res       our results go here; the AI reads its own id
+--   channels/&lt;id&gt;/beacons   hello / revoked, so `golem-bridge status` can tell
+--                           "Studio is closed" from "that line is from an old
+--                           session"
+--   channels/&lt;id&gt;/guest/*   the play-test driver's private request/reply lane
+--
+-- The channel id is the whole capability. It is minted per Studio session, so a
+-- line pasted into a chat is worthless once that session ends.
+
+local generation = 0
+
+-- Ops that make sense while the game is running. Everything else edits the
+-- place, which must not happen against a live session.
+local PLAY_SAFE = {
+	ping = true, debug = true, stop = true, playstate = true, screenshot = true,
+	logs = true, click = true, input = true, look_through = true, play = true,
+}
+
+-- Firebase caps a write around 1 MB; stay well under it so a big reply becomes a
+-- clear error instead of an opaque HTTP 400.
+local RELAY_MAX_RESULT = 900000
+-- A single command may run for at most this long before the loop gives up on it.
+local COMMAND_TIMEOUT_SECONDS = 180
+
+-- Results that could not be published yet (relay throttling, network blip).
+-- They are retried in order; a command must never look like it did nothing.
+local pendingResults = {}
+
+local function relayPublish(env)
+	-- Roblox's JSONEncode is not always re-entrant on deep tables, and the AI
+	-- side expects a plain string for anything big, so pack the result once.
+	if type(env.result) == "table" and not env.resultEncoded then
+		local okPack, packed = pcall(function()
+			return HttpService:JSONEncode(sanitizeEnvelope(env.result, 0))
+		end)
+		if okPack and type(packed) == "string" then
+			env.resultEncoded = true
+			env.result = packed
+		end
+	end
+	local body = encodeBody(env)
+	if body == nil then
+		return nil, "could not encode the result"
+	end
+	if #body &gt; RELAY_MAX_RESULT then
+		env = {
+			id = env.id,
+			ok = false,
+			v = VERSION,
+			error = string.format(
+				"the result was %d KB - too large to send from Studio. Narrow the query (path, scope, max, depth) and retry.",
+				math.floor(#body / 1024)),
+		}
+		body = encodeBody(env) or "{}"
+	end
+	return request({
+		url = resUrl() .. ".json",
+		method = "POST",
+		body = body,
+		headers = { ["Content-Type"] = "application/json" },
+	})
+end
+
+-- Keep the result lane short: the AI polls it, so old replies only cost time.
+local function relayTrimRes()
+	task.spawn(function()
+		local resp = request({ url = resUrl() .. ".json?shallow=true" })
+		if resp == nil then
+			return
+		end
+		local keys = decodeBody(resp)
+		if type(keys) ~= "table" then
+			return
+		end
+		local sorted = {}
+		for key in pairs(keys) do
+			table.insert(sorted, key)
+		end
+		if #sorted &lt;= 15 then
+			return
+		end
+		table.sort(sorted)
+		for i = 1, #sorted - 15 do
+			pcall(function()
+				request({ url = resUrl() .. "/" .. sorted[i] .. ".json", method = "DELETE" })
+			end)
+		end
+	end)
+end
+
+local function relayDeliver(env)
+	local resp, err = relayPublish(env)
+	if resp == nil then
+		if #pendingResults &lt; 25 then
+			table.insert(pendingResults, { env = env, fails = 0 })
+		end
+		state.publishError = tostring(err)
+		log("relay: result publish failed: " .. tostring(err))
+	else
+		state.publishError = nil
+		relayTrimRes()
+	end
+	updateStatus()
+	return resp ~= nil
+end
+
+local function relayFlushPending()
+	while #pendingResults &gt; 0 do
+		local pending = pendingResults[1]
+		local resp, err = relayPublish(pending.env)
+		if resp ~= nil then
+			table.remove(pendingResults, 1)
+			state.publishError = nil
+		elseif string.find(tostring(err), "HTTP 429", 1, true) then
+			state.publishError = tostring(err) .. " (relay is throttling; results are queued)"
+			updateStatus()
+			return
+		else
+			pending.fails = (pending.fails or 0) + 1
+			if pending.fails &gt;= 2 then
+				if pending.env.id ~= nil and not pending.swapped then
+					-- The command ran; only the reply could not travel. Say so, or
+					-- the AI will retry an edit that already happened.
+					pending.swapped = true
+					pending.fails = 0
+					pending.env = {
+						id = pending.env.id,
+						ok = false,
+						v = VERSION,
+						error = string.format(
+							"the command ran, but its result could not reach the relay (%s). Confirm the change with `list`/`read` before repeating it.",
+							tostring(err)),
+					}
+				else
+					table.remove(pendingResults, 1)
+					log("relay: dropped an undeliverable result: " .. tostring(err))
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+	updateStatus()
+end
+
+local function relayBeaconPost(channelId, env)
+	if type(channelId) ~= "string" or #channelId &lt; 8 then
+		return
+	end
+	pcall(function()
+		local body = encodeBody(env)
+		if body ~= nil then
+			request({
+				url = beaconUrl(channelId) .. ".json",
+				method = "POST",
+				body = body,
+				headers = { ["Content-Type"] = "application/json" },
+			})
+		end
+	end)
+	-- keep the last few beacons only
+	task.spawn(function()
+		local resp = request({ url = beaconUrl(channelId) .. ".json?shallow=true" })
+		if resp == nil then
+			return
+		end
+		local keys = decodeBody(resp)
+		if type(keys) ~= "table" then
+			return
+		end
+		local sorted = {}
+		for key in pairs(keys) do
+			table.insert(sorted, key)
+		end
+		if #sorted &lt;= 5 then
+			return
+		end
+		table.sort(sorted)
+		for i = 1, #sorted - 5 do
+			pcall(function()
+				request({ url = beaconUrl(channelId) .. "/" .. sorted[i] .. ".json", method = "DELETE" })
+			end)
+		end
+	end)
+end
+
+local function relayBeacon(op, extra)
+	local env = { op = op, v = VERSION, ts = os.time() }
+	if type(extra) == "table" then
+		for key, value in pairs(extra) do
+			env[key] = value
+		end
+	end
+	relayBeaconPost(bridge.channel, env)
+	bridge.beaconSentAt = os.clock()
+end
+
+-- Wipe a channel and tell anyone listening on it that it is gone, so a stale
+-- setup line in a chat produces "ask for a fresh line" instead of silence.
+local function relayRetireChannel(channelId)
+	if type(channelId) ~= "string" or #channelId &lt; 8 then
+		return
+	end
+	relayBeaconPost(channelId, { op = "revoked", v = VERSION, ts = os.time() })
+	task.spawn(function()
+		pcall(function()
+			request({ url = FIREBASE_DB .. "/channels/" .. channelId .. ".json", method = "DELETE" })
+		end)
+	end)
+end
+
+local function relayHandleMessage(cmd)
+	if type(cmd) ~= "table" then
+		log("relay: ignored a non-object on the command channel")
+		return
+	end
+	if cmd.id == nil or type(cmd.op) ~= "string" then
+		if cmd.id ~= nil then
+			relayDeliver({ id = cmd.id, ok = false, error = "a command needs a string 'op' and an 'id'" })
+		else
+			log("relay: ignored a command without an id")
+		end
+		return
+	end
+	state.commandsServed = state.commandsServed + 1
+	if not RunService:IsEdit() and not PLAY_SAFE[cmd.op] then
+		relayDeliver({
+			id = cmd.id,
+			op = cmd.op,
+			ok = false,
+			v = VERSION,
+			error = "the game is running - `stop` the play test before editing the place (screenshot, click, input, logs, and playstate work while it runs)",
+		})
+		return
+	end
+	-- Every command of one AI request carries the same token, so a new token
+	-- means a new request: the turn opens right now and the first tool of that
+	-- request already lands in its own turn.
+	local turnToken = nil
+	if type(cmd.args) == "table" and type(cmd.args.__turn) == "string" and #cmd.args.__turn &gt; 0 then
+		turnToken = cmd.args.__turn
+		cmd.args.__turn = nil
+	end
+	if turnToken ~= nil then
+		beginTurnFor(turnToken)
+	end
+	local envelopeTurn = turnNumber
+	local chatRow = nil
+	if cmd.op ~= "ping" and cmd.op ~= "screenshot" and cmd.op ~= "play" and cmd.op ~= "stop" then
+		chatRow = addChatCommand(cmd.op, cmd.args)
+		envelopeTurn = turnNumber
+	end
+
+	local envelope = nil
+	local finished = false
+	task.spawn(function()
+		if chatRow ~= nil then
+			task.wait()
+		end
+		envelope = executeCommand(cmd)
+		finished = true
+	end)
+	local startedAt = os.time()
+	while not finished and os.time() - startedAt &lt; COMMAND_TIMEOUT_SECONDS do
+		task.wait(0.1)
+	end
+	if not finished then
+		envelope = {
+			id = cmd.id,
+			op = cmd.op,
+			ok = false,
+			v = VERSION,
+			error = string.format(
+				"'%s' did not finish within %d s - it may be stuck. Restarting Studio clears stuck ops.",
+				tostring(cmd.op), COMMAND_TIMEOUT_SECONDS),
+		}
+	end
+	envelope = envelope or { id = cmd.id, ok = false, op = cmd.op, error = "the command returned no result" }
+	envelope.v = VERSION
+	envelope.turn = envelopeTurn
+	envelope.turnTools = currentTurn ~= nil and currentTurn.count or 0
+	if chatRow ~= nil then
+		finishRow(chatRow, envelope)
+		recordRow(chatRow, envelope)
+	end
+	if envelope.ok then
+		log(string.format("OK %s (%s ms)", tostring(cmd.op),
+			tostring(envelope.meta and envelope.meta.durationMs or "?")))
+	else
+		state.errors = state.errors + 1
+		log(string.format("ERR %s: %s", tostring(cmd.op), tostring(envelope.error)))
+	end
+	relayDeliver(envelope)
+end
+
+-- One poll: ask only for keys newer than the last one we handled, so a chatty
+-- channel never costs a growing download.
+local function pollOnce()
+	local query = ".json?orderBy=" .. HttpService:UrlEncode('"$key"') .. "&amp;limitToLast=25"
+	if bridge.lastMessageKey ~= nil then
+		query = query .. "&amp;startAt=" .. HttpService:UrlEncode('"' .. bridge.lastMessageKey .. '"')
+	end
+	local resp, err = request({ url = cmdUrl() .. query })
+	if resp == nil then
+		return nil, tostring(err)
+	end
+	bridge.okStreak = bridge.okStreak + 1
+	if bridge.okStreak &gt;= 12 then
+		-- quiet and healthy: back the cadence off to the floor
+		bridge.interval = math.max(2, bridge.interval - 1)
+		bridge.okStreak = 0
+	end
+	setConnected(true, nil)
+	local body = resp.Body
+	if type(body) ~= "string" or #body == 0 or body == "null" then
+		return true, nil
+	end
+	local data = decodeBody(resp)
+	if type(data) ~= "table" then
+		return true, nil
+	end
+	local keys = {}
+	for key in pairs(data) do
+		table.insert(keys, key)
+	end
+	table.sort(keys)
+	local skipped = 0
+	for _, key in ipairs(keys) do
+		local cmd = data[key]
+		if key ~= bridge.lastMessageKey then
+			local isOld = type(cmd) == "table" and type(cmd.ts) == "number" and cmd.ts &lt; bridge.skipBefore
+			if type(cmd) == "table" and not isOld then
+				local okHandle, errHandle = pcall(relayHandleMessage, cmd)
+				if not okHandle then
+					state.errors = state.errors + 1
+					log("relay: command '" .. tostring(cmd.op) .. "' crashed: " .. tostring(errHandle))
+					if cmd.id ~= nil then
+						pcall(function()
+							relayDeliver({
+								id = cmd.id,
+								ok = false,
+								op = tostring(cmd.op),
+								error = "plugin internal error, command dropped: " .. tostring(errHandle),
+							})
+						end)
+					end
+				end
+			else
+				skipped = skipped + 1
+			end
+			-- Always consume the key, even a skipped one, so the loop moves on.
+			pcall(function()
+				request({ url = cmdUrl() .. "/" .. key .. ".json", method = "DELETE" })
+			end)
+		end
+		bridge.lastMessageKey = key
+	end
+	if skipped &gt; 0 then
+		log("relay: ignored " .. skipped .. " command(s) left over from before this session started")
+	end
+	return true, nil
+end
+
+-- The polling loop. Runs for the life of the plugin. During a play test it keeps
+-- polling: the screen, input, and log tools still have to reach us, and the
+-- in-game driver needs its lane served.
+local function relayLoop(myGeneration)
+	log(string.format("relay: live on channel %s (every ~%ds)", tostring(bridge.channel), bridge.interval))
+	while myGeneration == generation do
+		relayFlushPending()
+		local ok, err = pollOnce()
+		if ok then
+			bridge.lastError = nil
+			bridge.lastPollAt = os.clock()
+			task.wait(bridge.interval)
+		else
+			local e = tostring(err)
+			bridge.lastError = e
+			bridge.okStreak = 0
+			ensureHttpEnabled()
+			setConnected(false, e)
+			if string.find(e, "HTTP 429", 1, true) then
+				bridge.interval = math.min(bridge.interval * 2 + 1, 25)
+				log(string.format("relay: rate limited - polling every %ds now", bridge.interval))
+			elseif string.find(e, "Http requests are not enabled", 1, true) then
+				bridge.interval = 10
+			else
+				bridge.interval = 2
+			end
+			task.wait(math.max(1, bridge.interval / 2))
+		end
+	end
+end
+
+local function startBridge()
+	ensureHttpEnabled()
+	ensureIdentity()
+	if bridge.previousChannel ~= nil then
+		local old = bridge.previousChannel
+		bridge.previousChannel = nil
+		relayRetireChannel(old)
+	end
+	generation = generation + 1
+	state.running = true
+	bridge.mode = "relay"
+	-- Ignore anything that was already sitting in the channel before this
+	-- session began: a queued command from a dead Studio must never run here.
+	bridge.skipBefore = os.time() - 45
+	bridge.lastMessageKey = nil
+	task.spawn(relayLoop, generation)
+	if RunService:IsEdit() then
+		relayBeacon("hello", { place = game.PlaceId })
+	end
+	updateStatus()
+end
+
+local function promptRefresh()
+	if ui.setupBox ~= nil then
+		ui.setupBox.Text = setupCommandText()
+	end
+	if ui.settingsSetupBox ~= nil then
+		ui.settingsSetupBox.Text = setupCommandText()
+	end
+end
+
+local function applyModeToUi()
+	promptRefresh()
+	updateStatus()
+end
 -- ------------------------------------------------------- in-session driver
 -- Source for the two scripts injected for the duration of a play test. They are
 -- plain Roblox scripts (they run inside the game, not as plugins), so they can
@@ -5196,7 +5631,7 @@ for name in pairs(OPS) do
 end
 table.sort(OP_NAMES)
 
-local function executeCommand(cmd)
+executeCommand = function(cmd)
  local startedAt = os.clock()
  local opName = tostring(cmd.op)
  local handler = OPS[opName]
@@ -5261,440 +5696,6 @@ function http(request)
  return response
 end
 
--- ---------------------------------------------------------------- transport
--- The relay. This plugin can only make outgoing calls, and the AI driving it
--- may be a cloud sandbox that cannot reach this computer, so both sides meet at
--- a Firebase Realtime Database:
---
---   channels/&lt;id&gt;/cmd       the AI's commands land here; we poll, run, delete
---   channels/&lt;id&gt;/res       our results go here; the AI reads its own id
---   channels/&lt;id&gt;/beacons   hello / revoked, so `golem-bridge status` can tell
---                           "Studio is closed" from "that line is from an old
---                           session"
---   channels/&lt;id&gt;/guest/*   the play-test driver's private request/reply lane
---
--- The channel id is the whole capability. It is minted per Studio session, so a
--- line pasted into a chat is worthless once that session ends.
-
-local generation = 0
-
--- Ops that make sense while the game is running. Everything else edits the
--- place, which must not happen against a live session.
-local PLAY_SAFE = {
-	ping = true, debug = true, stop = true, playstate = true, screenshot = true,
-	logs = true, click = true, input = true, look_through = true, play = true,
-}
-
--- Firebase caps a write around 1 MB; stay well under it so a big reply becomes a
--- clear error instead of an opaque HTTP 400.
-local RELAY_MAX_RESULT = 900000
--- A single command may run for at most this long before the loop gives up on it.
-local COMMAND_TIMEOUT_SECONDS = 180
-
--- Results that could not be published yet (relay throttling, network blip).
--- They are retried in order; a command must never look like it did nothing.
-local pendingResults = {}
-
-local function relayPublish(env)
-	-- Roblox's JSONEncode is not always re-entrant on deep tables, and the AI
-	-- side expects a plain string for anything big, so pack the result once.
-	if type(env.result) == "table" and not env.resultEncoded then
-		local okPack, packed = pcall(function()
-			return HttpService:JSONEncode(sanitizeEnvelope(env.result, 0))
-		end)
-		if okPack and type(packed) == "string" then
-			env.resultEncoded = true
-			env.result = packed
-		end
-	end
-	local body = encodeBody(env)
-	if body == nil then
-		return nil, "could not encode the result"
-	end
-	if #body &gt; RELAY_MAX_RESULT then
-		env = {
-			id = env.id,
-			ok = false,
-			v = VERSION,
-			error = string.format(
-				"the result was %d KB - too large to send from Studio. Narrow the query (path, scope, max, depth) and retry.",
-				math.floor(#body / 1024)),
-		}
-		body = encodeBody(env) or "{}"
-	end
-	return request({
-		url = resUrl() .. ".json",
-		method = "POST",
-		body = body,
-		headers = { ["Content-Type"] = "application/json" },
-	})
-end
-
--- Keep the result lane short: the AI polls it, so old replies only cost time.
-local function relayTrimRes()
-	task.spawn(function()
-		local resp = request({ url = resUrl() .. ".json?shallow=true" })
-		if resp == nil then
-			return
-		end
-		local keys = decodeBody(resp)
-		if type(keys) ~= "table" then
-			return
-		end
-		local sorted = {}
-		for key in pairs(keys) do
-			table.insert(sorted, key)
-		end
-		if #sorted &lt;= 15 then
-			return
-		end
-		table.sort(sorted)
-		for i = 1, #sorted - 15 do
-			pcall(function()
-				request({ url = resUrl() .. "/" .. sorted[i] .. ".json", method = "DELETE" })
-			end)
-		end
-	end)
-end
-
-local function relayDeliver(env)
-	local resp, err = relayPublish(env)
-	if resp == nil then
-		if #pendingResults &lt; 25 then
-			table.insert(pendingResults, { env = env, fails = 0 })
-		end
-		state.publishError = tostring(err)
-		log("relay: result publish failed: " .. tostring(err))
-	else
-		state.publishError = nil
-		relayTrimRes()
-	end
-	updateStatus()
-	return resp ~= nil
-end
-
-local function relayFlushPending()
-	while #pendingResults &gt; 0 do
-		local pending = pendingResults[1]
-		local resp, err = relayPublish(pending.env)
-		if resp ~= nil then
-			table.remove(pendingResults, 1)
-			state.publishError = nil
-		elseif string.find(tostring(err), "HTTP 429", 1, true) then
-			state.publishError = tostring(err) .. " (relay is throttling; results are queued)"
-			updateStatus()
-			return
-		else
-			pending.fails = (pending.fails or 0) + 1
-			if pending.fails &gt;= 2 then
-				if pending.env.id ~= nil and not pending.swapped then
-					-- The command ran; only the reply could not travel. Say so, or
-					-- the AI will retry an edit that already happened.
-					pending.swapped = true
-					pending.fails = 0
-					pending.env = {
-						id = pending.env.id,
-						ok = false,
-						v = VERSION,
-						error = string.format(
-							"the command ran, but its result could not reach the relay (%s). Confirm the change with `list`/`read` before repeating it.",
-							tostring(err)),
-					}
-				else
-					table.remove(pendingResults, 1)
-					log("relay: dropped an undeliverable result: " .. tostring(err))
-				end
-			end
-		end
-		task.wait(0.5)
-	end
-	updateStatus()
-end
-
-local function relayBeaconPost(channelId, env)
-	if type(channelId) ~= "string" or #channelId &lt; 8 then
-		return
-	end
-	pcall(function()
-		local body = encodeBody(env)
-		if body ~= nil then
-			request({
-				url = beaconUrl(channelId) .. ".json",
-				method = "POST",
-				body = body,
-				headers = { ["Content-Type"] = "application/json" },
-			})
-		end
-	end)
-	-- keep the last few beacons only
-	task.spawn(function()
-		local resp = request({ url = beaconUrl(channelId) .. ".json?shallow=true" })
-		if resp == nil then
-			return
-		end
-		local keys = decodeBody(resp)
-		if type(keys) ~= "table" then
-			return
-		end
-		local sorted = {}
-		for key in pairs(keys) do
-			table.insert(sorted, key)
-		end
-		if #sorted &lt;= 5 then
-			return
-		end
-		table.sort(sorted)
-		for i = 1, #sorted - 5 do
-			pcall(function()
-				request({ url = beaconUrl(channelId) .. "/" .. sorted[i] .. ".json", method = "DELETE" })
-			end)
-		end
-	end)
-end
-
-local function relayBeacon(op, extra)
-	local env = { op = op, v = VERSION, ts = os.time() }
-	if type(extra) == "table" then
-		for key, value in pairs(extra) do
-			env[key] = value
-		end
-	end
-	relayBeaconPost(bridge.channel, env)
-	bridge.beaconSentAt = os.clock()
-end
-
--- Wipe a channel and tell anyone listening on it that it is gone, so a stale
--- setup line in a chat produces "ask for a fresh line" instead of silence.
-local function relayRetireChannel(channelId)
-	if type(channelId) ~= "string" or #channelId &lt; 8 then
-		return
-	end
-	relayBeaconPost(channelId, { op = "revoked", v = VERSION, ts = os.time() })
-	task.spawn(function()
-		pcall(function()
-			request({ url = FIREBASE_DB .. "/channels/" .. channelId .. ".json", method = "DELETE" })
-		end)
-	end)
-end
-
-local function relayHandleMessage(cmd)
-	if type(cmd) ~= "table" then
-		log("relay: ignored a non-object on the command channel")
-		return
-	end
-	if cmd.id == nil or type(cmd.op) ~= "string" then
-		if cmd.id ~= nil then
-			relayDeliver({ id = cmd.id, ok = false, error = "a command needs a string 'op' and an 'id'" })
-		else
-			log("relay: ignored a command without an id")
-		end
-		return
-	end
-	state.commandsServed = state.commandsServed + 1
-	if not RunService:IsEdit() and not PLAY_SAFE[cmd.op] then
-		relayDeliver({
-			id = cmd.id,
-			op = cmd.op,
-			ok = false,
-			v = VERSION,
-			error = "the game is running - `stop` the play test before editing the place (screenshot, click, input, logs, and playstate work while it runs)",
-		})
-		return
-	end
-	-- Every command of one AI request carries the same token, so a new token
-	-- means a new request: the turn opens right now and the first tool of that
-	-- request already lands in its own turn.
-	local turnToken = nil
-	if type(cmd.args) == "table" and type(cmd.args.__turn) == "string" and #cmd.args.__turn &gt; 0 then
-		turnToken = cmd.args.__turn
-		cmd.args.__turn = nil
-	end
-	if turnToken ~= nil then
-		beginTurnFor(turnToken)
-	end
-	local envelopeTurn = turnNumber
-	local chatRow = nil
-	if cmd.op ~= "ping" and cmd.op ~= "screenshot" and cmd.op ~= "play" and cmd.op ~= "stop" then
-		chatRow = addChatCommand(cmd.op, cmd.args)
-		envelopeTurn = turnNumber
-	end
-
-	local envelope = nil
-	local finished = false
-	task.spawn(function()
-		if chatRow ~= nil then
-			task.wait()
-		end
-		envelope = executeCommand(cmd)
-		finished = true
-	end)
-	local startedAt = os.time()
-	while not finished and os.time() - startedAt &lt; COMMAND_TIMEOUT_SECONDS do
-		task.wait(0.1)
-	end
-	if not finished then
-		envelope = {
-			id = cmd.id,
-			op = cmd.op,
-			ok = false,
-			v = VERSION,
-			error = string.format(
-				"'%s' did not finish within %d s - it may be stuck. Restarting Studio clears stuck ops.",
-				tostring(cmd.op), COMMAND_TIMEOUT_SECONDS),
-		}
-	end
-	envelope = envelope or { id = cmd.id, ok = false, op = cmd.op, error = "the command returned no result" }
-	envelope.v = VERSION
-	envelope.turn = envelopeTurn
-	envelope.turnTools = currentTurn ~= nil and currentTurn.count or 0
-	if chatRow ~= nil then
-		finishRow(chatRow, envelope)
-		recordRow(chatRow, envelope)
-	end
-	if envelope.ok then
-		log(string.format("OK %s (%s ms)", tostring(cmd.op),
-			tostring(envelope.meta and envelope.meta.durationMs or "?")))
-	else
-		state.errors = state.errors + 1
-		log(string.format("ERR %s: %s", tostring(cmd.op), tostring(envelope.error)))
-	end
-	relayDeliver(envelope)
-end
-
--- One poll: ask only for keys newer than the last one we handled, so a chatty
--- channel never costs a growing download.
-local function pollOnce()
-	local query = ".json?orderBy=" .. HttpService:UrlEncode('"$key"') .. "&amp;limitToLast=25"
-	if bridge.lastMessageKey ~= nil then
-		query = query .. "&amp;startAt=" .. HttpService:UrlEncode('"' .. bridge.lastMessageKey .. '"')
-	end
-	local resp, err = request({ url = cmdUrl() .. query })
-	if resp == nil then
-		return nil, tostring(err)
-	end
-	bridge.okStreak = bridge.okStreak + 1
-	if bridge.okStreak &gt;= 12 then
-		-- quiet and healthy: back the cadence off to the floor
-		bridge.interval = math.max(2, bridge.interval - 1)
-		bridge.okStreak = 0
-	end
-	setConnected(true, nil)
-	local body = resp.Body
-	if type(body) ~= "string" or #body == 0 or body == "null" then
-		return true, nil
-	end
-	local data = decodeBody(resp)
-	if type(data) ~= "table" then
-		return true, nil
-	end
-	local keys = {}
-	for key in pairs(data) do
-		table.insert(keys, key)
-	end
-	table.sort(keys)
-	local skipped = 0
-	for _, key in ipairs(keys) do
-		local cmd = data[key]
-		if key ~= bridge.lastMessageKey then
-			local isOld = type(cmd) == "table" and type(cmd.ts) == "number" and cmd.ts &lt; bridge.skipBefore
-			if type(cmd) == "table" and not isOld then
-				local okHandle, errHandle = pcall(relayHandleMessage, cmd)
-				if not okHandle then
-					state.errors = state.errors + 1
-					log("relay: command '" .. tostring(cmd.op) .. "' crashed: " .. tostring(errHandle))
-					if cmd.id ~= nil then
-						pcall(function()
-							relayDeliver({
-								id = cmd.id,
-								ok = false,
-								op = tostring(cmd.op),
-								error = "plugin internal error, command dropped: " .. tostring(errHandle),
-							})
-						end)
-					end
-				end
-			else
-				skipped = skipped + 1
-			end
-			-- Always consume the key, even a skipped one, so the loop moves on.
-			pcall(function()
-				request({ url = cmdUrl() .. "/" .. key .. ".json", method = "DELETE" })
-			end)
-		end
-		bridge.lastMessageKey = key
-	end
-	if skipped &gt; 0 then
-		log("relay: ignored " .. skipped .. " command(s) left over from before this session started")
-	end
-	return true, nil
-end
-
--- The polling loop. Runs for the life of the plugin. During a play test it keeps
--- polling: the screen, input, and log tools still have to reach us, and the
--- in-game driver needs its lane served.
-local function relayLoop(myGeneration)
-	log(string.format("relay: live on channel %s (every ~%ds)", tostring(bridge.channel), bridge.interval))
-	while myGeneration == generation do
-		relayFlushPending()
-		local ok, err = pollOnce()
-		if ok then
-			bridge.lastError = nil
-			bridge.lastPollAt = os.clock()
-			task.wait(bridge.interval)
-		else
-			local e = tostring(err)
-			bridge.lastError = e
-			bridge.okStreak = 0
-			ensureHttpEnabled()
-			setConnected(false, e)
-			if string.find(e, "HTTP 429", 1, true) then
-				bridge.interval = math.min(bridge.interval * 2 + 1, 25)
-				log(string.format("relay: rate limited - polling every %ds now", bridge.interval))
-			elseif string.find(e, "Http requests are not enabled", 1, true) then
-				bridge.interval = 10
-			else
-				bridge.interval = 2
-			end
-			task.wait(math.max(1, bridge.interval / 2))
-		end
-	end
-end
-
-local function startBridge()
-	ensureHttpEnabled()
-	ensureIdentity()
-	if bridge.previousChannel ~= nil then
-		local old = bridge.previousChannel
-		bridge.previousChannel = nil
-		relayRetireChannel(old)
-	end
-	generation = generation + 1
-	state.running = true
-	bridge.mode = "relay"
-	-- Ignore anything that was already sitting in the channel before this
-	-- session began: a queued command from a dead Studio must never run here.
-	bridge.skipBefore = os.time() - 45
-	bridge.lastMessageKey = nil
-	task.spawn(relayLoop, generation)
-	if RunService:IsEdit() then
-		relayBeacon("hello", { place = game.PlaceId })
-	end
-	updateStatus()
-end
-
-local function promptRefresh()
-	if ui.setupBox ~= nil then
-		ui.setupBox.Text = setupCommandText()
-	end
-	if ui.settingsSetupBox ~= nil then
-		ui.settingsSetupBox.Text = setupCommandText()
-	end
-end
-
-local function applyModeToUi()
-	promptRefresh()
-	updateStatus()
-end
 local function makeIcon(kind, size, color)
 
  local holder = createElement("Frame", {
