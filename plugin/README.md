@@ -10,6 +10,32 @@ The plugin is a single `Script` (`VERSION = "4.1.0"` inside `Golem.lua`).
 - `build.py` — wraps `Golem.lua` in the `.rbxmx` XML envelope and
   round-trip-verifies it (`python3 build.py`, needs only the standard library).
 
+## Testing the plugin without Studio
+
+`test/plugin/` boots the real `Golem.lua` inside
+[fengari](https://github.com/fengari-lua/fengari) (Lua 5.3 in JS) against a
+Roblox shim, pushes commands through a fake Firebase relay, and drives the
+panel's buttons. It is what catches UI and relay bugs that reading cannot.
+
+```sh
+npm install --no-save fengari
+node test/plugin/run.js          # all four suites
+node test/plugin/run.js sweep    # one suite: ui | switch | restart | sweep
+node test/plugin/lint.js plugin/Golem.lua
+```
+
+- `ui` — the setup window: close hides it, COPY copies without stealing focus,
+  the line is not editable, ASK YOUR AI acts, the switch persists.
+- `switch` — off really stops commands, rotates the channel, and on resumes.
+- `restart` — a saved OFF survives a reload with zero polls.
+- `sweep` — every op is driven in the correct phase and must return a result.
+
+`fengari` is installed on demand rather than listed as a dependency, so plain
+`npm test` (the CLI suite) stays dependency-free. The shim is deliberately
+strict: it raises on unknown UI properties and on writing to
+`HttpService.HttpEnabled`, because a permissive shim hides exactly the bugs
+this is meant to find.
+
 Install: drop `Golem.rbxmx` into Studio's `Plugins` folder and restart Studio.
 
 **One setting must be on first:** `Game Settings > Security > Allow HTTP

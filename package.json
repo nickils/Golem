@@ -3,7 +3,9 @@
   "version": "4.1.0",
   "description": "Drive a running Roblox Studio session from an AI agent over a direct localhost link (no relay).",
   "scripts": {
-    "test": "node --test cli.test.js"
+    "test": "node --test cli.test.js",
+    "test:plugin": "node test/plugin/run.js",
+    "lint:plugin": "node test/plugin/lint.js plugin/Golem.lua"
   },
   "bin": {
     "golem-bridge": "./cli.js"
