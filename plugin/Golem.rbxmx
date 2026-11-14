@@ -372,6 +372,8 @@ local function updateStatus()
  text = nil
  elseif live then
  dotColor, text = COLORS.live, "LIVE"
+ elseif state.running and state.blockedReason == "HTTP_BLOCKED" then
+ dotColor, text = COLORS.warn, "BLOCKED · turn on Allow HTTP Requests (Game Settings &gt; Security)"
  elseif state.running then
  dotColor, text = COLORS.warn, "CONNECTING…"
  else
@@ -512,6 +514,7 @@ local function ensureHttpEnabled()
 		enabled = HttpService.HttpEnabled
 	end)
 	if okRead and enabled then
+		state.blockedReason = nil
 		return true
 	end
 	-- A plugin can run without the place's "Allow HTTP Requests" setting, but on
@@ -519,6 +522,9 @@ local function ensureHttpEnabled()
 	local okSet = pcall(function()
 		HttpService.HttpEnabled = true
 	end)
+	state.blockedReason = "HTTP_BLOCKED"
+	-- the status line is the only thing the user sees on a first run
+	if updateStatus ~= nil then updateStatus() end
 	if not okSet and not httpWarningShown then
 		httpWarningShown = true
 		log("HttpService is blocked. Turn on Game Settings &gt; Security &gt; Allow HTTP Requests and reopen the Golem window.")

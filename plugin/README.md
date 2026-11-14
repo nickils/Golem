@@ -12,6 +12,11 @@ The plugin is a single `Script` (`VERSION = "4.0.0"` inside `Golem.lua`).
 
 Install: drop `Golem.rbxmx` into Studio's `Plugins` folder and restart Studio.
 
+**One setting must be on first:** `Game Settings > Security > Allow HTTP
+Requests`. A fresh place has it off, and without it the plugin cannot reach the
+relay at all. If it is off the panel says so in its status line rather than
+sitting on "connecting" forever.
+
 ## What changed in 4.0.0
 
 - **Relay transport.** Studio can only make outgoing calls and the AI is often a
