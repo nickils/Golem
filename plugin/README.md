@@ -1,6 +1,6 @@
 # Golem Studio plugin source
 
-The plugin is a single `Script` (`VERSION = "4.0.0"` inside `Golem.lua`).
+The plugin is a single `Script` (`VERSION = "4.1.0"` inside `Golem.lua`).
 
 - `Golem.lua` — the canonical source. Edit this, then rebuild the model file.
 - `Golem.rbxmx` — the installable build: one top-level `Script` named
@@ -17,7 +17,23 @@ Requests`. A fresh place has it off, and without it the plugin cannot reach the
 relay at all. If it is off the panel says so in its status line rather than
 sitting on "connecting" forever.
 
-## What changed in 4.0.0
+## What changed in 4.1.0
+- **Code execution in the test.** `lua --target server|client`, plus
+  `run_script` / `run_list` / `run_remove`. The server runs inline; the client
+  has no `loadstring` in Roblox at all, so a client snippet is installed as a
+  `RunContext = Client` Script and its output arrives through `logs`.
+- **Honest input.** A rejected click or key press now fails with the reason; a
+  hold whose release fails says the key is still held. Holding works at all:
+  `input --hold w --hold-seconds 2`.
+- **Screenshots that fit.** The capture width is derived from the worst case
+  (17 B/px) and is both the default and the ceiling, so a capture cannot be
+  rejected in transit. 522px.
+- **First run names its blocker.** With Allow HTTP Requests off the panel shows
+  `BLOCKED · turn on Allow HTTP Requests (Game Settings > Security)` instead of
+  an unexplained CONNECTING.
+
+## What changed in 4.0.0 adds code execution inside the running test, honest input reporting,
+screenshots that fit the relay, and the first-run HTTP warning described below.)
 
 - **Relay transport.** Studio can only make outgoing calls and the AI is often a
   cloud sandbox, so both meet at a Firebase Realtime Database:

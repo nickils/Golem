@@ -599,7 +599,12 @@ test("the saved link is only a channel - the id is the whole capability", inTemp
 test("the shipped plugin talks over the relay and keeps the session capability", () => {
   const file = path.join(__dirname, "plugin", "Golem.lua");
   const src = fs.readFileSync(file, "utf8");
-  assert.match(src, /local VERSION = "4\.0\.0"/);
+  // Must be a 4.x release, and must match package.json: a plugin that reports a
+  // different version than the CLI is a bug report waiting to happen.
+  const pluginVersion = /local VERSION = "([\d.]+)"/.exec(src)?.[1];
+  assert.ok(pluginVersion, "the plugin declares no version");
+  assert.match(pluginVersion, /^4\.\d+\.\d+$/);
+  assert.equal(pluginVersion, require("./package.json").version, "plugin and package.json disagree");
   // the transport a cloud agent can actually use
   assert.match(src, /roblox-golem-default-rtdb\.firebaseio\.com/, "the relay URL is missing");
   assert.match(src, /\/channels\//, "no channel path");

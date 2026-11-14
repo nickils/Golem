@@ -1,6 +1,6 @@
 {
   "name": "golem-bridge",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "Drive a running Roblox Studio session from an AI agent over a direct localhost link (no relay).",
   "scripts": {
     "test": "node --test cli.test.js"
