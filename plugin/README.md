@@ -31,6 +31,15 @@ sitting on "connecting" forever.
 - **First run names its blocker.** With Allow HTTP Requests off the panel shows
   `BLOCKED · turn on Allow HTTP Requests (Game Settings > Security)` instead of
   an unexplained CONNECTING.
+- **A switch that actually switches.** Settings now starts with a master
+  switch. Off stops the relay loop, rotates the channel, and retires the old
+  one, so a line you already pasted into a chat stops working; a saved OFF
+  survives a Studio restart. On mints a fresh channel and resumes.
+- **The setup window behaves.** Close dismisses the popup (the SET UP AI pill
+  reopens it); COPY copies and nothing else — it no longer steals focus or
+  moves the cursor; the line itself is selectable but not editable, because an
+  edited line is a broken line; and ASK YOUR AI now puts the line on the
+  clipboard instead of being a button that did nothing.
 
 ## What changed in 4.0.0 adds code execution inside the running test, honest input reporting,
 screenshots that fit the relay, and the first-run HTTP warning described below.)
