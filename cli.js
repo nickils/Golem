@@ -29,9 +29,33 @@ function envOf(...names) {
   return undefined;
 }
 
-// Loopback only. The plugin is documented to talk to 127.0.0.1:PORT.
+// The bridge lives on loopback by default: a plugin in Studio, and the AI's
+// terminal, are both on this machine, so nothing has to cross a network.
+// GOLEM_BIND exists only for the cases where the agent is NOT on this machine
+// (WSL2/Docker, or an AI harness on another box) - it moves the listener off
+// loopback, which is a real security decision, not a convenience toggle.
 const DEFAULT_PORT = 41717;
 const LOOPBACK = "127.0.0.1";
+
+function bindAddress() {
+  const raw = (envOf("GOLEM_BIND") || "").trim();
+  if (!raw || raw === LOOPBACK || raw === "localhost") return LOOPBACK;
+  if (raw === "0.0.0.0" || raw === "::") return raw;
+  // any concrete interface address is allowed; resolve nothing (keep it literal)
+  if (/^[0-9a-fA-F:.]+$/.test(raw)) return raw;
+  return LOOPBACK;
+}
+
+// Advertised base URL. When bound to a wildcard we still hand out loopback to
+// this machine's own callers; remote callers use their own host:port.
+function bindHostForUrls() {
+  const bind = bindAddress();
+  return bind === "0.0.0.0" || bind === "::" ? LOOPBACK : bind;
+}
+
+function onLoopback() {
+  return bindAddress() === LOOPBACK;
+}
 const PLUGIN_STALE_MS = 20000;
 const DEFAULT_TIMEOUT = 120;
 // One AI request = one turn. Tools called in a burst share a turn token, so
@@ -175,8 +199,8 @@ function serverPort() {
   return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_PORT;
 }
 
-function serverUrl(port) {
-  return `http://${LOOPBACK}:${port || serverPort()}`;
+function serverUrl(port, host) {
+  return `http://${host || bindHostForUrls()}:${port || serverPort()}`;
 }
 
 // ---------------------------------------------------------------- turn tokens
@@ -555,13 +579,42 @@ function readBody(req, limit) {
 // The secret is a capability: it proves the caller holds the setup line. Both
 // the plugin (poll) and this CLI (call) must present it.
 function authorized(url, headers, body) {
-  if (!broker.secret) return true;
   const presented = [
     url.searchParams.get("secret"),
     headers["x-golem-secret"],
     body && body.secret,
   ];
-  return presented.some((v) => v === broker.secret);
+  // An empty secret only ever happens for a loopback-only listener; off
+  // loopback that would mean "everyone is authorized", so refuse instead.
+  if (!broker.secret) return onLoopback();
+  const ok = presented.some((v) => v === broker.secret);
+  if (ok) return true;
+  // Only this machine's own helpers (health probe, the in-game driver's own
+  // hello/result handshake) may work without it - and only while the listener
+  // is bound to loopback. Off-loopback, every route needs the secret.
+  return false;
+}
+
+/**
+ * Is this request coming from this very machine? True for loopback and for any
+ * address this host owns - when the listener is bound to a LAN address, Studio
+ * and this CLI reach it through that same address, so "own address" has to
+ * count as local. Everything else is a remote caller.
+ */
+function isLocalSocket(req) {
+  const addr = (req.socket && req.socket.remoteAddress) || "";
+  const plain = addr.replace(/^::ffff:/, "");
+  if (plain === "127.0.0.1" || plain === "::1") return true;
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const entry of list || []) {
+        if (entry && entry.address === plain) return true;
+      }
+    }
+  } catch {
+    // no interface info: treat as remote, which is the safe default
+  }
+  return false;
 }
 
 function reply(res, status, data) {
@@ -619,11 +672,19 @@ function handleBrokerRequest(req, res, url) {
   const route = `${req.method} ${pathname}`;
 
   if (route === "GET /v1/health") {
+    // Reachability probe for this machine's own CLI. Off-loopback it would leak
+    // the device id and place name to anyone who can hit the port.
+    if (!onLoopback() && !isLocalSocket(req)) {
+      reply(res, 403, { ok: false, error: "health is local-only" });
+      return;
+    }
     reply(res, 200, {
       ok: true,
       service: "golem-bridge",
       version: VERSION,
       port: serverPort(),
+      bind: bindAddress(),
+      loopbackOnly: onLoopback(),
       plugin: { connected: Date.now() - broker.lastPluginPoll < PLUGIN_STALE_MS, lastPollMs: broker.lastPluginPoll },
       place: broker.place,
       deviceId: broker.deviceId,
@@ -702,6 +763,12 @@ function handleBrokerRequest(req, res, url) {
   }
 
   if (route === "POST /v1/result") {
+    // Only Studio (same machine) posts command results. A remote caller posting
+    // here could forge the answer to a command the AI is waiting on.
+    if (!isLocalSocket(req)) {
+      reply(res, 403, { ok: false, error: "results are accepted from this machine only" });
+      return;
+    }
     readBody(req).then((text) => {
       let data = {};
       try {
@@ -765,6 +832,10 @@ function handleBrokerRequest(req, res, url) {
   }
 
   if (route === "POST /v1/guest/exec") {
+    if (!isLocalSocket(req)) {
+      reply(res, 403, { ok: false, error: "the in-game driver must be on this machine" });
+      return;
+    }
     readBody(req).then((text) => {
       let data = {};
       try {
@@ -846,12 +917,15 @@ function handleBrokerRequest(req, res, url) {
 
 function startBroker(link) {
   broker.secret = link.secret || "";
+  if (!broker.secret && !onLoopback()) {
+    throw new Error("refusing to listen off loopback without a session secret (GOLEM_SECRET)");
+  }
   const port = link.port || serverPort();
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
       let url;
       try {
-        url = new URL(req.url, `http://${LOOPBACK}:${port}`);
+        url = new URL(req.url, `http://${bindHostForUrls()}:${port}`);
       } catch {
         reply(res, 400, { ok: false, error: "bad request" });
         return;
@@ -880,7 +954,7 @@ function startBroker(link) {
         reject(err);
       }
     });
-    server.listen(port, LOOPBACK, () => {
+    server.listen(port, bindAddress(), () => {
       brokerLog(`listening on ${serverUrl(port)}`);
       resolve({ server, port });
     });
@@ -1664,6 +1738,12 @@ async function connect(setupLine, opts) {
   const link = { secret: parsed.secret, port, deviceId: null };
   const url = serverUrl(port);
   process.stdout.write(`golem-bridge is listening on ${url}\n`);
+  if (!onLoopback()) {
+    process.stdout.write(
+      `  (bound to ${bindAddress()} - reachable from other machines on this network; ` +
+        "every call needs the session secret)\n"
+    );
+  }
   try {
     await ensureServer(link);
   } catch (err) {
@@ -1908,6 +1988,10 @@ module.exports = {
   status,
   broker,
   startBroker,
+  authorized,
+  isLocalSocket,
+  bindAddress,
+  onLoopback,
   UsageError,
   main,
 };

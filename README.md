@@ -78,9 +78,31 @@ notes: the turn counter is the whole bookkeeping.
 
 - `GOLEM_PORT` — bridge port (default `41717`). Set it when two projects need
   separate sessions at the same time.
+- `GOLEM_BIND` — address to listen on (default `127.0.0.1`). Only needed when the
+  agent is **not** on this machine; see below.
 - `GOLEM_DEVICE` — `device:secret` override, for scripted setups.
 - `GOLEM_TURN_IDLE` — seconds of quiet after which the next tool call starts a
   new turn in the Studio timeline (default 300).
+
+## Where the agent runs (read this before opening a port)
+
+The bridge listens on loopback, so the AI's terminal must be on the same machine
+as Studio. That is the normal case for a coding agent in your shell, and it is
+why there is no relay to trust.
+
+| Agent runs in | Works? | What to do |
+|---|---|---|
+| Your terminal (Claude Code, Cursor, Codex CLI, local loops) | yes | nothing — loopback is enough |
+| WSL2 / a container / a VM on the same machine | no | `GOLEM_BIND=0.0.0.0` in the CLI, and the plugin/setup line must reach the host IP; or run the CLI inside the same container |
+| A hosted/cloud agent (a remote sandbox, a web agent) | no | it cannot reach your loopback. Exposing the bridge to the internet is not supported — put it behind your own tunnel/VPN if you really need it, and keep the secret |
+
+`GOLEM_BIND` is a real security decision, not a convenience: it moves the
+listener off loopback, and anything that can reach the port can try to use it.
+With it set, every route requires the session secret, command **results** and the
+in-game driver handshake are only accepted from this machine's own addresses, and
+the health probe stops answering at all — otherwise a remote caller could read
+the device id and place name, or forge the reply to a command the AI is waiting
+on. `golem-bridge` refuses to listen off loopback with no secret.
 
 ## Security
 

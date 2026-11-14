@@ -38,6 +38,7 @@ tool call goes through it. `npx golem-bridge disconnect` stops it.
 | `unauthorized` | this terminal holds a different session than Studio | same as above: re-copy the line from the window |
 | tools hang, then time out | the play session is busy, or Studio is modal | `npx golem-bridge cancel` drops the queue, then retry with a longer `--timeout` |
 | several Studio windows share one line | commands may run twice | stop, tell the user to keep one window per link |
+| `connect` cannot reach Studio at all, `status` sees no bridge | the agent is not on the same machine as Studio (container, WSL2, remote sandbox) | the bridge is loopback-only by design. Ask the user to run the CLI on the Studio machine (or set `GOLEM_BIND` to a reachable address and open that port themselves) |
 
 `npx golem-bridge status` is the cheap check and needs no Studio round trip.
 `npx golem-bridge debug` is the expensive one: it asks the plugin about its

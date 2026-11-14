@@ -431,6 +431,52 @@ test("status explains what to do when nothing is listening", async () => {
   }
 });
 
+test("a remote caller is refused unless it has the secret, and never forges results", () => {
+  const remote = { socket: { remoteAddress: "203.0.113.9" } };
+  const local = { socket: { remoteAddress: "127.0.0.1" } };
+  assert.equal(cli.isLocalSocket(remote), false);
+  assert.equal(cli.isLocalSocket(local), true);
+
+  cli.broker.secret = "a".repeat(40);
+  const url = new URL("http://bridge/v1/call");
+  // no secret, wrong secret
+  assert.equal(cli.authorized(url, {}, {}), false);
+  assert.equal(cli.authorized(url, {}, { secret: "b".repeat(40) }), false);
+  // the real secret, however presented
+  assert.equal(cli.authorized(url, {}, { secret: "a".repeat(40) }), true);
+  assert.equal(cli.authorized(url, { "x-golem-secret": "a".repeat(40) }, {}), true);
+  assert.equal(cli.authorized(new URL("http://bridge/v1/poll?secret=" + "a".repeat(40)), {}, null), true);
+  cli.broker.secret = "";
+});
+
+test("binding defaults to loopback and only moves when asked", () => {
+  const saved = process.env.GOLEM_BIND;
+  const restore = () => {
+    if (saved === undefined) delete process.env.GOLEM_BIND;
+    else process.env.GOLEM_BIND = saved;
+  };
+  try {
+    delete process.env.GOLEM_BIND;
+    assert.equal(cli.bindAddress(), "127.0.0.1");
+    assert.equal(cli.onLoopback(), true);
+    // garbage must never widen the listener
+    for (const junk of ["", "localhost", "not-an-ip", "evil.example.com"]) {
+      process.env.GOLEM_BIND = junk;
+      assert.equal(cli.bindAddress(), "127.0.0.1", junk);
+      assert.equal(cli.onLoopback(), true, junk);
+    }
+    // an explicit address is honoured, and then it is no longer loopback-only
+    process.env.GOLEM_BIND = "0.0.0.0";
+    assert.equal(cli.bindAddress(), "0.0.0.0");
+    assert.equal(cli.onLoopback(), false);
+    process.env.GOLEM_BIND = "192.168.1.20";
+    assert.equal(cli.bindAddress(), "192.168.1.20");
+    assert.equal(cli.onLoopback(), false);
+  } finally {
+    restore();
+  }
+});
+
 // ------------------------------------------------------------------- plugin
 test("the shipped plugin source is v4 and has no relay left", () => {
   const file = path.join(__dirname, "plugin", "Golem.lua");
