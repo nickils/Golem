@@ -9,7 +9,7 @@ if plugin == nil then
 end
 
 local PLUGIN_TITLE = "Golem"
-local VERSION = "4.1.0"
+local VERSION = "4.1.1"
 
 -- Studio can only make outgoing HTTP calls, and the AI running golem-bridge is
 -- usually a cloud sandbox that cannot reach this computer at all. So both sides
