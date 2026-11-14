@@ -868,6 +868,9 @@ local OPERATION_NAMES = {
 	insert_asset = "insert",
 	apply_asset = "apply",
 	run = "lua",
+	run_script = "run_script",
+	run_list = "run_list",
+	run_remove = "run_remove",
 }
 local function richEscape(s)
 	s = string.gsub(tostring(s), "&", "&amp;")
@@ -2674,7 +2677,7 @@ function OPS.terrain(args)
  position = { x = center.X, y = center.Y, z = center.Z } }
 end
 
-function OPS.run(args)
+function editorRun(args)
  if loadstring == nil then
  error("loadstring is not available in this context", 0)
  end
@@ -3475,6 +3478,8 @@ local generation = 0
 local PLAY_SAFE = {
 	ping = true, debug = true, stop = true, playstate = true, screenshot = true,
 	logs = true, click = true, input = true, look_through = true, play = true,
+	-- code execution targets the running game, so it belongs to this list
+	run = true, run_script = true, run_list = true, run_remove = true,
 }
 
 -- Screenshots are by far the biggest thing that crosses the relay: a 900px
@@ -4413,6 +4418,224 @@ handlers.logs = function()
   return { ok = true, total = #entries, entries = entries, source = "play" }
 end
 
+-- ---------------------------------------------------------------- code execution
+-- Two ways to get AI code running here:
+--   run  - run NOW in this driver's context (server or client), return the values
+--   install - turn the code into a standing Script that runs in its own context
+-- Instrumented (print/warn hooks between markers) unless args.autoRun is false.
+--
+-- Client note: there is no loadstring on a Roblox client, ever. A client "run"
+-- is therefore installed as a Script with RunContext = Client and its prints
+-- stream back through `logs`; the reply says so instead of pretending it
+-- returned a value. Any client-run authorisation dance would just be an
+-- obfuscation step, so this does not pretend to be one.
+
+local runCounter = 0
+
+local function nextRunId()
+  runCounter = runCounter + 1
+  return string.format("%s-%d-%d", tostring(ROLE), runCounter, math.floor(os.clock() * 1000) % 100000)
+end
+
+local function safeLabel(text)
+  return (string.gsub(tostring(text or "code"), "[^%w_-]", "_"))
+end
+
+-- Execute inside the driver itself. Server only: the client has no loadstring.
+local function runInline(code, args)
+  if ROLE ~= "server" then
+    return {
+      ok = false,
+      needsInstall = true,
+      error = "there is no loadstring on a Roblox client - a client snippet must be installed as a Script instead of run inline",
+    }
+  end
+  if type(loadstring) ~= "function" then
+    return {
+      ok = false,
+      needsInstall = true,
+      error = "loadstring is not enabled on this server (ServerScriptService.LoadStringEnabled is off) - install a Script instead",
+    }
+  end
+  local id = nextRunId()
+  local instrumented = args.autoRun ~= false
+  local source = code
+  if instrumented then
+    local marker = "__GOLEM_RUN_BEGIN_" .. id
+    local finish = "__GOLEM_RUN_END_" .. id
+    local indent = function(text)
+      return (string.gsub(tostring(text), "\n", "\n  "))
+    end
+    -- Wrap in a function so the snippet cannot clobber our locals, but keep the
+    -- snippet's return values and its errors: a wrapper that swallows either
+    -- reports success for code that raised and drops what it returned.
+    source = table.concat({
+      'print("' .. marker .. '")',
+      'local __golem = table.pack(pcall(function()',
+      "  " .. indent(code),
+      "end))",
+      'print("' .. finish .. ' " .. tostring(__golem[1]))',
+      "if not __golem[1] then",
+      "  warn('code raised: ' .. tostring(__golem[2]))",
+      "  error(tostring(__golem[2]), 0)",
+      "end",
+      "return table.unpack(__golem, 2, __golem.n)",
+    }, "\n")
+  end
+  local chunk, compileError = loadstring(source, "=golem-run-" .. id)
+  if chunk == nil then
+    return { ok = false, id = id, error = "Lua compile error: " .. tostring(compileError) }
+  end
+  local results = table.pack(pcall(chunk))
+  local values = {}
+  for index = 2, math.min(results.n, 13) do
+    local value = results[index]
+    local kind = type(value)
+    if kind == "table" or kind == "function" or kind == "userdata" or kind == "thread" then
+      local okJson, encoded = pcall(function()
+        if HttpService and HttpService.JSONEncode then
+          return HttpService:JSONEncode(value)
+        end
+        return tostring(value)
+      end)
+      values[#values + 1] = okJson and encoded or tostring(value)
+    else
+      values[#values + 1] = value
+    end
+  end
+  if results[1] ~= true then
+    return { ok = false, id = id, error = "runtime error: " .. tostring(results[2]), values = values }
+  end
+  return { ok = true, id = id, mode = "run", role = ROLE, instrumented = instrumented, values = values }
+end
+
+-- Build a standing Script whose only job is to run the snippet. It is named so
+-- that logs from it can be attributed, and it is cleaned up by `stop` like the
+-- drivers themselves.
+local function buildScript(code, args, name)
+  local plain = args.autoRun == false
+  local source = table.concat({
+    "-- Golem: code installed into the running play test",
+    plain and "" or ('warn("[Golem] running installed code ' .. name .. '")'),
+    code,
+  }, "\n")
+  local scriptInstance = Instance.new("Script")
+  scriptInstance.Name = name
+  scriptInstance.Source = source
+  scriptInstance.Disabled = false
+  local runContext = (args.runContext == "client" or args.runContext == "Client") and "Client" or "Server"
+  if ROLE == "client" then
+    runContext = "Client"
+  end
+  scriptInstance.Enabled = true
+  local okContext, contextErr = pcall(function()
+    scriptInstance.RunContext = Enum.RunContext[runContext]
+  end)
+  return scriptInstance, runContext, okContext, contextErr
+end
+
+-- One folder name, two homes. The folder is looked up by service rather than by
+-- name: both folders are called the same thing, so comparing names to decide
+-- which is which silently put every server script in ReplicatedStorage.
+local SCRIPTS_FOLDER = "GolemPlayTestScripts"
+
+local function scriptsFolder(serviceName)
+  local parent = game:GetService(serviceName)
+  local existing = parent:FindFirstChild(SCRIPTS_FOLDER)
+  if existing ~= nil and existing.ClassName ~= "Folder" then
+    existing = nil
+  end
+  if existing == nil then
+    existing = Instance.new("Folder")
+    existing.Name = SCRIPTS_FOLDER
+    existing.Parent = parent
+  end
+  return existing
+end
+
+local function installScript(code, args)
+  local name = tostring(args.name or ("GolemRun_" .. nextRunId()))
+  name = (string.gsub(name, "[^%w_]", "_"))
+  local target, runContext, okContext, contextErr = buildScript(code, args, name)
+  if not okContext then
+    return { ok = false, error = "could not set RunContext: " .. tostring(contextErr) }
+  end
+  local holder
+  if runContext == "Client" then
+    -- ReplicatedStorage so every client, including this one, gets it
+    holder = scriptsFolder("ReplicatedStorage")
+  else
+    holder = scriptsFolder("ServerScriptService")
+  end
+  target.Parent = holder
+  local written = false
+  pcall(function()
+    written = target.Source ~= "" and target.Source ~= nil
+  end)
+  return {
+    ok = true,
+    id = nextRunId(),
+    mode = "install",
+    role = ROLE,
+    name = name,
+    path = tostring(holder) .. "/" .. name,
+    runContext = runContext,
+    printed = "this code is not inline: its prints and errors show up in `logs`",
+  }
+end
+
+handlers.run = function(args)
+  local code = args and args.code
+  if type(code) ~= "string" or #code == 0 then
+    return { ok = false, error = "args.code (Lua source) is required" }
+  end
+  local wantsInstall = args.asScript == true or args.install == true or args.runContext ~= nil
+  if wantsInstall then
+    return installScript(code, args)
+  end
+  local reply = runInline(code, args)
+  if reply.needsInstall then
+    -- A client snippet (or a server without loadstring) cannot run inline, so
+    -- fall back to the standing-script path rather than failing the request.
+    reply = installScript(code, args)
+    reply.note = "ran as an installed Script, not inline"
+  end
+  return reply
+end
+
+handlers.run_list = function()
+  local out = {}
+  for _, serviceName in ipairs({ "ServerScriptService", "ReplicatedStorage" }) do
+    local holder = game:GetService(serviceName):FindFirstChild(SCRIPTS_FOLDER)
+    if holder ~= nil then
+      for _, child in ipairs(holder:GetChildren()) do
+        out[#out + 1] = {
+          name = child.Name,
+          path = tostring(holder) .. "/" .. child.Name,
+          runContext = child.ClassName == "Script" and "server" or "client",
+        }
+      end
+    end
+  end
+  return { ok = true, role = ROLE, count = #out, scripts = out }
+end
+
+handlers.uninstall = function(args)
+  local name = tostring(args and args.name or "")
+  if name == "" then
+    return { ok = false, error = "args.name is required" }
+  end
+  for _, serviceName in ipairs({ "ServerScriptService", "ReplicatedStorage" }) do
+    local holder = game:GetService(serviceName):FindFirstChild(SCRIPTS_FOLDER)
+    local child = holder and holder:FindFirstChild(name)
+    if child ~= nil then
+      child:Destroy()
+      return { ok = true, removed = name, from = tostring(holder) }
+    end
+  end
+  return { ok = false, error = "no installed script named " .. name }
+end
+
 -- Small command pump: between frames the driver asks the plugin for anything
 -- queued for it, so input and capture feel immediate.
 local function pump()
@@ -4937,6 +5160,131 @@ function OPS.click(args)
 		error(tostring(reply.error or "click failed"), 0)
 	end
 	return reply.result or { ok = true }
+end
+
+-- ---------------------------------------------------------------- code execution
+-- `run` used to mean "run Lua in the Studio plugin's context". It now means the
+-- same thing, plus the thing people actually want: run code *inside the running
+-- play test*, on the client or the server. `--target editor` keeps the old
+-- behaviour for code that is about the place rather than the session.
+local RUN_TARGETS = { editor = true, server = true, client = true }
+
+local function runTargetFrom(args)
+	local target = string.lower(tostring(args and args.target or ""))
+	if target == "" then
+		-- No target: inside a play test the session is what you meant; outside
+		-- one there is nothing but the editor.
+		return RunService:IsRunning() and "server" or "editor"
+	end
+	if not RUN_TARGETS[target] then
+		error("run: --target must be editor, server, or client", 0)
+	end
+	return target
+end
+
+local function requireCode(args)
+	local code = args and args.code
+	if type(code) ~= "string" or #code == 0 then
+		error("args.code (Lua source) is required", 0)
+	end
+	return code
+end
+
+local function guestRun(role, code, args, timeout)
+	-- One driver call per role. The driver decides whether it can run inline.
+	local reply = guestExec(role, "run", {
+		code = code,
+		autoRun = args.autoRun,
+		asScript = args.asScript,
+		name = args.name,
+	}, timeout or 20)
+	if not reply.ok then
+		local payload = type(reply.result) == "table" and reply.result or {}
+		-- a client snippet is installed rather than run, and that is not a failure
+		if payload.mode == "install" then
+			return payload
+		end
+		error(tostring(reply.error or (role .. " could not run the code")), 0)
+	end
+	return type(reply.result) == "table" and reply.result or {}
+end
+
+function OPS.run(args)
+	local target = runTargetFrom(args)
+	if target == "editor" then
+		return editorRun(args)
+	end
+	local code = requireCode(args)
+	if not RunService:IsRunning() then
+		error("run: there is no running play test - call `play` first, or pass --target editor", 0)
+	end
+	local result
+	if target == "server" then
+		result = guestRun("server", code, args, 30)
+	else
+		-- the client cannot loadstring, so this becomes an installed Script
+		result = guestRun("client", code, args, 20)
+	end
+	result.target = target
+	return result
+end
+
+-- A standing script in the session: for code that has to run in its own
+-- context with its own lifetime, and whose prints stream back through `logs`.
+function OPS.run_script(args)
+	if not RunService:IsRunning() then
+		error("run_script: there is no running play test - call `play` first", 0)
+	end
+	local code = requireCode(args)
+	local context = string.lower(tostring(args.runContext or args.context or "server"))
+	if context ~= "server" and context ~= "client" then
+		error("run_script: --context must be server or client", 0)
+	end
+	if context == "server" then
+		local reply = guestExec("server", "run", {
+			code = code, asScript = true, name = args.name, autoRun = args.autoRun,
+		}, 20)
+		if not reply.ok then
+			error(tostring(reply.error or "the server could not install the script"), 0)
+		end
+		return reply.result
+	end
+	-- A client script is placed by the server so every client gets it; asking the
+	-- client driver to place it would only reach the one client.
+	local reply = guestExec("server", "run", {
+		code = code, asScript = true, name = args.name, runContext = "client", autoRun = args.autoRun,
+	}, 20)
+	if not reply.ok then
+		error(tostring(reply.error or "the server could not install the client script"), 0)
+	end
+	return reply.result
+end
+
+function OPS.run_list(args)
+	if not RunService:IsRunning() then
+		return { playing = false, scripts = {}, hint = "call `play` to start a session" }
+	end
+	local role = string.lower(tostring(args and args.context or "server"))
+	local reply = guestExec(role == "client" and "client" or "server", "run_list", {}, 15)
+	if not reply.ok then
+		error(tostring(reply.error or "could not list installed scripts"), 0)
+	end
+	return reply.result
+end
+
+function OPS.run_remove(args)
+	if not RunService:IsRunning() then
+		error("run_remove: there is no running play test", 0)
+	end
+	local name = tostring(args and args.name or "")
+	if name == "" then
+		error("run_remove: --name is required", 0)
+	end
+	local reply = guestExec("server", "uninstall", { name = name }, 15)
+	if not reply.ok then
+		error(tostring(reply.error or "could not remove the script"), 0)
+	end
+	return reply.result
 end
 
 function OPS.input(args)

@@ -196,6 +196,48 @@ test("every documented input form actually parses", () => {
   }
 });
 
+test("code execution: targets reach the plugin, and client runs are installs", () => {
+  // Editing Lua and running-for-real are different ops: `run` is play-safe and
+  // dispatches on target, so the target has to survive the wire intact.
+  const build = (argv) => cli.buildArgs("lua", cli.parseToolArgs("lua", argv));
+  assert.deepEqual(build(["return 1"]).args, { code: "return 1" });
+  assert.deepEqual(build(["return 1", "--target", "server"]).args, { code: "return 1", target: "server" });
+  assert.deepEqual(build(["return 1", "--target", "client"]).args, { code: "return 1", target: "client" });
+  assert.deepEqual(build(["return 1", "--target", "editor"]).args, { code: "return 1", target: "editor" });
+  throwsUsage(() => build(["return 1", "--target", "browser"]), /bad value/);
+
+  // Standing scripts: context decides where it lands in the place
+  assert.deepEqual(
+    cli.buildArgs("run_script", cli.parseToolArgs("run_script", ["print(1)", "--context", "client", "--name", "p"])).args,
+    { code: "print(1)", runContext: "client", name: "p" }
+  );
+  assert.equal(cli.buildArgs("run_script", cli.parseToolArgs("run_script", ["print(1)"])).op, "run_script");
+  throwsUsage(() => cli.buildArgs("run_remove", cli.parseToolArgs("run_remove", [])), /--name is required/);
+
+  // The plugin must actually answer all four ops, or the CLI advertises a tool
+  // that Studio rejects.
+  const src = fs.readFileSync(path.join(__dirname, "plugin", "Golem.lua"), "utf8");
+  for (const op of ["run", "run_script", "run_list", "run_remove"]) {
+    assert.match(src, new RegExp(`^function OPS\\.${op}\\(`, "m"), `the plugin has no ${op} op`);
+  }
+  // and `run` must not be a second editor-only implementation: the old one is
+  // renamed so the session-aware version is what the relay calls.
+  assert.equal((src.match(/^function OPS\.run\(/gm) || []).length, 1, "two run ops would shadow each other");
+  assert.match(src, /^function editorRun\(/m, "the editor implementation must still exist");
+
+  // The in-session driver has to carry the code-execution handlers, or `play`
+  // sessions get a plugin that promises code execution and cannot do it.
+  for (const handler of ["handlers.run", "handlers.run_list", "handlers.uninstall"]) {
+    assert.ok(src.includes(handler + " ="), `the injected driver has no ${handler}`);
+  }
+  // No client loadstring anywhere: a Roblox client has none, so the client path
+  // must go through an installed Script rather than pretend to eval.
+  assert.ok(
+    !/handlers\.clientRun\s*=|ClientRun\s*=/.test(src),
+    "a client-side eval snuck in; Roblox has no loadstring on the client"
+  );
+});
+
 test("there is no turn/say/note tool left", () => {
   for (const gone of ["say", "turn", "turn_begin", "turn_end"]) {
     assert.equal(cli.TOOLS[gone], undefined, `${gone} should be gone`);
@@ -224,6 +266,7 @@ test("every advertised tool builds args without throwing", () => {
     logs: [], screenshot: [], click: ["1", "2"], input: ["space"], look_through: ["Workspace/X"],
     attr: ["Workspace/X"], tag: ["Workspace/X", "--add", "T"],
     terrain: ["--position", "0,0,0", "--size", "1,1,1"], insert: ["123"], apply: ["123", "Workspace/X", "Texture"],
+    run_script: ["return 1"], run_list: [], run_remove: ["--name", "probe"],
   };
   for (const name of Object.keys(cli.TOOLS)) {
     if (cli.TOOLS[name].local) continue;
@@ -709,6 +752,7 @@ test("every op the CLI can send exists in the plugin", () => {
       logs: [], screenshot: [], click: ["1", "1"], input: ["space"], look_through: ["Workspace/X"],
       attr: ["Workspace/X"], tag: ["Workspace/X", "--add", "T"],
       terrain: ["--position", "0,0,0", "--size", "1,1,1"], insert: ["1"], apply: ["1", "Workspace/X", "Texture"],
+      run_script: ["return 1"], run_list: [], run_remove: ["--name", "probe"],
     };
     const built = cli.buildArgs(name, cli.parseToolArgs(name, samples[name] || []));
     sent.add(built.op);

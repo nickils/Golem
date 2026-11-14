@@ -186,6 +186,38 @@ driver into that session so you can see it and touch it.
 | `logs [--all] [--limit N] [--since S]` | the running game's errors and warnings |
 | `stop` | end the test and clean the driver out of the place |
 
+### Running code inside the test
+
+`lua` means "run this Lua for real". Where it runs depends on `--target`:
+
+```
+lua "return game.PlaceId"                  # in a test: the server. Otherwise: the editor
+lua --target server "for _, p in ipairs(workspace:GetChildren()) do print(p.Name) end"
+lua --target client "print('hello from the client')"
+lua --target editor "return game.Workspace:GetChildren()[1].Name"
+```
+
+| Tool | What it does |
+|---|---|
+| `lua [code] [--target editor\|server\|client]` | run code and get its return values back |
+| `run_script [code] [--context server\|client] [--name N]` | install a standing Script into the test |
+| `run_list [--context]` | the scripts Golem installed into this session |
+| `run_remove --name N` | remove one of them |
+
+The server is the honest place to run code: it has `loadstring`, so the values
+come straight back and a compile error is reported as a compile error.
+
+**The client has no `loadstring` at all** — not in Studio, not in a live game,
+it is a platform rule. So `lua --target client` installs a `Script` with
+`RunContext = Client` instead of evaluating anything inline. It returns a path,
+not a value, and its `print`s show up in `logs`. That is not a limitation Golem
+can fix, and anything claiming otherwise is quietly eval-ing somewhere it should
+not.
+
+Installed scripts land in a `GolemPlayTestScripts` folder (`ServerScriptService`
+for server, `ReplicatedStorage` for client) and `stop` cleans them out with the
+drivers. Errors and prints from them stream into `logs` like any other game log.
+
 The loop that works:
 
 1. `play` → `playstate` until the client driver answers.

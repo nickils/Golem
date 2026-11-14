@@ -512,7 +512,7 @@ async function status() {
 const GROUPS = [
   ["Connection", ["ping", "debug", "status", "cancel"]],
   ["Exploring", ["list", "tree", "find", "grep", "count", "look"]],
-  ["Scripts and Lua", ["read", "script", "lua", "exec"]],
+  ["Scripts and Lua", ["read", "script", "lua", "run_script", "run_list", "run_remove", "exec"]],
   ["Organizing", ["delete", "move", "group", "duplicate", "rename", "selection", "waypoint", "undo", "redo", "attr", "tag"]],
   ["Moving", ["rotate", "face", "shift", "scale", "place", "pivot"]],
   ["Surfaces and physics", ["paint", "anchor", "collide", "terrain", "weld", "hitbox"]],
@@ -528,7 +528,27 @@ const TOOLS = {
   status: { help: "is Studio live on this channel? reads the relay beacons (no Studio round-trip)", local: true },
   cancel: { help: "explains how to recover when a call looks stuck", local: true },
   exec: { help: 'send a raw op JSON: {"op":..., "args":...}', pos: [["json"]] },
-  lua: { help: "run Lua inside Studio (code arg, or - for stdin)", pos: [["code", null]] },
+  lua: {
+    help: "run Lua in Studio or inside the running play test (--target editor|server|client)",
+    pos: [["code", null]],
+    flags: {
+      target: ["str", { choices: ["editor", "server", "client"] }],
+      name: "str",
+      script: "bool",
+      "no-auto-run": ["bool", { flag: "--no-auto-run" }],
+    },
+  },
+  run_script: {
+    help: "install a standing Script into the play test (--context server|client)",
+    pos: [["code", null]],
+    flags: {
+      context: ["str", { choices: ["server", "client"] }],
+      name: "str",
+      "no-auto-run": ["bool", { flag: "--no-auto-run" }],
+    },
+  },
+  run_list: { help: "list the scripts Golem has installed into the play test", pos: [], flags: { context: ["str", { choices: ["server", "client"] }] } },
+  run_remove: { help: "remove one installed script from the play test", pos: [], flags: { name: "str" } },
   list: { help: "children of a path", pos: [["path", "game"]], flags: { recursive: "bool", max: "int" } },
   tree: { help: "recursive tree of a path", pos: [["path", "game"]], flags: { depth: "int" } },
   read: { help: "read an instance (script source by default, --json for full record)", pos: ["path"], flags: { json: "bool", props: "str" } },
@@ -748,7 +768,29 @@ function buildArgs(name, ns) {
       let code = ns.code;
       if (code === "-" || code == null) code = process.stdin.isTTY ? "" : readStdin();
       if (!code) throw new UsageError("no Lua code given (pass it as an argument or pipe it in)");
-      return { op: "run", args: { code } };
+      const a = { code };
+      if (ns.target) a.target = ns.target;
+      if (ns.name) a.name = ns.name;
+      if (ns.script) a.asScript = true;
+      if (ns.noAutoRun) a.autoRun = false;
+      return { op: "run", args: a };
+    }
+    case "run_script": {
+      let code = ns.code;
+      if (code === "-" || code == null) code = process.stdin.isTTY ? "" : readStdin();
+      if (!code) throw new UsageError("no Lua code given (pass it as an argument or pipe it in)");
+      const a = { code };
+      if (ns.context) a.runContext = ns.context;
+      if (ns.name) a.name = ns.name;
+      if (ns.noAutoRun) a.autoRun = false;
+      return { op: "run_script", args: a };
+    }
+    case "run_list": {
+      return { op: "run_list", args: ns.context ? { context: ns.context } : {} };
+    }
+    case "run_remove": {
+      if (!ns.name) throw new UsageError("run_remove: --name is required");
+      return { op: "run_remove", args: { name: ns.name } };
     }
     case "list": {
       const a = { path: ns.path };
