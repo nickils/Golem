@@ -9,21 +9,25 @@ to each GitHub Release and distributed through the Roblox Creator Store.
 
 ## How it connects
 
-No relay. The plugin in Studio talks to `golem-bridge` on **your computer**,
-over `127.0.0.1:41717`. Studio plugins are allowed to reach localhost, so the
-command path is: AI terminal → plugin → Studio, and back. Nothing is routed
-through a third-party service, there is no channel id to leak, and the link
-dies when you close Studio or run `disconnect`.
+A small Firebase Realtime Database relay sits between Studio and the AI. Not
+because a relay is nice to have, but because of two hard facts:
+
+- a Studio plugin can only make **outgoing** HTTP calls, and
+- the AI running `golem-bridge` is often a **cloud sandbox** that cannot reach
+  your computer at all.
+
+So both sides meet in the middle. `golem-bridge` pushes a command into a channel
+and Studio polls that channel, runs the command, and pushes the result back. The
+database only stores JSON — it knows nothing about Roblox and never sees a token.
 
 Studio shows one line in the Golem window (and in Settings):
 
 ```
-npx golem-bridge connect <inbox>:<secret>
+npx golem-bridge connect 9f3c1a77b0e24d58
 ```
 
-Run it once in the AI's terminal. It verifies the round trip, saves
-`./.golem/link.json` (mode `0600`), starts a small background bridge so later
-tool calls do not have to re-link, and prints the tool manual.
+Paste it into **any** AI chat. `connect` pings the channel, saves the id to
+`./.golem/link.json`, and prints the tool manual:
 
 ```sh
 npx golem-bridge ping
@@ -33,6 +37,10 @@ npx golem-bridge tree --depth 3
 `ping` returns `"ok": true` plus the open place name. `manual` reprints the
 reference any time (`help <tool>` explains one tool). Each tool reply also
 carries the turn it landed in, which is the number drawn in the Studio window.
+
+If a call looks stuck, `status` reads the channel beacons and says which of these
+happened: Studio stopped polling, the plugin is an old build, or that line is
+from a Studio session that has since rotated.
 
 Done with a session? Forget it locally (Studio is unaffected):
 
@@ -47,26 +55,18 @@ agents that run somewhere other than your PC. Roblox's built-in MCP server is
 stdio-only (there is no local port to connect to), and a cloud session cannot
 start it, so the same limit hits every remote agent.
 
-Golem works the other way around: **Studio reaches out to the AI's terminal.**
-Paste the setup line into the chat, the agent runs it, and Studio starts calling
-back. No MCP, no server for the agent to launch, no IDE plugin.
+Golem works the other way around: the setup line is the only thing the AI needs,
+and it works from a laptop, a container, or a hosted sandbox.
 
-### The one thing that has to be true
+### The security model, in one paragraph
 
-The plugin can only make *outgoing* HTTP calls, so your Studio has to be able to
-reach wherever the bridge is listening.
-
-| Where the AI runs | Setup |
-|---|---|
-| Same machine as Studio (terminal, Cursor, Codex CLI) | nothing — the line just works |
-| A web/cloud agent, or a different machine | give the AI a URL it can reach: run a tunnel to the bridge port, set `GOLEM_URL` to it, and paste that host into **Settings → Where your AI runs** in Studio |
-
-A tunnel is the user's own, on the user's terms — there is no relay service in
-this design that can read your place.
-
-The setup line is a **session** secret: it is never written to disk, and it dies
-when Studio closes, reloads, or you press END SESSION. That matters because this
-flow means the line ends up in a chat transcript.
+The **channel id is the capability**. It is 16 random hex characters, minted for
+each Studio session, held only in memory, and never written to disk. Ending the
+session (or restarting Studio) mints a new one, marks the old channel `revoked`,
+and deletes it — so a line you pasted into a chat transcript is dead the moment
+the session it names is over. Anyone who holds a live line and reaches the relay
+can drive that Studio session; that is the whole trust model, and it is why the
+line expires.
 
 ## What the AI can do
 
@@ -86,70 +86,41 @@ notes: the turn counter is the whole bookkeeping.
 
 ## Files
 
-- `cli.js` - the whole package: local bridge, session setup, every Studio tool
-- `golem-tools.md` - the agent manual (printed by `connect` and `manual`)
-- `plugin/Golem.lua` - the Studio plugin source
-- `plugin/Golem.rbxmx` - the installable plugin build (`python3 plugin/build.py`)
-- `package.json` - npm manifest
+- `cli.js` — the whole package: relay transport, session setup, every Studio tool
+- `golem-tools.md` — the agent manual (printed by `connect` and `manual`)
+- `plugin/Golem.lua` — the Studio plugin source
+- `plugin/Golem.rbxmx` — the installable plugin build (`python3 plugin/build.py`)
+- `package.json` — npm manifest
 
 ## Notes
 
-- Only `cli.js`, `golem-tools.md`, and (via `connect`) the local link file are
-  used. No data leaves the machine except the marketplace lookups, which talk to
+- Commands travel through the relay channel; Studio results travel back the same
+  way. Nothing else leaves the machine, except marketplace lookups, which talk to
   roblox.com from this terminal because Studio cannot.
-- The bridge listens on loopback only and requires the secret from the setup
-  line on every call. A different Studio window on the same port is refused.
+- The plugin deletes each command from the channel after running it and ignores
+  anything older than the moment its current session started, so a command queued
+  for a closed Studio never fires into the next one.
 - npm account `skellzy` and GitHub `nickils` are the same person.
 
 ## Environment variables (all optional)
 
-- `GOLEM_PORT` — bridge port (default `41717`). Set it when two projects need
-  separate sessions at the same time.
-- `GOLEM_URL` — the address *this* process uses to reach the bridge
-  (default loopback). Set it to your tunnel URL for a remote agent.
-- `GOLEM_BIND` — address the bridge listens on (default `127.0.0.1`). Moving it
-  off loopback is a security decision: every route then requires the session
-  secret, command results and the in-game driver handshake are accepted only from
-  this machine, and the health probe goes dark. The bridge refuses to listen off
-  loopback with no secret.
-- `GOLEM_SECRET` — use this session secret instead of `./.golem/link.json`.
+- `GOLEM_FIREBASE_DB` — the relay base URL (default
+  `https://roblox-golem-default-rtdb.firebaseio.com`). Must be `https://`, except
+  for a local emulator on `127.0.0.1`.
+- `GOLEM_CHANNEL` — use this channel id instead of `./.golem/link.json` (useful
+  when a script or a fresh sandbox must pin a session).
+- `GOLEM_POLL_INTERVAL` — seconds between result polls in the CLI (default `2`).
 - `GOLEM_TURN_IDLE` — seconds of quiet after which the next tool call starts a
   new turn in the Studio timeline (default 300).
 
-## Remote agent, step by step
-
-Studio cannot be reached from outside your machine, so put the bridge somewhere
-the agent can reach and point Studio at it:
-
-```sh
-# 1. on the Studio machine: expose the bridge port through your own tunnel
-cloudflared tunnel --url http://127.0.0.1:41717
-
-# 2. in the agent's terminal (or its sandbox): use that URL instead of loopback
-GOLEM_URL=https://your-tunnel.trycloudflare.com npx golem-bridge connect <secret>
-```
-
-3. In Studio: **Settings → Where your AI runs → paste the same https URL → USE
-   THIS**. The plugin dials that address instead of `127.0.0.1`.
-
-Then the setup line works exactly as before. If your tunnel gives a new hostname
-each restart, update it in both places.
-
-`GOLEM_BIND` (below) is only needed when the bridge itself must listen on
-something other than loopback — for example the CLI running in WSL2 while Studio
-is on Windows.
-
 ## Security
 
-Trust model: the setup line is the capability. Anyone holding it and able to
-reach this machine's loopback port could drive that Studio session. It stays
-valid until the user ends the session in Studio, which mints a new one.
-
-- `connect` only accepts the documented line format, verifies the round trip
-  before saving, writes the link file `0600`, and never sends the secret
-  anywhere except `127.0.0.1`.
-- The plugin talks only to `127.0.0.1` and sends the secret as a header. It
-  refuses commands from a bridge with a different secret.
+- `connect` only accepts a hex channel id, verifies the round trip before saving,
+  and writes the link file with the id and nothing else.
+- Studio mints the channel in memory, wipes any id an older build persisted, and
+  refuses edit commands while a play test is running.
+- `status` never talks to Studio; it reads the beacons, so it cannot be used to
+  poke a session that has ended.
 - Scanners flag the Lua execution and editing commands. That is what Golem is:
-  your agent driving your own Studio. The session secret is the whole security
+  your agent driving your own Studio. The session channel is the whole security
   model.

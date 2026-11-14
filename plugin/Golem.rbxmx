@@ -1,7 +1,7 @@
 <roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Meta name="ExplicitAutoJoints">true</Meta><External>null</External><External>nil</External><Item class="Script" referent="RBX0"><Properties><string name="Name">Golem</string><bool name="Disabled">false</bool><ProtectedString name="Source">-- Golem: lets an AI agent build in this Studio session.
 -- Install: put Golem.rbxmx in Studio's Plugins folder, restart Studio.
--- v4.0.0: direct link (no relay middleman), real play-testing with screen capture
--- and virtual input, turn counter, undo-safe edits.
+-- v4.0.0: relay transport (works with a cloud AI), real play-testing with screen
+-- capture and virtual input, turn counter, undo-safe edits.
 
 if plugin == nil then
 	warn("[Golem] This script must run as a Roblox Studio plugin.")
@@ -11,10 +11,11 @@ end
 local PLUGIN_TITLE = "Golem"
 local VERSION = "4.0.0"
 
--- The CLI serves these endpoints on this computer. Studio plugins are allowed to
--- talk to localhost, which is the whole transport: no relay, no hosted fallback,
--- no third party that could see or replay a command.
-local DEFAULT_PORT = 41717
+-- Studio can only make outgoing HTTP calls, and the AI running golem-bridge is
+-- usually a cloud sandbox that cannot reach this computer at all. So both sides
+-- meet at a small Firebase Realtime Database: the CLI pushes a command, this
+-- plugin polls for it and pushes the result back. The database only stores JSON.
+local FIREBASE_DB = "https://roblox-golem-default-rtdb.firebaseio.com"
 
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
@@ -23,6 +24,14 @@ local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+
+local STUDIO_VERSION = "unknown"
+do
+	local ok, v = pcall(version)
+	if ok and v ~= nil then
+		STUDIO_VERSION = tostring(v)
+	end
+end
 
 local function getSetting(key, default)
 	local value = plugin:GetSetting(key)
@@ -41,39 +50,27 @@ local state = {
 	workingCount = nil,
 	startedAt = os.clock(),
 	playStartedAt = nil,
-	transport = nil,
 	publishError = nil,
 }
 
--- The bridge talks to the local golem-bridge server on this machine and nothing
--- else. Everything about the wire protocol lives in this table.
+-- Everything about the wire protocol lives in this table.
 local bridge = {
-	mode = "local", -- "local" | "none"
-	-- where the bridge lives. Loopback by default; set a tunnel URL when the AI
-	-- does not run on this machine (Studio can only make outgoing calls).
-	host = "http://127.0.0.1",
-	port = DEFAULT_PORT,
-	baseUrl = nil,
-	deviceId = nil,
-	deviceSecret = nil,
-	interval = 0.45,
-	failStreak = 0,
-	cursor = nil,
+	mode = "none", -- "relay" once the channel exists
+	-- The channel id IS the capability: 16 random hex chars, minted fresh for
+	-- every Studio session and never written to disk. A setup line pasted into a
+	-- chat ties an AI to this session and to nothing beyond it.
+	channel = nil,
+	previousChannel = nil,
+	interval = 2,
+	okStreak = 0,
+	skipBefore = 0,
+	lastMessageKey = nil,
 	lastPollAt = 0,
 	lastError = nil,
-	linkedAt = nil,
-	linkedPlace = nil,
+	beaconSentAt = 0,
 }
 
 local ui = {}
-
-local STUDIO_VERSION = "unknown"
-do
-	local ok, v = pcall(version)
-	if ok and v ~= nil then
-		STUDIO_VERSION = tostring(v)
-	end
-end
 
 local function makeRef(inst)
  refCounter = refCounter + 1
@@ -441,6 +438,153 @@ local OP_LABELS = {
  say = "Saying",
 }
 
+-- ---------------------------------------------------------------- session
+-- A channel id, minted per Studio session. Nothing else identifies this Studio,
+-- and it is deliberately NOT persisted: the setup line gets pasted into a chat
+-- window, so it must be a capability that dies with the session rather than a
+-- password that lives on disk forever.
+
+local function randomHex(n)
+	local rng = Random.new()
+	local chars = "0123456789abcdef"
+	local out = table.create(n)
+	for i = 1, n do
+		local idx = rng:NextInteger(1, 16)
+		out[i] = string.sub(chars, idx, idx)
+	end
+	return table.concat(out)
+end
+
+local function cmdUrl()
+	return FIREBASE_DB .. "/channels/" .. tostring(bridge.channel) .. "/cmd"
+end
+
+local function resUrl()
+	return FIREBASE_DB .. "/channels/" .. tostring(bridge.channel) .. "/res"
+end
+
+local function beaconUrl(channel)
+	local id = channel or bridge.channel
+	return FIREBASE_DB .. "/channels/" .. tostring(id) .. "/beacons"
+end
+
+local function ensureIdentity()
+	if bridge.channel ~= nil then
+		return
+	end
+	-- Whatever an older build stored is worthless now (and leaving it behind
+	-- would keep an old line alive), so wipe it and mint a fresh channel.
+	local stale = getSetting("Golem_Channel", nil)
+	pcall(function()
+		plugin:SetSetting("Golem_Channel", nil)
+	end)
+	if type(stale) == "string" and #stale &gt;= 8 then
+		bridge.previousChannel = stale
+	end
+	bridge.channel = randomHex(16)
+end
+
+ensureIdentity()
+
+-- Mint a fresh channel and wipe the old one. Any line handed to an AI before
+-- this call stops working immediately - that is the point of END SESSION.
+local function rotateChannel()
+	local old = bridge.channel
+	bridge.channel = randomHex(16)
+	bridge.lastMessageKey = nil
+	bridge.skipBefore = os.time() - 45
+	bridge.interval = 2
+	bridge.okStreak = 0
+	bridge.previousChannel = old
+	return bridge.channel
+end
+
+-- The one line the user (or their AI) runs to link this Studio.
+local function setupCommandText()
+	return "Connect to my Roblox Studio, Run: npx golem-bridge connect " .. tostring(bridge.channel)
+end
+
+local httpWarningShown = false
+
+local function ensureHttpEnabled()
+	local enabled = false
+	local okRead = pcall(function()
+		enabled = HttpService.HttpEnabled
+	end)
+	if okRead and enabled then
+		return true
+	end
+	-- A plugin can run without the place's "Allow HTTP Requests" setting, but on
+	-- some Studio builds the setting still gates HttpService. Try both quietly.
+	local okSet = pcall(function()
+		HttpService.HttpEnabled = true
+	end)
+	if not okSet and not httpWarningShown then
+		httpWarningShown = true
+		log("HttpService is blocked. Turn on Game Settings &gt; Security &gt; Allow HTTP Requests and reopen the Golem window.")
+	end
+	return okSet or (okRead and enabled)
+end
+
+-- sanitizeEnvelope is defined with the JSON helpers further down; it must be
+-- declared here so this encode helper closes over it instead of a nil global.
+local sanitizeEnvelope
+
+-- Thin RequestAsync wrapper: no compression, no redirects, hard timeouts.
+local function request(opts)
+	local req = {
+		Url = opts.url,
+		Method = opts.method or "GET",
+		Headers = opts.headers or {},
+		Compress = Enum.HttpCompression.None,
+	}
+	if opts.body ~= nil then
+		req.Body = opts.body
+	end
+	req.Headers["Accept"] = "application/json"
+	req.Headers["X-Golem-Plugin"] = VERSION
+	req.Headers["X-Golem-Studio"] = STUDIO_VERSION
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync(req)
+	end)
+	if not ok then
+		return nil, tostring(response)
+	end
+	if not response.Success then
+		local body = tostring(response.Body or "")
+		if #body &gt; 300 then
+			body = string.sub(body, 1, 300) .. "…"
+		end
+		return nil, string.format("HTTP %d %s", tonumber(response.StatusCode) or 0, body)
+	end
+	return response
+end
+
+local function encodeBody(value)
+	local ok, body = pcall(function()
+		return HttpService:JSONEncode(sanitizeEnvelope(value, 0))
+	end)
+	if not ok then
+		return nil, "JSONEncode failed: " .. tostring(body)
+	end
+	if type(body) ~= "string" then
+		return nil, "JSONEncode returned " .. type(body)
+	end
+	return body
+end
+
+local function decodeBody(response)
+	if response == nil or response.Body == nil or response.Body == "" then
+		return nil
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not ok then
+		return nil
+	end
+	return data
+end
 -- ------------------------------------------------------- safe JSON encoding
 -- Firebase/relay-era name kept so the shape of every payload stays identical:
 -- invalid UTF-8 becomes "?", control characters are dropped, and keys starting
@@ -509,7 +653,7 @@ local function jsonSafe(s)
  return table.concat(out)
 end
 
-local function sanitizeEnvelope(value, depth)
+function sanitizeEnvelope(value, depth)
  if depth &gt; 64 then
  return tostring(value)
  end
@@ -533,27 +677,6 @@ local function sanitizeEnvelope(value, depth)
  else
  return value
  end
-end
--- ------------------------------------------------------------ wire helpers
--- Small pieces every Studio-&gt;bridge call shares. Declared early because the
--- play-test tools need them too.
-
-local function transportUrl(path, query)
-	local base = bridge.baseUrl
-	if base == nil then
-		return nil
-	end
-	local url = base .. path
-	if query ~= nil and #query &gt; 0 then
-		url = url .. "?" .. query
-	end
-	return url
-end
-
--- The bridge runs on this machine, so routing needs no extra parameters. The
--- session secret always travels as a header, never in a URL.
-local function authQuery()
-	return ""
 end
 -- ------------------------------------------------------- undo/redo recordings
 -- Ops used to drop a bare SetWaypoint, which collapses into one vague step and
@@ -631,208 +754,63 @@ local NO_RECORDING = {
 local function opNeedsRecording(opName)
 	return not NO_RECORDING[opName]
 end
--- ---------------------------------------------------------------- session
--- A device id (public: it tells the CLI which Studio to talk to) and a secret
--- (private: it authorizes this CLI to drive this Studio).
---
--- The device id is stable so a saved link keeps pointing at this Studio; the
--- secret is minted per Studio session and never written to disk, because the
--- user hands it to an AI client by pasting it into a chat.
+-- ------------------------------------------------------------ wire helpers
+-- Small pieces every Studio-&gt;relay call shares. Declared early because the
+-- play-test tools need them too.
 
-local function randomHex(n)
-	local rng = Random.new()
-	local chars = "0123456789abcdef"
-	local out = table.create(n)
-	for i = 1, n do
-		local idx = rng:NextInteger(1, 16)
-		out[i] = string.sub(chars, idx, idx)
-	end
-	return table.concat(out)
-end
-
-local function ensureIdentity()
-	if bridge.deviceId == nil then
-		local stored = getSetting("Golem_DeviceId", nil)
-		if type(stored) == "string" and #stored &gt;= 8 then
-			bridge.deviceId = stored
-		else
-			bridge.deviceId = "golem-" .. randomHex(10)
-			pcall(function()
-				plugin:SetSetting("Golem_DeviceId", bridge.deviceId)
-			end)
-		end
-	end
-	-- The secret is NEVER saved. The setup line is handed to an AI client - often
-	-- by pasting it into a chat - so it has to be a session capability: it lives
-	-- in memory only, dies when Studio closes, reloads, or the user ends the
-	-- session, and a leaked pasted log is worthless afterwards.
-	bridge.deviceSecret = randomHex(40)
-	bridge.secretMintedAt = os.time()
-	pcall(function()
-		plugin:SetSetting("Golem_DeviceSecret", nil)
-	end)
-	bridge.port = tonumber(getSetting("Golem_Port", DEFAULT_PORT)) or DEFAULT_PORT
-	-- Optional override for the case where the AI cannot see our loopback.
-	-- Accepts "http://host", "https://host", or "https://host/some/path".
-	local storedHost = getSetting("Golem_BridgeHost", nil)
-	if type(storedHost) == "string" and #storedHost &gt; 0 then
-		local cleaned = string.gsub(storedHost, "/+$", "")
-		if string.match(cleaned, "^https?://[%w%.%-%:_/]+$") then
-			bridge.host = cleaned
-		end
-	end
-end
-
-ensureIdentity()
-
--- Mint a fresh secret. Any line handed to an AI client before this call stops
--- working immediately - that is the point: pasting the line into a chat must
--- leave nothing usable behind once the session is over.
-local function rotateSecret()
-	bridge.deviceSecret = randomHex(40)
-	bridge.secretMintedAt = os.time()
-	bridge.cursor = nil
-	pcall(function()
-		plugin:SetSetting("Golem_DeviceSecret", nil)
-	end)
-	return bridge.deviceSecret
-end
-
--- The one line the user (or their AI) runs to link this Studio.
-local function setupCommandText()
-	local port = ""
-	if bridge.port ~= DEFAULT_PORT then
-		port = " --port " .. tostring(bridge.port)
-	end
-	return string.format("npx golem-bridge connect %s%s", bridge.deviceSecret, port)
-end
-
--- The piece of that line that is safe to show on screen and in chat: the device
--- id is public, the secret is not.
-local function publicPair()
-	return bridge.deviceId
-end
-
-local httpWarningShown = false
-
-local function ensureHttpEnabled()
-	local enabled = false
-	local okRead = pcall(function()
-		enabled = HttpService.HttpEnabled
-	end)
-	if okRead and enabled then
-		return true
-	end
-	-- A plugin can run without the place's "Allow HTTP Requests" setting, but on
-	-- some Studio builds the setting still gates HttpService. Try both quietly.
-	local okSet = pcall(function()
-		HttpService.HttpEnabled = true
-	end)
-	if not okSet and not httpWarningShown then
-		httpWarningShown = true
-		log("HttpService is blocked. Turn on Game Settings &gt; Security &gt; Allow HTTP Requests and reopen the Golem window.")
-	end
-	return okSet or (okRead and enabled)
-end
-
--- Thin RequestAsync wrapper: no compression, no redirects, hard timeouts.
-local function request(opts)
-	local req = {
-		Url = opts.url,
-		Method = opts.method or "GET",
-		Headers = opts.headers or {},
-		Compress = Enum.HttpCompression.None,
-	}
-	if opts.body ~= nil then
-		req.Body = opts.body
-	end
-	req.Headers["Accept"] = "application/json"
-	req.Headers["X-Golem-Plugin"] = VERSION
-	req.Headers["X-Golem-Studio"] = STUDIO_VERSION
-	local ok, response = pcall(function()
-		return HttpService:RequestAsync(req)
-	end)
-	if not ok then
-		return nil, tostring(response)
-	end
-	if not response.Success then
-		local body = tostring(response.Body or "")
-		if #body &gt; 300 then
-			body = string.sub(body, 1, 300) .. "…"
-		end
-		return nil, string.format("HTTP %d %s", tonumber(response.StatusCode) or 0, body)
-	end
-	return response
-end
-
-local function encodeBody(value)
-	local ok, body = pcall(function()
-		return HttpService:JSONEncode(sanitizeEnvelope(value, 0))
-	end)
-	if not ok then
-		return nil, "JSONEncode failed: " .. tostring(body)
-	end
-	if type(body) ~= "string" then
-		return nil, "JSONEncode returned " .. type(body)
-	end
-	return body
-end
-
-local function decodeBody(response)
-	if response == nil or response.Body == nil or response.Body == "" then
-		return nil
-	end
-	local ok, data = pcall(function()
-		return HttpService:JSONDecode(response.Body)
-	end)
-	if not ok then
-		return nil
-	end
-	return data
-end
-
--- Ask the local CLI to link this Studio. On success the CLI holds the channel id
--- for every later command, so no secret is ever printed or pasted again.
-local function linkLocal()
-	bridge.mode = "local"
-	-- Loopback unless the user pointed the plugin somewhere else: when the AI
-	-- does not run on this machine, it can reach a tunnel URL but not our
-	-- localhost, so the plugin has to dial the same address the AI does.
-	local host = bridge.host
-	bridge.baseUrl = string.format("%s:%d", host, bridge.port)
-	local body, encodeErr = encodeBody({
-		deviceId = bridge.deviceId,
-		secret = bridge.deviceSecret,
-		place = game.Name,
-		placeId = game.PlaceId,
-		pluginVersion = VERSION,
-	})
+-- Request/reply over Firebase, for the cases where Studio asks something and
+-- needs the answer before it can continue (the in-game driver, mostly). The
+-- normal command path does not use this: it answers asynchronously through
+-- relayDeliver further down.
+local function relayRequest(baseUrl, op, args, timeoutSec)
+	local id = "q" .. randomHex(8)
+	local body, encodeErr = encodeBody({ id = id, op = op, args = args or {}, ts = os.time() })
 	if body == nil then
-		return false, "could not encode the link payload: " .. tostring(encodeErr)
+		return nil, "could not encode the request: " .. tostring(encodeErr)
 	end
-	local response, err = request({
-		url = bridge.baseUrl .. "/v1/session",
+	local posted, postErr = request({
+		url = baseUrl .. "/cmd.json",
 		method = "POST",
 		body = body,
+		headers = { ["Content-Type"] = "application/json" },
 	})
-	if response == nil then
-		return false, tostring(err)
+	if posted == nil then
+		return nil, tostring(postErr)
 	end
-	local data = decodeBody(response)
-	bridge.cursor = data ~= nil and tostring(data.cursor or "") or nil
-	return true, nil
+	local started = os.clock()
+	local budget = timeoutSec or 20
+	while os.clock() - started &lt; budget do
+		local listing = request({ url = baseUrl .. "/res.json?shallow=true" })
+		if listing ~= nil then
+			local keys = decodeBody(listing)
+			if type(keys) == "table" then
+				local sorted = {}
+				for key in pairs(keys) do
+					table.insert(sorted, key)
+				end
+				table.sort(sorted)
+				for _, key in ipairs(sorted) do
+					local entryResp = request({ url = baseUrl .. "/res/" .. key .. ".json" })
+					local entry = entryResp ~= nil and decodeBody(entryResp) or nil
+					if type(entry) == "table" and entry.id == id then
+						pcall(function()
+							request({ url = baseUrl .. "/res/" .. key .. ".json", method = "DELETE" })
+						end)
+						return entry
+					end
+				end
+			end
+		end
+		task.wait(0.35)
+	end
+	return nil, string.format("no answer within %d s", budget)
 end
 
--- Refresh the local link (and let the CLI know we are alive) about once a minute.
-local function heartbeat()
-	local ok, err = linkLocal()
-	if not ok then
-		setConnected(false, "cannot reach golem-bridge on port " .. tostring(bridge.port) ..
-			" - run the setup line in your AI's terminal")
-		return false, err
-	end
-	setConnected(true, nil)
-	return true, nil
+-- The in-game driver's private lane. The driver runs inside the play-test copy,
+-- which has no access to this plugin, so it gets its own request/reply pair
+-- under the same session channel.
+local function guestBase(role)
+	return FIREBASE_DB .. "/channels/" .. tostring(bridge.channel) .. "/guest/" .. tostring(role or "client")
 end
 -- ------------------------------------------------------------ shared vocabulary
 -- Op verb names for the timeline, and rich-text escaping for every label.
@@ -1496,11 +1474,13 @@ local function newTurn()
 	return turn
 end
 
--- Advance the counter and open a fresh turn.
+-- Advance the counter and open a fresh turn. The very first turn of a session
+-- must be Turn: 1, so the counter is advanced *before* the label is drawn and
+-- the turn is announced even before its first tool row exists.
 local function touchTurn()
 	turnNumber = turnNumber + 1
-	currentTurn = newTurn()
 	pushEvent({ k = "turn", n = turnNumber })
+	currentTurn = newTurn()
 	if refreshWorking ~= nil then
 		refreshWorking()
 	end
@@ -1752,6 +1732,7 @@ function chatRestore()
 			skip = skip + 1
 		end
 	end
+	-- a saved history continues where it left off; a fresh place starts at 1
 	turnNumber = math.max(savedTurn, 0)
 	for i = skip + 1, #events do
 		local entry = events[i]
@@ -3471,50 +3452,507 @@ function OPS.ui_list(args)
  return { layout = slashPath(listLayout), parent = slashPath(parent) }
 end
 
+-- ------------------------------------------------------- in-session driver
+-- Source for the two scripts injected for the duration of a play test. They are
+-- plain Roblox scripts (they run inside the game, not as plugins), so they can
+-- use CaptureService and UserInputService:CreateVirtualInput() - the same APIs
+-- Studio's own playtest automation uses. They never touch anything outside the
+-- test session and are destroyed as soon as it starts.
+
+local GUEST_TEMPLATE = [==[
+-- Golem's play-test driver. It lives inside the running test session only, for
+-- the length of that session, and speaks to the same relay channel the plugin
+-- uses. Its own request/reply lane keeps it out of the command path, so a slow
+-- screenshot can never block the AI's editing tools.
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CaptureService = game:GetService("CaptureService")
+local AssetService = game:GetService("AssetService")
+
+local ROLE = "@ROLE@"
+local RELAY = "@RELAY@"
+local CHANNEL = "@CHANNEL@"
+
+local BASE = RELAY .. "/channels/" .. CHANNEL .. "/guest/" .. ROLE
+
+local function send(url, method, body)
+  local ok, response = pcall(function()
+    return HttpService:RequestAsync({
+      Url = url,
+      Method = method,
+      Body = body,
+      Headers = { ["Content-Type"] = "application/json", ["Accept"] = "application/json" },
+      Compress = Enum.HttpCompression.None,
+    })
+  end)
+  if not ok then
+    return nil, tostring(response)
+  end
+  if not response.Success then
+    return nil, string.format("HTTP %d %s", response.StatusCode, tostring(response.Body or ""))
+  end
+  return response
+end
+
+local function decode(response)
+  if response == nil or type(response.Body) ~= "string" or #response.Body == 0 then
+    return nil
+  end
+  local ok, data = pcall(function()
+    return HttpService:JSONDecode(response.Body)
+  end)
+  if not ok then
+    return nil
+  end
+  return data
+end
+
+-- Publish a frame for the plugin to pick up on its next poll.
+local function post(kind, payload)
+  local body = HttpService:JSONEncode(payload)
+  return send(BASE .. "/" .. kind .. ".json", "POST", body)
+end
+
+local function answer(commandId, result)
+  result.id = commandId
+  post("res", result)
+end
+
+local function readCommands()
+  local listing = decode(send(BASE .. "/cmd.json?shallow=true", "GET"))
+  if type(listing) ~= "table" then
+    return {}
+  end
+  local keys = {}
+  for key in pairs(listing) do
+    table.insert(keys, key)
+  end
+  table.sort(keys)
+  local out = {}
+  for _, key in ipairs(keys) do
+    local entry = decode(send(BASE .. "/cmd/" .. key .. ".json", "GET"))
+    -- claim it before running it: a second read must never repeat the input
+    send(BASE .. "/cmd/" .. key .. ".json", "DELETE")
+    if type(entry) == "table" then
+      table.insert(out, entry)
+    end
+  end
+  return out
+end
+
+-- Pointer/keyboard helper. VirtualInput is the supported path; the older
+-- VirtualInputManager is only used if the Studio build predates it.
+local function getVirtualInput()
+  local ok, input = pcall(function()
+    return UserInputService:CreateVirtualInput()
+  end)
+  if ok and input ~= nil then
+    return { kind = "VirtualInput", handle = input }
+  end
+  local okManager, manager = pcall(function()
+    return game:GetService("VirtualInputManager")
+  end)
+  if okManager and manager ~= nil then
+    return { kind = "VirtualInputManager", handle = manager }
+  end
+  return nil
+end
+
+local KEY_ALIASES = {
+  [" "] = "Space", enter = "Return", esc = "Escape", ctrl = "LeftControl",
+  shift = "LeftShift", alt = "LeftAlt", tab = "Tab", backspace = "Backspace",
+}
+
+local function keyCodeFor(name)
+  local text = tostring(name or "")
+  if #text == 1 then
+    text = string.upper(text)
+  end
+  text = KEY_ALIASES[string.lower(text)] or text
+  local ok, code = pcall(function()
+    return Enum.KeyCode[text]
+  end)
+  if not ok or code == nil then
+    return nil
+  end
+  return code
+end
+
+local function pressKey(vim, name)
+  local code = keyCodeFor(name)
+  if code == nil then
+    return false, "unknown key '" .. tostring(name) .. "'"
+  end
+  if vim.kind == "VirtualInput" then
+    pcall(function()
+      vim.handle:SendKey(true, code)
+      task.wait(0.03)
+      vim.handle:SendKey(false, code)
+    end)
+    return true
+  end
+  pcall(function()
+    vim.handle:SendKeyEvent(true, code, false, game)
+    task.wait(0.03)
+    vim.handle:SendKeyEvent(false, code, false, game)
+  end)
+  return true
+end
+
+local function clickAt(vim, x, y, holdSeconds)
+  local point = Vector2.new(x, y)
+  if vim.kind == "VirtualInput" then
+    pcall(function()
+      vim.handle:SendMousePosition(point)
+      vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, true)
+      task.wait(holdSeconds or 0.06)
+      vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, false)
+    end)
+    return true
+  end
+  pcall(function()
+    vim.handle:SendMouseMoveEvent(x, y, game)
+    vim.handle:SendMouseButtonEvent(x, y, 1, true, game, 0)
+    task.wait(holdSeconds or 0.06)
+    vim.handle:SendMouseButtonEvent(x, y, 1, false, game, 0)
+  end)
+  return true
+end
+
+-- Crop + downscale RGBA into a PNG-friendly payload.
+local function captureScreenshot(args)
+  local maxWidth = tonumber(args and args.maxWidth) or 900
+  local contentId = nil
+  local finished = false
+  CaptureService:CaptureScreenshot(function(id)
+    contentId = id
+    finished = true
+  end)
+  local started = os.clock()
+  while not finished and os.clock() - started &lt; 8 do
+    task.wait(0.1)
+  end
+  if contentId == nil then
+    return { ok = false, error = "CaptureService did not hand back an image (is the viewport visible?)" }
+  end
+  local image = nil
+  local okImage, errImage = pcall(function()
+    image = AssetService:CreateEditableImageAsync(contentId)
+  end)
+  if not okImage or image == nil then
+    return { ok = false, error = "could not read the capture: " .. tostring(errImage) }
+  end
+  local size = image.Size
+  local scale = math.min(1, maxWidth / math.max(1, size.X))
+  local width = math.max(8, math.floor(size.X * scale))
+  local height = math.max(8, math.floor(size.Y * scale))
+  local points = {}
+  local opaque = 0
+  local stepX = size.X / width
+  local stepY = size.Y / height
+  for y = 0, height - 1 do
+    for x = 0, width - 1 do
+      local okPixel, r, g, b, a = pcall(function()
+        local px = image:ReadPixels(Vector2.new(math.floor(x * stepX), math.floor(y * stepY)), Vector2.new(1, 1))
+        return px[1], px[2], px[3], px[4]
+      end)
+      if okPixel and r ~= nil then
+        if (a or 1) &gt; 0.01 then
+          opaque = opaque + 1
+        end
+        table.insert(points, string.format("%d,%d,%d,%d",
+          math.floor((r or 0) * 255), math.floor((g or 0) * 255), math.floor((b or 0) * 255),
+          math.floor((a or 1) * 255)))
+      else
+        table.insert(points, "0,0,0,0")
+      end
+    end
+  end
+  pcall(function()
+    image:Destroy()
+  end)
+  return {
+    ok = true,
+    label = tostring(args and args.label or "viewport"),
+    source = "play",
+    width = width,
+    height = height,
+    format = "rgba-csv",
+    pixels = table.concat(points, ";"),
+    note = "captured from the running play session",
+  }
+end
+
+local handlers = {}
+
+handlers.hello = function()
+  return {
+    ok = true,
+    role = ROLE,
+    place = game.Name,
+    play = RunService:IsRunning(),
+    client = ROLE == "client",
+    camera = workspace.CurrentCamera ~= nil,
+  }
+end
+
+handlers.screenshot = function(args)
+  return captureScreenshot(args)
+end
+
+handlers.click = function(args)
+  local vim = getVirtualInput()
+  if vim == nil then
+    return { ok = false, error = "this Studio build has no virtual input API" }
+  end
+  local ok, err = clickAt(vim, tonumber(args.x), tonumber(args.y), tonumber(args.holdMs) and (tonumber(args.holdMs) / 1000))
+  return { ok = ok, error = err, x = args.x, y = args.y, api = vim.kind }
+end
+
+handlers.input = function(args)
+  local vim = getVirtualInput()
+  if vim == nil then
+    return { ok = false, error = "this Studio build has no virtual input API" }
+  end
+  local sent = {}
+  if type(args.text) == "string" and #args.text &gt; 0 then
+    if vim.kind == "VirtualInput" then
+      pcall(function()
+        vim.handle:SendTextInput(args.text)
+      end)
+    else
+      for i = 1, #args.text do
+        pcall(function()
+          vim.handle:SendTextInputCharacterEvent(string.sub(args.text, i, i), game)
+        end)
+      end
+    end
+    table.insert(sent, "text")
+  end
+  local sequence = args.keys
+  if type(sequence) == "string" then
+    sequence = { sequence }
+  end
+  if type(sequence) == "table" then
+    for _, key in ipairs(sequence) do
+      local ok, err = pressKey(vim, key)
+      if not ok then
+        return { ok = false, error = err, sent = sent }
+      end
+      table.insert(sent, tostring(key))
+      task.wait(tonumber(args.keyDelay) or 0.08)
+    end
+  end
+  if type(args.hold) == "table" then
+    local held = false
+    for _, key in ipairs(args.hold) do
+      local code = keyCodeFor(key)
+      if code ~= nil then
+        pcall(function()
+          if vim.kind == "VirtualInput" then
+            vim.handle:SendKey(true, code)
+          else
+            vim.handle:SendKeyEvent(true, code, false, game)
+          end
+        end)
+        held = true
+      end
+    end
+    if held then
+      task.wait(math.clamp(tonumber(args.holdSeconds) or 1, 0.05, 10))
+      for _, key in ipairs(args.hold) do
+        local code = keyCodeFor(key)
+        if code ~= nil then
+          pcall(function()
+            if vim.kind == "VirtualInput" then
+              vim.handle:SendKey(false, code)
+            else
+              vim.handle:SendKeyEvent(false, code, false, game)
+            end
+          end)
+        end
+      end
+    end
+    table.insert(sent, "hold")
+  end
+  return { ok = true, sent = sent, api = vim.kind }
+end
+
+handlers.look_through = function(args)
+  local target = nil
+  for _, inst in ipairs(game:GetDescendants()) do
+    if inst:GetFullName() == tostring(args.path) then
+      target = inst
+      break
+    end
+  end
+  local camera = workspace.CurrentCamera
+  if camera == nil or target == nil then
+    return { ok = false, error = "target not found in the running session" }
+  end
+  local base
+  if target:IsA("BasePart") then
+    base = target.CFrame
+  elseif target:IsA("Model") then
+    base = target:GetPivot()
+  end
+  if base == nil then
+    return { ok = false, error = "target is not a part or model" }
+  end
+  camera.CameraType = Enum.CameraType.Scriptable
+  camera.CFrame = base * CFrame.new(0, 2, 6) * CFrame.Angles(0, math.rad(180), 0)
+  return { ok = true, target = target:GetFullName() }
+end
+
+handlers.logs = function()
+  local ok, history = pcall(function()
+    return game:GetService("LogService"):GetLogHistory()
+  end)
+  if not ok or type(history) ~= "table" then
+    return { ok = false, error = "no log access in this session" }
+  end
+  local entries = {}
+  for _, entry in ipairs(history) do
+    if type(entry) == "table" then
+      local mtype = tostring(entry.messageType)
+      if mtype == "Enum.MessageType.MessageError" or mtype == "Enum.MessageType.MessageWarning" then
+        table.insert(entries, {
+          type = mtype == "Enum.MessageType.MessageError" and "error" or "warning",
+          message = tostring(entry.message or ""),
+          timestamp = tonumber(entry.timestamp) or 0,
+        })
+      end
+    end
+  end
+  return { ok = true, total = #entries, entries = entries, source = "play" }
+end
+
+-- Small command pump: between frames the driver asks the plugin for anything
+-- queued for it, so input and capture feel immediate.
+local function pump()
+  for _, command in ipairs(readCommands()) do
+    local handler = handlers[command.op]
+    local ok, result = pcall(function()
+      if handler == nil then
+        return { ok = false, error = "unknown guest op " .. tostring(command.op) }
+      end
+      return handler(command.args or {})
+    end)
+    if not ok then
+      result = { ok = false, error = tostring(result) }
+    end
+    if type(result) ~= "table" then
+      result = { ok = false, error = "the handler returned no table" }
+    end
+    answer(command.id, result)
+  end
+end
+
+task.spawn(function()
+  while true do
+    local ok = pcall(pump)
+    task.wait(ok and (ROLE == "client" and 0.2 or 0.4) or 1)
+  end
+end)
+post("hello", { ok = true, role = ROLE, play = RunService:IsRunning(), ts = os.time() })
+]==]
+
+local function buildGuestSource(role)
+	local ok, source = pcall(function()
+		local text = GUEST_TEMPLATE
+		text = string.gsub(text, "@ROLE@", role)
+		text = string.gsub(text, "@RELAY@", FIREBASE_DB)
+		text = string.gsub(text, "@CHANNEL@", tostring(bridge.channel))
+		return text
+	end)
+	if not ok then
+		return nil
+	end
+	return source
+end
+
+-- Built when the play test starts, not when the plugin loads: the channel is
+-- part of the driver's source and the channel can rotate any time.
+local function guestSource(role)
+	return buildGuestSource(role)
+end
 -- ------------------------------------------------------- play test plumbing
 -- A plugin cannot see inside a running play session: play mode runs a copy of
 -- the place. So Golem injects a small driver into the copy, starts a real test
--- session, and the driver phones the same local bridge to do screen capture and
--- virtual input. The driver is removed from the place the moment the session
--- starts, so nothing is left behind.
+-- session, and the driver talks to this plugin through the relay channel to do
+-- screen capture and virtual input. The driver only exists for the length of the
+-- test session.
 
 local GuestService = {}
 GuestService.clientReady = false
 GuestService.serverReady = false
 GuestService.sessionId = nil
 
+-- Ask the in-game driver to do something and wait for its result. The request
+-- lands on that role's lane in the relay channel; the driver polls it, runs the
+-- op, and posts one reply back.
 local function guestExec(role, op, args, timeoutSec)
-	if bridge.mode == nil or bridge.mode == "none" then
-		return { ok = false, error = "not linked to golem-bridge - run the setup line in your AI's terminal" }
+	if bridge.channel == nil then
+		return { ok = false, error = "not linked - the relay channel does not exist yet" }
 	end
-	local body = encodeBody({
-		role = role,
+	local base = guestBase(role)
+	local id = "g" .. randomHex(8)
+	local body, encodeErr = encodeBody({
+		id = id,
 		op = op,
 		args = args or {},
 		timeoutMs = math.floor((timeoutSec or 20) * 1000),
 	})
 	if body == nil then
-		return { ok = false, error = "could not encode the guest request" }
+		return { ok = false, error = "could not encode the driver request: " .. tostring(encodeErr) }
 	end
-	local path = "/v1/guest/exec"
-	local headers = {
-		["Content-Type"] = "application/json",
-		["X-Golem-Secret"] = bridge.deviceSecret or "",
-	}
-	local response, err = request({
-		url = transportUrl(path),
+	local posted, postErr = request({
+		url = base .. "/cmd.json",
 		method = "POST",
 		body = body,
-		headers = headers,
+		headers = { ["Content-Type"] = "application/json" },
 	})
-	if response == nil then
-		return { ok = false, error = "bridge unreachable: " .. tostring(err) }
+	if posted == nil then
+		return { ok = false, error = "relay unreachable: " .. tostring(postErr) }
 	end
-	local data = decodeBody(response)
-	if type(data) ~= "table" then
-		return { ok = false, error = "bridge sent an unreadable reply" }
+	-- Grab our own push key: anything older than it cannot be our answer.
+	local sinceKey = nil
+	local okKey, keyData = pcall(function()
+		return HttpService:JSONDecode(posted.Body or "")
+	end)
+	if okKey and type(keyData) == "table" and type(keyData.name) == "string" then
+		sinceKey = keyData.name
 	end
-	return data
+	local started = os.clock()
+	local budget = math.min(tonumber(timeoutSec) or 20, 60)
+	while os.clock() - started &lt; budget do
+		local listing = request({ url = base .. "/res.json?shallow=true" })
+		local keys = listing ~= nil and decodeBody(listing) or nil
+		if type(keys) == "table" then
+			local sorted = {}
+			for key in pairs(keys) do
+				table.insert(sorted, key)
+			end
+			table.sort(sorted)
+			for _, key in ipairs(sorted) do
+				if sinceKey == nil or key &gt; sinceKey then
+					local entryResp = request({ url = base .. "/res/" .. key .. ".json" })
+					local entry = entryResp ~= nil and decodeBody(entryResp) or nil
+					if type(entry) == "table" and entry.id == id then
+						pcall(function()
+							request({ url = base .. "/res/" .. key .. ".json", method = "DELETE" })
+						end)
+						-- the driver's own payload is the result; its ok/error stay
+						-- on the wrapper so every caller reads the same shape
+						return { ok = entry.ok == true, error = entry.error, result = entry }
+					end
+				end
+			end
+		end
+		task.wait(0.3)
+	end
+	return { ok = false, error = string.format("no answer from the %s driver within %d s", tostring(role), budget) }
 end
 
 -- Does the running game have a driver checking in?
@@ -3555,7 +3993,7 @@ local function installDriver()
 	removeDriver()
 	local client = Instance.new("Script")
 	client.Name = DRIVER_CLIENT_NAME
-	client.Source = GUEST_CLIENT_SOURCE
+	client.Source = guestSource("client") or ""
 	client.Disabled = false
 	pcall(function()
 		client.RunContext = Enum.RunContext.Client
@@ -3564,7 +4002,7 @@ local function installDriver()
 
 	local server = Instance.new("Script")
 	server.Name = DRIVER_SERVER_NAME
-	server.Source = GUEST_SERVER_SOURCE
+	server.Source = guestSource("server") or ""
 	server.Disabled = false
 	pcall(function()
 		server.RunContext = Enum.RunContext.Server
@@ -3578,25 +4016,34 @@ function OPS.debug()
 		plugin = PLUGIN_TITLE,
 		version = VERSION,
 		studio = STUDIO_VERSION,
-		transport = bridge.mode,
-		port = bridge.port,
-		deviceId = bridge.deviceId,
-		cursor = bridge.cursor,
+		transport = "relay",
+		relay = FIREBASE_DB,
+		channel = bridge.channel,
+		deviceId = bridge.channel, -- kept for older CLI wording
+		pollInterval = bridge.interval,
+		lastPollMsAgo = bridge.lastPollAt &gt; 0 and math.floor((os.clock() - bridge.lastPollAt) * 1000) or nil,
+		lastError = bridge.lastError,
 		httpEnabled = HttpService.HttpEnabled,
 		uptimeSeconds = math.floor(os.clock() - state.startedAt + 0.5),
 		commandsServed = state.commandsServed,
 		errors = state.errors,
+		queuedResults = #pendingResults,
+		publishError = state.publishError,
 		place = game.Name,
 		playRunning = RunService:IsRunning(),
 		turn = turnNumber,
 		historyEvents = #chatEvents,
 		marketplace = "agent-side (npx golem-bridge search/info)",
 	}
-	if bridge.mode == "local" then
-		local before = state.connected
-		local ok = linkLocal()
-		report.relink = ok and "ok" or "failed"
-		report.connected = state.connected or before
+
+	-- Prove the relay is actually readable and writable from this Studio, not
+	-- just that a URL exists. A marker goes out and has to come back.
+	local marker = "debug-" .. tostring(os.clock())
+	local okPost = relayDeliver({ op = "debug", v = VERSION, ts = os.time(), marker = marker })
+	report.relayPublish = okPost and "ok" or "failed"
+	if okPost then
+		local listing = request({ url = resUrl() .. ".json?shallow=true" })
+		report.relayRead = listing ~= nil and "ok" or "read failed"
 	end
 	if RunService:IsRunning() then
 		report.driver = guestStatus()
@@ -3949,411 +4396,6 @@ function OPS.playstate()
 	status.playStartedAt = state.playStartedAt
 	return status
 end
--- ------------------------------------------------------- in-session driver
--- Source for the two scripts injected for the duration of a play test. They are
--- plain Roblox scripts (they run inside the game, not as plugins), so they can
--- use CaptureService and UserInputService:CreateVirtualInput() - the same APIs
--- Studio's own playtest automation uses. They never touch anything outside the
--- test session and are destroyed as soon as it starts.
-
-local GUEST_TEMPLATE = [==[
-local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local CaptureService = game:GetService("CaptureService")
-local AssetService = game:GetService("AssetService")
-local ScriptContext = game:GetService("ScriptContext")
-
-local ROLE = "@ROLE@"
-local MODE = "@MODE@"
-local PORT = @PORT@
-local DEVICE = "@DEVICE@"
-local SECRET = "@SECRET@"
-
--- The driver speaks to the same local bridge the plugin uses: this machine only.
-local function endpoint(path, query)
-  local q = query or ""
-  return string.format("http://127.0.0.1:%d%s", PORT, path) .. (#q &gt; 0 and ("?" .. q) or "")
-end
-
-local function call(op, args, timeoutMs)
-  local body = HttpService:JSONEncode({ role = ROLE, op = op, args = args or {}, timeoutMs = timeoutMs })
-  local ok, response = pcall(function()
-    return HttpService:RequestAsync({
-      Url = endpoint("/v1/guest/exec"),
-      Method = "POST",
-      Body = body,
-      Headers = {
-        ["Content-Type"] = "application/json",
-        ["X-Golem-Secret"] = SECRET,
-        ["X-Golem-Role"] = ROLE,
-      },
-      Compress = Enum.HttpCompression.None,
-    })
-  end)
-  if not ok then
-    return { ok = false, error = tostring(response) }
-  end
-  if not response.Success then
-    return { ok = false, error = string.format("HTTP %d %s", response.StatusCode, tostring(response.Body or "")) }
-  end
-  local decoded
-  local okDecode, data = pcall(function()
-    return HttpService:JSONDecode(response.Body)
-  end)
-  if not okDecode or type(data) ~= "table" then
-    return { ok = false, error = "unreadable bridge reply" }
-  end
-  decoded = data
-  return decoded
-end
-
--- Pointer/keyboard helper. VirtualInput is the supported path; the older
--- VirtualInputManager is only used if the Studio build predates it.
-local function getVirtualInput()
-  local ok, input = pcall(function()
-    return UserInputService:CreateVirtualInput()
-  end)
-  if ok and input ~= nil then
-    return { kind = "VirtualInput", handle = input }
-  end
-  local okManager, manager = pcall(function()
-    return game:GetService("VirtualInputManager")
-  end)
-  if okManager and manager ~= nil then
-    return { kind = "VirtualInputManager", handle = manager }
-  end
-  return nil
-end
-
-local KEY_ALIASES = {
-  [" "] = "Space", enter = "Return", esc = "Escape", ctrl = "LeftControl",
-  shift = "LeftShift", alt = "LeftAlt", tab = "Tab", backspace = "Backspace",
-}
-
-local function keyCodeFor(name)
-  local text = tostring(name or "")
-  if #text == 1 then
-    text = string.upper(text)
-  end
-  text = KEY_ALIASES[string.lower(text)] or text
-  local ok, code = pcall(function()
-    return Enum.KeyCode[text]
-  end)
-  if not ok or code == nil then
-    return nil
-  end
-  return code
-end
-
-local function pressKey(vim, name)
-  local code = keyCodeFor(name)
-  if code == nil then
-    return false, "unknown key '" .. tostring(name) .. "'"
-  end
-  if vim.kind == "VirtualInput" then
-    pcall(function()
-      vim.handle:SendKey(true, code)
-      task.wait(0.03)
-      vim.handle:SendKey(false, code)
-    end)
-    return true
-  end
-  pcall(function()
-    vim.handle:SendKeyEvent(true, code, false, game)
-    task.wait(0.03)
-    vim.handle:SendKeyEvent(false, code, false, game)
-  end)
-  return true
-end
-
-local function clickAt(vim, x, y, holdSeconds)
-  local point = Vector2.new(x, y)
-  if vim.kind == "VirtualInput" then
-    pcall(function()
-      vim.handle:SendMousePosition(point)
-      vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, true)
-      task.wait(holdSeconds or 0.06)
-      vim.handle:SendMouseButton(point, Enum.UserInputType.MouseButton1, false)
-    end)
-    return true
-  end
-  pcall(function()
-    vim.handle:SendMouseMoveEvent(x, y, game)
-    vim.handle:SendMouseButtonEvent(x, y, 1, true, game, 0)
-    task.wait(holdSeconds or 0.06)
-    vim.handle:SendMouseButtonEvent(x, y, 1, false, game, 0)
-  end)
-  return true
-end
-
--- Crop + downscale RGBA into a PNG-friendly payload.
-local function captureScreenshot(args)
-  local maxWidth = tonumber(args and args.maxWidth) or 900
-  local contentId = nil
-  local finished = false
-  CaptureService:CaptureScreenshot(function(id)
-    contentId = id
-    finished = true
-  end)
-  local started = os.clock()
-  while not finished and os.clock() - started &lt; 8 do
-    task.wait(0.1)
-  end
-  if contentId == nil then
-    return { ok = false, error = "CaptureService did not hand back an image (is the viewport visible?)" }
-  end
-  local image = nil
-  local okImage, errImage = pcall(function()
-    image = AssetService:CreateEditableImageAsync(contentId)
-  end)
-  if not okImage or image == nil then
-    return { ok = false, error = "could not read the capture: " .. tostring(errImage) }
-  end
-  local size = image.Size
-  local scale = math.min(1, maxWidth / math.max(1, size.X))
-  local width = math.max(8, math.floor(size.X * scale))
-  local height = math.max(8, math.floor(size.Y * scale))
-  local points = {}
-  local opaque = 0
-  local stepX = size.X / width
-  local stepY = size.Y / height
-  for y = 0, height - 1 do
-    for x = 0, width - 1 do
-      local okPixel, r, g, b, a = pcall(function()
-        local px = image:ReadPixels(Vector2.new(math.floor(x * stepX), math.floor(y * stepY)), Vector2.new(1, 1))
-        return px[1], px[2], px[3], px[4]
-      end)
-      if okPixel and r ~= nil then
-        if (a or 1) &gt; 0.01 then
-          opaque = opaque + 1
-        end
-        table.insert(points, string.format("%d,%d,%d,%d",
-          math.floor((r or 0) * 255), math.floor((g or 0) * 255), math.floor((b or 0) * 255),
-          math.floor((a or 1) * 255)))
-      else
-        table.insert(points, "0,0,0,0")
-      end
-    end
-  end
-  pcall(function()
-    image:Destroy()
-  end)
-  return {
-    ok = true,
-    label = tostring(args and args.label or "viewport"),
-    source = "play",
-    width = width,
-    height = height,
-    format = "rgba-csv",
-    pixels = table.concat(points, ";"),
-    note = "captured from the running play session",
-  }
-end
-
-local handlers = {}
-
-handlers.hello = function()
-  return {
-    ok = true,
-    role = ROLE,
-    place = game.Name,
-    play = RunService:IsRunning(),
-    client = ROLE == "client",
-    camera = workspace.CurrentCamera ~= nil,
-  }
-end
-
-handlers.screenshot = function(args)
-  return captureScreenshot(args)
-end
-
-handlers.click = function(args)
-  local vim = getVirtualInput()
-  if vim == nil then
-    return { ok = false, error = "this Studio build has no virtual input API" }
-  end
-  local ok, err = clickAt(vim, tonumber(args.x), tonumber(args.y), tonumber(args.holdMs) and (tonumber(args.holdMs) / 1000))
-  return { ok = ok, error = err, x = args.x, y = args.y, api = vim.kind }
-end
-
-handlers.input = function(args)
-  local vim = getVirtualInput()
-  if vim == nil then
-    return { ok = false, error = "this Studio build has no virtual input API" }
-  end
-  local sent = {}
-  if type(args.text) == "string" and #args.text &gt; 0 then
-    if vim.kind == "VirtualInput" then
-      pcall(function()
-        vim.handle:SendTextInput(args.text)
-      end)
-    else
-      for i = 1, #args.text do
-        pcall(function()
-          vim.handle:SendTextInputCharacterEvent(string.sub(args.text, i, i), game)
-        end)
-      end
-    end
-    table.insert(sent, "text")
-  end
-  local sequence = args.keys
-  if type(sequence) == "string" then
-    sequence = { sequence }
-  end
-  if type(sequence) == "table" then
-    for _, key in ipairs(sequence) do
-      local ok, err = pressKey(vim, key)
-      if not ok then
-        return { ok = false, error = err, sent = sent }
-      end
-      table.insert(sent, tostring(key))
-      task.wait(tonumber(args.keyDelay) or 0.08)
-    end
-  end
-  if type(args.hold) == "table" then
-    local held = false
-    for _, key in ipairs(args.hold) do
-      local code = keyCodeFor(key)
-      if code ~= nil then
-        pcall(function()
-          if vim.kind == "VirtualInput" then
-            vim.handle:SendKey(true, code)
-          else
-            vim.handle:SendKeyEvent(true, code, false, game)
-          end
-        end)
-        held = true
-      end
-    end
-    if held then
-      task.wait(math.clamp(tonumber(args.holdSeconds) or 1, 0.05, 10))
-      for _, key in ipairs(args.hold) do
-        local code = keyCodeFor(key)
-        if code ~= nil then
-          pcall(function()
-            if vim.kind == "VirtualInput" then
-              vim.handle:SendKey(false, code)
-            else
-              vim.handle:SendKeyEvent(false, code, false, game)
-            end
-          end)
-        end
-      end
-    end
-    table.insert(sent, "hold")
-  end
-  return { ok = true, sent = sent, api = vim.kind }
-end
-
-handlers.look_through = function(args)
-  local target = nil
-  for _, inst in ipairs(game:GetDescendants()) do
-    if inst:GetFullName() == tostring(args.path) then
-      target = inst
-      break
-    end
-  end
-  local camera = workspace.CurrentCamera
-  if camera == nil or target == nil then
-    return { ok = false, error = "target not found in the running session" }
-  end
-  local base
-  if target:IsA("BasePart") then
-    base = target.CFrame
-  elseif target:IsA("Model") then
-    base = target:GetPivot()
-  end
-  if base == nil then
-    return { ok = false, error = "target is not a part or model" }
-  end
-  camera.CameraType = Enum.CameraType.Scriptable
-  camera.CFrame = base * CFrame.new(0, 2, 6) * CFrame.Angles(0, math.rad(180), 0)
-  return { ok = true, target = target:GetFullName() }
-end
-
-handlers.logs = function()
-  local ok, history = pcall(function()
-    return game:GetService("LogService"):GetLogHistory()
-  end)
-  if not ok or type(history) ~= "table" then
-    return { ok = false, error = "no log access in this session" }
-  end
-  local entries = {}
-  for _, entry in ipairs(history) do
-    if type(entry) == "table" then
-      local mtype = tostring(entry.messageType)
-      if mtype == "Enum.MessageType.MessageError" or mtype == "Enum.MessageType.MessageWarning" then
-        table.insert(entries, {
-          type = mtype == "Enum.MessageType.MessageError" and "error" or "warning",
-          message = tostring(entry.message or ""),
-          timestamp = tonumber(entry.timestamp) or 0,
-        })
-      end
-    end
-  end
-  return { ok = true, total = #entries, entries = entries, source = "play" }
-end
-
--- Small command pump: the driver asks the bridge "anything for me?" between
--- frames so input and capture feel immediate.
-local function pump()
-  local reply = call("poll", nil, 5000)
-  if reply.ok and type(reply.result) == "table" and type(reply.result.commands) == "table" then
-    for _, command in ipairs(reply.result.commands) do
-      local handler = handlers[command.op]
-      local ok, result = pcall(function()
-        if handler == nil then
-          return { ok = false, error = "unknown guest op " .. tostring(command.op) }
-        end
-        return handler(command.args or {})
-      end)
-      if not ok then
-        result = { ok = false, error = tostring(result) }
-      end
-      result.id = command.id
-      call("result", result, 5000)
-    end
-  end
-end
-
-if ROLE == "client" then
-  task.spawn(function()
-    while true do
-      local ok = pcall(pump)
-      task.wait(ok and 0.15 or 1)
-    end
-  end)
-  call("hello", nil, 5000)
-else
-  task.spawn(function()
-    while true do
-      local ok = pcall(pump)
-      task.wait(ok and 0.3 or 1)
-    end
-  end)
-  call("hello", nil, 5000)
-end
-]==]
-
-local function buildGuestSource(role)
-	local ok, source = pcall(function()
-		local text = GUEST_TEMPLATE
-		text = string.gsub(text, "@ROLE@", role)
-		text = string.gsub(text, "@MODE@", bridge.mode or "local")
-		text = string.gsub(text, "@PORT@", tostring(bridge.port or DEFAULT_PORT))
-		text = string.gsub(text, "@DEVICE@", bridge.deviceId or "")
-		text = string.gsub(text, "@SECRET@", bridge.deviceSecret or "")
-		return text
-	end)
-	if not ok then
-		return nil
-	end
-	return source
-end
-
-GUEST_CLIENT_SOURCE = buildGuestSource("client") or ""
-GUEST_SERVER_SOURCE = buildGuestSource("server") or ""
 function OPS.rename(args)
  local inst = resolveStrict(args.path)
  local name = args.name
@@ -5220,8 +5262,19 @@ function http(request)
 end
 
 -- ---------------------------------------------------------------- transport
--- Studio polls the CLI for a batch of commands and posts one result back. That
--- is the whole wire protocol; there is no third-party service in the middle.
+-- The relay. This plugin can only make outgoing calls, and the AI driving it
+-- may be a cloud sandbox that cannot reach this computer, so both sides meet at
+-- a Firebase Realtime Database:
+--
+--   channels/&lt;id&gt;/cmd       the AI's commands land here; we poll, run, delete
+--   channels/&lt;id&gt;/res       our results go here; the AI reads its own id
+--   channels/&lt;id&gt;/beacons   hello / revoked, so `golem-bridge status` can tell
+--                           "Studio is closed" from "that line is from an old
+--                           session"
+--   channels/&lt;id&gt;/guest/*   the play-test driver's private request/reply lane
+--
+-- The channel id is the whole capability. It is minted per Studio session, so a
+-- line pasted into a chat is worthless once that session ends.
 
 local generation = 0
 
@@ -5232,104 +5285,266 @@ local PLAY_SAFE = {
 	logs = true, click = true, input = true, look_through = true, play = true,
 }
 
-local MAX_RESULT_BYTES = 400000
+-- Firebase caps a write around 1 MB; stay well under it so a big reply becomes a
+-- clear error instead of an opaque HTTP 400.
+local RELAY_MAX_RESULT = 900000
 -- A single command may run for at most this long before the loop gives up on it.
 local COMMAND_TIMEOUT_SECONDS = 180
 
-local function publishResult(env)
+-- Results that could not be published yet (relay throttling, network blip).
+-- They are retried in order; a command must never look like it did nothing.
+local pendingResults = {}
+
+local function relayPublish(env)
+	-- Roblox's JSONEncode is not always re-entrant on deep tables, and the AI
+	-- side expects a plain string for anything big, so pack the result once.
+	if type(env.result) == "table" and not env.resultEncoded then
+		local okPack, packed = pcall(function()
+			return HttpService:JSONEncode(sanitizeEnvelope(env.result, 0))
+		end)
+		if okPack and type(packed) == "string" then
+			env.resultEncoded = true
+			env.result = packed
+		end
+	end
 	local body = encodeBody(env)
 	if body == nil then
 		return nil, "could not encode the result"
 	end
-	if #body &gt; MAX_RESULT_BYTES then
-		body = HttpService:JSONEncode({
+	if #body &gt; RELAY_MAX_RESULT then
+		env = {
 			id = env.id,
 			ok = false,
-			op = env.op,
+			v = VERSION,
 			error = string.format(
-				"the result was %d KB, too large for one Studio phone-home. Narrow the query (path, max, depth) and retry.",
+				"the result was %d KB - too large to send from Studio. Narrow the query (path, scope, max, depth) and retry.",
 				math.floor(#body / 1024)),
-		})
+		}
+		body = encodeBody(env) or "{}"
 	end
 	return request({
-		url = transportUrl("/v1/result"),
+		url = resUrl() .. ".json",
 		method = "POST",
 		body = body,
-		headers = {
-			["Content-Type"] = "application/json",
-			["X-Golem-Secret"] = bridge.deviceSecret or "",
-		},
+		headers = { ["Content-Type"] = "application/json" },
 	})
 end
 
-local function deliver(env)
-	local response, err = publishResult(env)
-	if response == nil then
-		state.publishError = tostring(err)
-		log("could not deliver the result: " .. tostring(err))
-	else
-		state.publishError = nil
-	end
-	updateStatus()
-	return response ~= nil
+-- Keep the result lane short: the AI polls it, so old replies only cost time.
+local function relayTrimRes()
+	task.spawn(function()
+		local resp = request({ url = resUrl() .. ".json?shallow=true" })
+		if resp == nil then
+			return
+		end
+		local keys = decodeBody(resp)
+		if type(keys) ~= "table" then
+			return
+		end
+		local sorted = {}
+		for key in pairs(keys) do
+			table.insert(sorted, key)
+		end
+		if #sorted &lt;= 15 then
+			return
+		end
+		table.sort(sorted)
+		for i = 1, #sorted - 15 do
+			pcall(function()
+				request({ url = resUrl() .. "/" .. sorted[i] .. ".json", method = "DELETE" })
+			end)
+		end
+	end)
 end
 
-local function handleCommand(cmd)
+local function relayDeliver(env)
+	local resp, err = relayPublish(env)
+	if resp == nil then
+		if #pendingResults &lt; 25 then
+			table.insert(pendingResults, { env = env, fails = 0 })
+		end
+		state.publishError = tostring(err)
+		log("relay: result publish failed: " .. tostring(err))
+	else
+		state.publishError = nil
+		relayTrimRes()
+	end
+	updateStatus()
+	return resp ~= nil
+end
+
+local function relayFlushPending()
+	while #pendingResults &gt; 0 do
+		local pending = pendingResults[1]
+		local resp, err = relayPublish(pending.env)
+		if resp ~= nil then
+			table.remove(pendingResults, 1)
+			state.publishError = nil
+		elseif string.find(tostring(err), "HTTP 429", 1, true) then
+			state.publishError = tostring(err) .. " (relay is throttling; results are queued)"
+			updateStatus()
+			return
+		else
+			pending.fails = (pending.fails or 0) + 1
+			if pending.fails &gt;= 2 then
+				if pending.env.id ~= nil and not pending.swapped then
+					-- The command ran; only the reply could not travel. Say so, or
+					-- the AI will retry an edit that already happened.
+					pending.swapped = true
+					pending.fails = 0
+					pending.env = {
+						id = pending.env.id,
+						ok = false,
+						v = VERSION,
+						error = string.format(
+							"the command ran, but its result could not reach the relay (%s). Confirm the change with `list`/`read` before repeating it.",
+							tostring(err)),
+					}
+				else
+					table.remove(pendingResults, 1)
+					log("relay: dropped an undeliverable result: " .. tostring(err))
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+	updateStatus()
+end
+
+local function relayBeaconPost(channelId, env)
+	if type(channelId) ~= "string" or #channelId &lt; 8 then
+		return
+	end
+	pcall(function()
+		local body = encodeBody(env)
+		if body ~= nil then
+			request({
+				url = beaconUrl(channelId) .. ".json",
+				method = "POST",
+				body = body,
+				headers = { ["Content-Type"] = "application/json" },
+			})
+		end
+	end)
+	-- keep the last few beacons only
+	task.spawn(function()
+		local resp = request({ url = beaconUrl(channelId) .. ".json?shallow=true" })
+		if resp == nil then
+			return
+		end
+		local keys = decodeBody(resp)
+		if type(keys) ~= "table" then
+			return
+		end
+		local sorted = {}
+		for key in pairs(keys) do
+			table.insert(sorted, key)
+		end
+		if #sorted &lt;= 5 then
+			return
+		end
+		table.sort(sorted)
+		for i = 1, #sorted - 5 do
+			pcall(function()
+				request({ url = beaconUrl(channelId) .. "/" .. sorted[i] .. ".json", method = "DELETE" })
+			end)
+		end
+	end)
+end
+
+local function relayBeacon(op, extra)
+	local env = { op = op, v = VERSION, ts = os.time() }
+	if type(extra) == "table" then
+		for key, value in pairs(extra) do
+			env[key] = value
+		end
+	end
+	relayBeaconPost(bridge.channel, env)
+	bridge.beaconSentAt = os.clock()
+end
+
+-- Wipe a channel and tell anyone listening on it that it is gone, so a stale
+-- setup line in a chat produces "ask for a fresh line" instead of silence.
+local function relayRetireChannel(channelId)
+	if type(channelId) ~= "string" or #channelId &lt; 8 then
+		return
+	end
+	relayBeaconPost(channelId, { op = "revoked", v = VERSION, ts = os.time() })
+	task.spawn(function()
+		pcall(function()
+			request({ url = FIREBASE_DB .. "/channels/" .. channelId .. ".json", method = "DELETE" })
+		end)
+	end)
+end
+
+local function relayHandleMessage(cmd)
 	if type(cmd) ~= "table" then
+		log("relay: ignored a non-object on the command channel")
 		return
 	end
 	if cmd.id == nil or type(cmd.op) ~= "string" then
 		if cmd.id ~= nil then
-			deliver({ id = cmd.id, ok = false, error = "a command needs a string 'op' and an 'id'" })
+			relayDeliver({ id = cmd.id, ok = false, error = "a command needs a string 'op' and an 'id'" })
+		else
+			log("relay: ignored a command without an id")
 		end
 		return
 	end
 	state.commandsServed = state.commandsServed + 1
 	if not RunService:IsEdit() and not PLAY_SAFE[cmd.op] then
-		deliver({
+		relayDeliver({
 			id = cmd.id,
 			op = cmd.op,
 			ok = false,
-			error = "the game is running - `stop` the play test before editing the place (screenshot, click, input, and logs work while it runs)",
+			v = VERSION,
+			error = "the game is running - `stop` the play test before editing the place (screenshot, click, input, logs, and playstate work while it runs)",
 		})
 		return
 	end
-	-- Every request from the AI carries the same token on all of its commands.
-	-- Seeing a new token means a new request, so the turn opens right now - the
-	-- first tool of a request lands in its own turn instead of the previous one.
-	if type(cmd.turn) == "string" and #cmd.turn &gt; 0 then
-		beginTurnFor(cmd.turn)
+	-- Every command of one AI request carries the same token, so a new token
+	-- means a new request: the turn opens right now and the first tool of that
+	-- request already lands in its own turn.
+	local turnToken = nil
+	if type(cmd.args) == "table" and type(cmd.args.__turn) == "string" and #cmd.args.__turn &gt; 0 then
+		turnToken = cmd.args.__turn
+		cmd.args.__turn = nil
+	end
+	if turnToken ~= nil then
+		beginTurnFor(turnToken)
 	end
 	local envelopeTurn = turnNumber
 	local chatRow = nil
 	if cmd.op ~= "ping" and cmd.op ~= "screenshot" and cmd.op ~= "play" and cmd.op ~= "stop" then
 		chatRow = addChatCommand(cmd.op, cmd.args)
-		-- the row decides whether a new turn opens, so read the counter after it
 		envelopeTurn = turnNumber
 	end
+
 	local envelope = nil
-	local done = false
+	local finished = false
 	task.spawn(function()
 		if chatRow ~= nil then
 			task.wait()
 		end
 		envelope = executeCommand(cmd)
-		done = true
+		finished = true
 	end)
-	local startedAt = os.clock()
-	while not done and (os.clock() - startedAt) &lt; COMMAND_TIMEOUT_SECONDS do
-		task.wait(0.05)
+	local startedAt = os.time()
+	while not finished and os.time() - startedAt &lt; COMMAND_TIMEOUT_SECONDS do
+		task.wait(0.1)
 	end
-	if not done then
+	if not finished then
 		envelope = {
 			id = cmd.id,
 			op = cmd.op,
 			ok = false,
-			error = string.format("'%s' did not finish within %d s - it may be stuck. Restarting Studio clears stuck ops.",
+			v = VERSION,
+			error = string.format(
+				"'%s' did not finish within %d s - it may be stuck. Restarting Studio clears stuck ops.",
 				tostring(cmd.op), COMMAND_TIMEOUT_SECONDS),
 		}
 	end
-	envelope = envelope or { id = cmd.id, op = cmd.op, ok = false, error = "the command returned no result" }
+	envelope = envelope or { id = cmd.id, ok = false, op = cmd.op, error = "the command returned no result" }
+	envelope.v = VERSION
 	envelope.turn = envelopeTurn
 	envelope.turnTools = currentTurn ~= nil and currentTurn.count or 0
 	if chatRow ~= nil then
@@ -5343,96 +5558,141 @@ local function handleCommand(cmd)
 		state.errors = state.errors + 1
 		log(string.format("ERR %s: %s", tostring(cmd.op), tostring(envelope.error)))
 	end
-	deliver(envelope)
+	relayDeliver(envelope)
 end
 
--- One poll: ask for the next batch, run everything in it, return the cursor.
+-- One poll: ask only for keys newer than the last one we handled, so a chatty
+-- channel never costs a growing download.
 local function pollOnce()
-	local query = string.format("device=%s", HttpService:UrlEncode(bridge.deviceId or ""))
-	if bridge.cursor ~= nil and #bridge.cursor &gt; 0 then
-		query = query .. "&amp;cursor=" .. HttpService:UrlEncode(bridge.cursor)
+	local query = ".json?orderBy=" .. HttpService:UrlEncode('"$key"') .. "&amp;limitToLast=25"
+	if bridge.lastMessageKey ~= nil then
+		query = query .. "&amp;startAt=" .. HttpService:UrlEncode('"' .. bridge.lastMessageKey .. '"')
 	end
-	-- Let the bridge hold this poll open until it has work or the request goes
-	-- quiet. Holding it is what makes tool calls instant and keeps the link
-	-- chatty enough for both sides to notice a dead session quickly.
-	query = query .. "&amp;wait=2000"
-	local response, err = request({
-		url = transportUrl("/v1/poll", query),
-		method = "GET",
-		headers = { ["X-Golem-Secret"] = bridge.deviceSecret or "" },
-	})
-	if response == nil then
+	local resp, err = request({ url = cmdUrl() .. query })
+	if resp == nil then
 		return nil, tostring(err)
 	end
-	local data = decodeBody(response)
+	bridge.okStreak = bridge.okStreak + 1
+	if bridge.okStreak &gt;= 12 then
+		-- quiet and healthy: back the cadence off to the floor
+		bridge.interval = math.max(2, bridge.interval - 1)
+		bridge.okStreak = 0
+	end
+	setConnected(true, nil)
+	local body = resp.Body
+	if type(body) ~= "string" or #body == 0 or body == "null" then
+		return true, nil
+	end
+	local data = decodeBody(resp)
 	if type(data) ~= "table" then
 		return true, nil
 	end
-	if type(data.cursor) == "string" then
-		bridge.cursor = data.cursor
+	local keys = {}
+	for key in pairs(data) do
+		table.insert(keys, key)
 	end
-	if data.reconnect == true then
-		return nil, "the golem-bridge server restarted - re-linking"
-	end
-	local commands = data.commands
-	if type(commands) == "table" then
-		for _, cmd in ipairs(commands) do
-			local ok, errHandle = pcall(handleCommand, cmd)
-			if not ok then
-				state.errors = state.errors + 1
-				log("command '" .. tostring(cmd and cmd.op) .. "' crashed the handler: " .. tostring(errHandle))
+	table.sort(keys)
+	local skipped = 0
+	for _, key in ipairs(keys) do
+		local cmd = data[key]
+		if key ~= bridge.lastMessageKey then
+			local isOld = type(cmd) == "table" and type(cmd.ts) == "number" and cmd.ts &lt; bridge.skipBefore
+			if type(cmd) == "table" and not isOld then
+				local okHandle, errHandle = pcall(relayHandleMessage, cmd)
+				if not okHandle then
+					state.errors = state.errors + 1
+					log("relay: command '" .. tostring(cmd.op) .. "' crashed: " .. tostring(errHandle))
+					if cmd.id ~= nil then
+						pcall(function()
+							relayDeliver({
+								id = cmd.id,
+								ok = false,
+								op = tostring(cmd.op),
+								error = "plugin internal error, command dropped: " .. tostring(errHandle),
+							})
+						end)
+					end
+				end
+			else
+				skipped = skipped + 1
 			end
+			-- Always consume the key, even a skipped one, so the loop moves on.
+			pcall(function()
+				request({ url = cmdUrl() .. "/" .. key .. ".json", method = "DELETE" })
+			end)
 		end
+		bridge.lastMessageKey = key
+	end
+	if skipped &gt; 0 then
+		log("relay: ignored " .. skipped .. " command(s) left over from before this session started")
 	end
 	return true, nil
 end
 
--- The bridge loop. Keeps running for the life of the plugin; re-links on its
--- own when the CLI restarts.
-local function bridgeLoop(myGeneration)
-	local lastHeartbeat = 0
+-- The polling loop. Runs for the life of the plugin. During a play test it keeps
+-- polling: the screen, input, and log tools still have to reach us, and the
+-- in-game driver needs its lane served.
+local function relayLoop(myGeneration)
+	log(string.format("relay: live on channel %s (every ~%ds)", tostring(bridge.channel), bridge.interval))
 	while myGeneration == generation do
-		-- Keep polling in both modes: during a play test the screenshot, input,
-		-- and log tools still have to reach the plugin, and the driver inside the
-		-- game needs the bridge to be live. Edit ops are refused per command
-		-- instead of stalling the whole link.
-		local now = os.clock()
-		if now - lastHeartbeat &gt; 45 then
-			lastHeartbeat = now
-			heartbeat()
-		end
+		relayFlushPending()
 		local ok, err = pollOnce()
 		if ok then
-			bridge.failStreak = 0
-			setConnected(true, nil)
-			bridge.interval = 0.45
+			bridge.lastError = nil
+			bridge.lastPollAt = os.clock()
 			task.wait(bridge.interval)
 		else
-			bridge.failStreak = bridge.failStreak + 1
-			bridge.interval = math.min(0.45 * bridge.failStreak, 4)
-			if bridge.failStreak == 6 then
-				setConnected(false, tostring(err))
+			local e = tostring(err)
+			bridge.lastError = e
+			bridge.okStreak = 0
+			ensureHttpEnabled()
+			setConnected(false, e)
+			if string.find(e, "HTTP 429", 1, true) then
+				bridge.interval = math.min(bridge.interval * 2 + 1, 25)
+				log(string.format("relay: rate limited - polling every %ds now", bridge.interval))
+			elseif string.find(e, "Http requests are not enabled", 1, true) then
+				bridge.interval = 10
+			else
+				bridge.interval = 2
 			end
-			task.wait(bridge.interval)
+			task.wait(math.max(1, bridge.interval / 2))
 		end
 	end
 end
 
 local function startBridge()
 	ensureHttpEnabled()
+	ensureIdentity()
+	if bridge.previousChannel ~= nil then
+		local old = bridge.previousChannel
+		bridge.previousChannel = nil
+		relayRetireChannel(old)
+	end
 	generation = generation + 1
 	state.running = true
-	local ok, err = linkLocal()
-	if ok then
-		bridge.mode = "local"
-		setConnected(true, nil)
-		log(string.format("linked to golem-bridge on port %d", bridge.port))
-	else
-		bridge.mode = "none"
-		setConnected(false, tostring(err))
-		log("golem-bridge is not running on this computer yet: " .. tostring(err))
+	bridge.mode = "relay"
+	-- Ignore anything that was already sitting in the channel before this
+	-- session began: a queued command from a dead Studio must never run here.
+	bridge.skipBefore = os.time() - 45
+	bridge.lastMessageKey = nil
+	task.spawn(relayLoop, generation)
+	if RunService:IsEdit() then
+		relayBeacon("hello", { place = game.PlaceId })
 	end
-	task.spawn(bridgeLoop, generation)
+	updateStatus()
+end
+
+local function promptRefresh()
+	if ui.setupBox ~= nil then
+		ui.setupBox.Text = setupCommandText()
+	end
+	if ui.settingsSetupBox ~= nil then
+		ui.settingsSetupBox.Text = setupCommandText()
+	end
+end
+
+local function applyModeToUi()
+	promptRefresh()
 	updateStatus()
 end
 local function makeIcon(kind, size, color)
@@ -5639,7 +5899,7 @@ local function buildUi(widget, linkWidget)
 	}, ui.setupPopup)
 	makeIcon("close", 12, COLORS.textFaint).Parent = ui.closeButton
 	label({
-		Text = "Paste this line into your AI's terminal. It links this Studio straight to the AI - no relay, no channel to carry around.",
+		Text = "Paste this line into any AI - a terminal, a chat window, even a cloud agent with no tools installed. It ties that AI to this Studio session only.",
 		Position = UDim2.new(0, 16, 0, 40),
 		Size = UDim2.new(1, -32, 0, 30),
 		FontFace = fontRegular,
@@ -5708,15 +5968,12 @@ local function buildUi(widget, linkWidget)
 		end
 	end)
 	ui.askAiButton.Activated:Connect(function()
-		-- Only the public half goes into chat. The secret half never leaves
-		-- Studio, so a leaked chat log cannot drive this session.
-		local publicHalf = publicPair()
+		-- The line is the whole capability and it dies with this Studio session,
+		-- so pasting it into a chat (even a public one) is safe by design.
 		if ui.chatBox == nil then
 			return
 		end
-		ui.chatBox.Text = string.format(
-			"Link to my Roblox Studio: run `npx golem-bridge connect %s` and then run `npx golem-bridge link %s` to pair the secret I copied from Studio.",
-			bridge.deviceId, publicHalf)
+		ui.chatBox.Text = setupCommandText()
 		ui.hideSetupPopup()
 		ui.chatBox:CaptureFocus()
 	end)
@@ -5881,7 +6138,7 @@ local function buildUi(widget, linkWidget)
 	addCorner(setupCard, 10)
 	label({ Text = "SET UP YOUR AI", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, setupCard)
 	label({
-		Text = "Paste this line into your AI's terminal. It links Studio straight to the AI: no relay, no channel to copy around.",
+		Text = "Paste this line into your AI - anywhere it runs. It names this Studio session, and it stops working when the session ends.",
 		Position = UDim2.new(0, 14, 0, 26),
 		Size = UDim2.new(1, -28, 0, 26),
 		FontFace = fontRegular,
@@ -5912,18 +6169,20 @@ local function buildUi(widget, linkWidget)
 	setupCard.Size = UDim2.new(1, 0, 0, 132)
 
 	local function endSessionNow()
-		-- rotates in memory only: the previous line is dead from this moment
-		rotateSecret()
-		bridge.mode = "none"
+		-- Mint a brand-new channel and wipe the old one: the line pasted into the
+		-- chat stops answering from this moment.
+		local old = bridge.channel
+		rotateChannel()
+		relayRetireChannel(old)
 		generation = generation + 1
 		state.running = false
 		setConnected(false, "session ended")
-		local ok = linkLocal()
-		if ok then
-			bridge.mode = "local"
-			setConnected(true, nil)
-		end
-		task.spawn(bridgeLoop, generation)
+		ensureHttpEnabled()
+		bridge.skipBefore = os.time() - 45
+		bridge.lastMessageKey = nil
+		bridge.mode = "relay"
+		task.spawn(relayLoop, generation)
+		relayBeacon("hello", { place = game.PlaceId })
 		if ui.setupBox ~= nil then
 			ui.setupBox.Text = setupCommandText()
 		end
@@ -5934,7 +6193,7 @@ local function buildUi(widget, linkWidget)
 		if ui.refreshSettings ~= nil then
 			ui.refreshSettings()
 		end
-		log("Session ended: this Studio now uses a new key. The old setup line no longer works.")
+		log("Session ended: this Studio is on a new channel. The old setup line no longer works.")
 	end
 
 	local sessionCard = createElement("Frame", {
@@ -5973,71 +6232,6 @@ local function buildUi(widget, linkWidget)
 		else
 			ui.endSessionButton.Text = END_SESSION_TEXT
 			endSessionNow()
-		end
-	end)
-
-	-- Where the AI runs decides whether loopback is enough. This is the one
-	-- choice the user has to make, so it gets its own card with the honest
-	-- explanation attached.
-	local remoteCard = createElement("Frame", {
-		Size = UDim2.new(1, 0, 0, 132),
-		BackgroundColor3 = COLORS.card,
-		BorderSizePixel = 0,
-		LayoutOrder = 3,
-	}, settingsList)
-	addCorner(remoteCard, 10)
-	label({ Text = "WHERE YOUR AI RUNS", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, remoteCard)
-	label({
-		Text = "Same PC as Studio (terminal, Cursor, Codex): nothing to do. A web or cloud AI cannot see your localhost - give it a tunnel to this port and paste that URL below.",
-		Position = UDim2.new(0, 14, 0, 26),
-		Size = UDim2.new(1, -28, 0, 44),
-		FontFace = fontRegular,
-		TextSize = 11,
-		TextWrapped = true,
-		TextColor3 = COLORS.textFaint,
-	}, remoteCard)
-	ui.bridgeHostBox = textBox({
-		Position = UDim2.new(0, 14, 0, 76),
-		Size = UDim2.new(1, -110, 0, 28),
-		Text = bridge.host or "http://127.0.0.1",
-		PlaceholderText = "https://your-tunnel.example.com",
-	}, remoteCard)
-	addCorner(ui.bridgeHostBox, 6)
-	local hostSave = button({
-		Position = UDim2.new(1, -90, 0, 76),
-		Size = UDim2.fromOffset(76, 28),
-		Text = "USE THIS",
-		BackgroundColor3 = COLORS.inner,
-		TextColor3 = COLORS.text,
-	}, remoteCard, COLORS.accent)
-	hostSave.Activated:Connect(function()
-		local typed = tostring(ui.bridgeHostBox.Text or "")
-		local cleaned = string.gsub(typed, "/+$", "")
-		if #cleaned == 0 or string.lower(cleaned) == "http://127.0.0.1" then
-			cleaned = "http://127.0.0.1"
-		elseif string.match(cleaned, "^https?://[%w%.%-%:_/]+$") == nil then
-			log("That is not a URL I can dial - it must start with http:// or https://")
-			return
-		end
-		bridge.host = cleaned
-		pcall(function()
-			plugin:SetSetting("Golem_BridgeHost", cleaned)
-		end)
-		ui.bridgeHostBox.Text = cleaned
-		-- relink against the new address right away
-		generation = generation + 1
-		bridge.mode = "none"
-		local ok = linkLocal()
-		if ok then
-			bridge.mode = "local"
-			setConnected(true, nil)
-			log("Bridge address set to " .. cleaned .. " - linking there.")
-		else
-			setConnected(false, "cannot reach " .. cleaned .. " - is the bridge and tunnel running?")
-		end
-		task.spawn(bridgeLoop, generation)
-		if ui.refreshSettings ~= nil then
-			ui.refreshSettings()
 		end
 	end)
 
@@ -6082,14 +6276,16 @@ local function buildUi(widget, linkWidget)
 
 	-- Keep the static settings text current without rebuilding the panel.
 	ui.refreshSettings = function()
-		local transport = "not linked"
-		if bridge.mode == "local" then
-			transport = string.format("linked to golem-bridge on port %d", bridge.port)
+		local transport = "waiting for the relay"
+		if state.connected then
+			transport = "relay is answering - an AI can drive this Studio"
+		elseif state.connectError ~= nil and #tostring(state.connectError) &gt; 0 then
+			transport = "relay unreachable: " .. tostring(state.connectError)
 		end
 		linkStatusLabel.Text = transport
 		sessionInfo.Text = string.format(
-			"Linked by the setup line above. End the session if that line leaked: Studio mints a new key and the old line dies immediately. State: %s.",
-			transport)
+			"This Studio is on channel %s. End the session if that line leaked: a new channel is minted, the old one is wiped, and the pasted line dies immediately. State: %s.",
+			tostring(bridge.channel), transport)
 		historyInfo.Text = string.format(
 			"Saved per place. %d event%s, currently at Turn: %d. The newest %d are restored on reopen.",
 			#chatEvents, #chatEvents == 1 and "" or "s", turnNumber, RESTORE_MAX_EVENTS)

@@ -2,8 +2,9 @@
 
 // golem-bridge unit tests. Zero dependencies, no network: run with
 //   npm test
-// These cover parsing, arg building, the PNG writer, the turn token, the local
-// broker (against a fake plugin on loopback), and the plugin source itself.
+// These cover parsing, arg building, the PNG writer, the turn token, the relay
+// transport (against a local stub speaking the Firebase REST shape), and the
+// plugin source itself.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -76,32 +77,36 @@ test("stripTimeout splits --timeout out of argv", () => {
   }
 });
 
-test("parseSetupLine accepts the v4 line, the bare secret, and quoted forms", () => {
-  const secret = "0123456789abcdef0123456789abcdef01234567";
+test("parseSetupLine accepts the 3.x-style line, the bare channel, and quoted forms", () => {
+  const channel = "a1b2c3d4e5f60718";
   for (const input of [
-    `npx golem-bridge connect ${secret}`,
-    `${secret}`,
-    `  "npx golem-bridge connect ${secret}"  `,
-    `npx  golem-bridge  connect  ${secret}`,
+    `npx golem-bridge connect ${channel}`,
+    `${channel}`,
+    `  "npx golem-bridge connect ${channel}"  `,
+    `npx  golem-bridge  connect  ${channel}`,
+    `Connect to my Roblox Studio, Run: npx golem-bridge connect ${channel}`,
+    channel.toUpperCase(),
   ]) {
-    assert.deepEqual(cli.parseSetupLine(input), { secret }, input);
+    assert.deepEqual(cli.parseSetupLine(input), { channel }, input);
   }
-  assert.deepEqual(cli.parseSetupLine(`npx golem-bridge connect ${secret} --port 42000`), {
-    secret,
-    port: 42000,
-  });
-  for (const bad of ["", "golem-bridge", "short", "zzzz:0123456789abcdef", `${secret} --port 0`]) {
+  // the id goes into a URL, so anything that is not hex is refused outright
+  for (const bad of ["", "golem-bridge", "short", "zzzzzzzzzzzzzzzz", "a1b2-c3d4", `${channel} --port 0`]) {
     assert.equal(cli.parseSetupLine(bad), null, bad);
   }
 });
 
-test("a 3.x line is refused instead of half-working", () => {
-  // old lines carried a relay channel: accepting them would silently fail
-  assert.deepEqual(cli.parseSetupLine("aabbccdd11223344"), { legacy: "channel" });
-  assert.deepEqual(
-    cli.parseSetupLine("aabbccdd11223344:0123456789abcdef0123456789abcdef01234567"),
-    { legacy: "pair" }
-  );
+test("channel ids are validated before they reach a URL", () => {
+  assert.equal(cli.isValidChannel("a1b2c3d4e5f60718"), true);
+  for (const bad of ["", "abc", "../channels", "a1b2c3d4e5f60718/../../x", "a".repeat(80), null]) {
+    assert.equal(cli.isValidChannel(bad), false, String(bad));
+  }
+});
+
+test("a 40-char 4.x secret parses as an id, so a stale line fails at the ping", () => {
+  // 4.x had no channel at all; a 4.x secret is hex and is treated as an id, so
+  // the ping is what tells the user the line is stale - not a silent success
+  const parsed = cli.parseSetupLine("npx golem-bridge connect " + "0".repeat(40));
+  assert.deepEqual(parsed, { channel: "0".repeat(40) });
 });
 
 test("the setup line never leaks into a tool argument", () => {
@@ -223,299 +228,312 @@ test("currentTurn keeps a burst in one turn and starts a new one later", inTempC
   assert.match(forced.token, /^t[0-9a-z]+$/);
 }));
 
-// --------------------------------------------------------------- fake plugin
-// A tiny stand-in for the Studio plugin: links, then long-polls and answers.
-let keepAliveRef = null;
-
-function startFakePlugin(port, opts) {
+// ------------------------------------------------------------- relay stub
+// A minimal stand-in for the Firebase Realtime Database REST API: push-style
+// POST under /channels/<id>/cmd.json, shallow key listings, per-key GETs. Keys
+// are monotonic so the CLI's sinceKey filtering is exercised for real.
+function startRelayStub(opts) {
   const o = opts || {};
-  const secret = o.secret || "0123456789abcdef0123456789abcdef01234567";
-  const device = "golem-abcdef01";
-  const state = { linked: false, polls: 0, commands: [], results: [] };
-  let stopped = false;
-  const request = (method, p, body) =>
-    new Promise((resolve, reject) => {
-      const data = body ? JSON.stringify(body) : undefined;
-      const req = http.request(
-        {
-          host: "127.0.0.1",
-          port,
-          path: p,
-          method,
-          headers: data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {},
-        },
-        (res) => {
-          const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => {
-            try {
-              resolve(JSON.parse(Buffer.concat(chunks).toString()));
-            } catch {
-              resolve({});
-            }
-          });
-        }
-      );
-      req.on("error", reject);
-      if (data) req.write(data);
-      req.end();
-    });
-
-  const keepAlive = setInterval(() => {}, 1 << 30);
-  keepAliveRef = keepAlive;
-  const loop = (async () => {
-    while (!stopped) {
-      if (!state.linked) {
-        try {
-          const r = await request("POST", "/v1/session", {
-            deviceId: device,
-            secret,
-            place: "Test Place",
-            pluginVersion: "4.0.0",
-          });
-          state.linked = r && r.ok === true;
-        } catch {
-          // bridge not up yet
-        }
-        await new Promise((r) => setTimeout(r, 100));
-        continue;
-      }
-      let batch;
-      try {
-        batch = await request("GET", `/v1/poll?device=${device}&secret=${secret}&wait=600`);
-      } catch {
-        await new Promise((r) => setTimeout(r, 100));
-        continue;
-      }
-      state.polls += 1;
-      for (const cmd of batch.commands || []) {
-        state.commands.push(cmd);
-        const result =
-          cmd.op === "screenshot"
-            ? { ok: true, width: 1, height: 1, format: "rgba-csv", pixels: "9,8,7,255", source: "editor" }
-            : { echoed: cmd.args };
-        const envelope = {
-          id: cmd.id,
-          op: cmd.op,
-          ok: true,
-          result,
-          turn: cmd.turn ? 1 : 0,
-          turnTools: 1,
-        };
-        state.results.push(envelope);
-        await request("POST", "/v1/result", { result: envelope });
-      }
-    }
-  })();
-
-  return {
-    state,
-    secret,
-    device,
-    requests: request,
-    stop: async () => {
-      stopped = true;
-      return loop;
-    },
+  const state = {
+    channels: new Map(), // id -> { cmd: Map, res: Map, beacons: Map }
+    posts: [],
+    gets: [],
+    rateLimitFirstPolls: o.rateLimitFirstPolls || 0,
+    polls: 0,
+    onCommand: o.onCommand || null,
+    stopped: false,
   };
+  const chan = (id) => {
+    if (!state.channels.has(id)) state.channels.set(id, { cmd: new Map(), res: new Map(), beacons: new Map() });
+    return state.channels.get(id);
+  };
+  let counter = 0;
+  const nextKey = () => {
+    counter += 1;
+    return `-k${String(counter).padStart(8, "0")}`;
+  };
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const url = new URL(req.url, "http://relay");
+      const body = Buffer.concat(chunks).toString();
+      const send = (status, obj, headers) => {
+        res.writeHead(status, Object.assign({ "Content-Type": "application/json" }, headers || {}));
+        res.end(typeof obj === "string" ? obj : JSON.stringify(obj));
+      };
+      // NOTE: the key group must not swallow the ".json" suffix
+      const m = url.pathname.match(/^\/channels\/([^/]+)\/(cmd|res|beacons)(?:\/([^/.]+))?(?:\.json)?$/);
+      if (!m) return send(404, { error: "not found" });
+      const [, id, bucket, key] = m;
+      const box = chan(id)[bucket];
+
+      if (req.method === "POST") {
+        state.posts.push({ id, bucket, body });
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return send(400, { error: "bad json" });
+        }
+        const k = nextKey();
+        box.set(k, parsed);
+        if (bucket === "cmd") {
+          // the plugin side: answer on the next tick, as a real plugin would
+          if (state.onCommand) {
+            setTimeout(() => {
+              const reply = state.onCommand(parsed, id);
+              if (reply) chan(id).res.set(nextKey(), reply);
+            }, 10);
+          }
+        }
+        return send(200, { name: k });
+      }
+
+      if (key) {
+        state.gets.push({ id, bucket, key });
+        const v = box.get(key);
+        return send(200, v === undefined ? "null" : v);
+      }
+
+      if (bucket === "res" && url.searchParams.get("shallow") === "true") {
+        state.polls += 1;
+        if (state.polls <= state.rateLimitFirstPolls) {
+          return send(429, { error: "rate limited" }, { "Retry-After": "0" });
+        }
+        const out = {};
+        for (const k of box.keys()) out[k] = true;
+        return send(200, Object.keys(out).length ? out : "null");
+      }
+      const out = {};
+      for (const [k, v] of box.entries()) out[k] = v;
+      return send(200, Object.keys(out).length ? out : "null");
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      resolve({
+        state,
+        url: `http://127.0.0.1:${port}`,
+        chan,
+        nextKey,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
 }
 
-test("broker: a fake plugin links, runs a command, and reports the turn", async () => {
-  const port = 45871;
-  const link = { secret: "0123456789abcdef0123456789abcdef01234567", port };
-  const { server } = await cli.startBroker(link);
-  const plugin = startFakePlugin(port, { secret: link.secret });
+// The relay must be https except for a local stub, so the tests point the
+// override at loopback and everything else goes through relayCall unchanged.
+async function withRelayStub(opts, fn) {
+  const stub = await startRelayStub(opts);
+  const saved = process.env.GOLEM_FIREBASE_DB;
+  const savedPoll = process.env.GOLEM_POLL_INTERVAL;
+  process.env.GOLEM_FIREBASE_DB = stub.url;
+  if (!savedPoll) process.env.GOLEM_POLL_INTERVAL = "0.25";
   try {
-    // wait for the link
-    const linkDeadline = Date.now() + 4000;
-    while (!cli.broker.deviceId && Date.now() < linkDeadline) await new Promise((r) => setTimeout(r, 50));
-    assert.equal(cli.broker.deviceId, "golem-abcdef01");
-
-    const call = await new Promise((resolve, reject) => {
-      const body = JSON.stringify({ op: "count", args: { scope: "game" }, secret: link.secret, turn: "tabc" });
-      const req = http.request(
-        { host: "127.0.0.1", port, path: "/v1/call", method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } },
-        (res) => {
-          const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString())));
-        }
-      );
-      req.on("error", reject);
-      req.write(body);
-      req.end();
-    });
-    assert.equal(call.ok, true, JSON.stringify(call));
-    assert.deepEqual(call.result, { echoed: { scope: "game" } });
-    assert.equal(plugin.state.commands[0].op, "count");
-    assert.equal(plugin.state.commands[0].turn, "tabc", "the turn token must reach the plugin");
+    await fn(stub);
   } finally {
-    await plugin.stop();
-    clearInterval(keepAliveRef);
-    await new Promise((r) => server.close(r));
-    await new Promise((r) => setTimeout(r, 200));
+    if (saved === undefined) delete process.env.GOLEM_FIREBASE_DB;
+    else process.env.GOLEM_FIREBASE_DB = saved;
+    if (savedPoll === undefined) delete process.env.GOLEM_POLL_INTERVAL;
+    else process.env.GOLEM_POLL_INTERVAL = savedPoll;
+    await stub.close();
+  }
+}
+
+const CHAN = "a1b2c3d4e5f60718";
+
+test("relay: a command is posted with its own key and its reply is matched by id", async () => {
+  await withRelayStub(
+    {
+      onCommand: (cmd) => ({ id: cmd.id, ok: true, result: { echoed: cmd.args, turn: 1, turnTools: 1 } }),
+    },
+    async (stub) => {
+      // a stale reply already in the channel must never be taken for ours
+      stub.chan(CHAN).res.set("-k00000000", { id: "somebody-else", ok: true, result: { wrong: true } });
+      const answer = await cli.relayCall(CHAN, "count", { scope: "game" }, 20);
+      assert.equal(answer.ok, true, JSON.stringify(answer));
+      assert.deepEqual(answer.result, { echoed: { scope: "game" }, turn: 1, turnTools: 1 });
+      const posted = JSON.parse(stub.state.posts[0].body);
+      assert.equal(posted.op, "count");
+      assert.deepEqual(posted.args, { scope: "game" });
+      assert.match(posted.id, /^c[0-9a-z]+$/);
+      assert.ok(posted.ts > 0, "every command carries a timestamp the plugin can skip on");
+      assert.match(answer.id, /^c/);
+      assert.equal(stub.state.posts[0].bucket, "cmd");
+    }
+  );
+});
+
+test("relay: an encoded result is unwrapped and a bad channel never hits the network", async () => {
+  await withRelayStub(
+    {
+      onCommand: (cmd) => {
+        // the plugin JSON-encodes oversized results; the CLI must undo that
+        const big = { rows: Array.from({ length: 5 }, (_, i) => i) };
+        return { id: cmd.id, ok: true, result: JSON.stringify(big), resultEncoded: true, v: "4.0.0" };
+      },
+    },
+    async (stub) => {
+      const answer = await cli.relayCall(CHAN, "list", {}, 20);
+      assert.deepEqual(answer.result, { rows: [0, 1, 2, 3, 4] });
+      assert.equal(answer.resultEncoded, undefined, "the encoding flag must not leak to the caller");
+      const before = stub.state.posts.length;
+      const bad = await cli.relayCall("../../evil", "ping", {}, 5);
+      assert.equal(bad.ok, false);
+      assert.match(bad.error, /bad channel/);
+      assert.equal(stub.state.posts.length, before, "an invalid id must not produce a request");
+    }
+  );
+});
+
+test("relay: a 429 on the first poll backs off and still delivers the answer", async () => {
+  await withRelayStub(
+    {
+      rateLimitFirstPolls: 2,
+      onCommand: (cmd) => ({ id: cmd.id, ok: true, result: { survived: true } }),
+    },
+    async () => {
+      const answer = await cli.relayCall(CHAN, "ping", {}, 25);
+      assert.equal(answer.ok, true, JSON.stringify(answer));
+      assert.deepEqual(answer.result, { survived: true });
+    }
+  );
+});
+
+test("relay: silence becomes a timeout message that names the next step", async () => {
+  await withRelayStub({ onCommand: () => null }, async () => {
+    const started = Date.now();
+    const answer = await cli.relayCall(CHAN, "count", {}, 2);
+    assert.equal(answer.ok, false);
+    assert.match(answer.error, /timed out after 2s/);
+    assert.match(answer.error, /Studio/);
+    assert.ok(Date.now() - started >= 1900, "the timeout must actually wait");
+  });
+});
+
+test("relay: a plugin error is passed through untouched", async () => {
+  await withRelayStub(
+    { onCommand: (cmd) => ({ id: cmd.id, ok: false, error: "no such instance: Workspace/Nope" }) },
+    async () => {
+      const answer = await cli.relayCall(CHAN, "read", { path: "Workspace/Nope" }, 20);
+      assert.equal(answer.ok, false);
+      assert.match(answer.error, /no such instance/);
+    }
+  );
+});
+
+test("relay: the base URL must be https unless it is a local stub", () => {
+  const saved = process.env.GOLEM_FIREBASE_DB;
+  try {
+    delete process.env.GOLEM_FIREBASE_DB;
+    assert.match(cli.relayBase(), /^https:\/\//);
+    process.env.GOLEM_FIREBASE_DB = "http://relay.example.com/";
+    assert.throws(() => cli.relayBase(), /non-HTTPS/);
+    process.env.GOLEM_FIREBASE_DB = "http://127.0.0.1:9000/";
+    assert.equal(cli.relayBase(), "http://127.0.0.1:9000", "trailing slash trimmed, local allowed");
+  } finally {
+    if (saved === undefined) delete process.env.GOLEM_FIREBASE_DB;
+    else process.env.GOLEM_FIREBASE_DB = saved;
   }
 });
 
-test("broker: a wrong secret is refused, and a guest call reaches the game driver", async () => {
-  const port = 45872;
-  const link = { secret: "ffffffffffffffffffffffffffffffffffffffff", port };
-  const { server } = await cli.startBroker(link);
-  const post = (p, body) =>
-    new Promise((resolve, reject) => {
-      const data = JSON.stringify(body);
-      const req = http.request(
-        { host: "127.0.0.1", port, path: p, method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
-        (res) => {
-          const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString())));
-        }
-      );
-      req.on("error", reject);
-      req.write(data);
-      req.end();
-    });
-  try {
-    const denied = await post("/v1/call", { op: "ping", secret: "nope" });
-    assert.equal(denied.ok, false);
-    assert.match(denied.error, /unauthorized/);
+test("relay: a live hello beacon reads as live, a revoked one as rotated", async () => {
+  await withRelayStub({}, async (stub) => {
+    const savedCwd = process.cwd();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "golem-status-"));
+    process.chdir(dir);
+    try {
+      cli.saveLink({ channel: CHAN, place: "Test Place" });
+      // empty channel: no beacon, no results
+      const empty = await cli.status();
+      assert.equal(empty.ok, true);
+      assert.match(empty.verdict, /never posted here|older plugin/);
 
-    // simulate the in-game driver: it polls for work and answers it
-    const driver = (async () => {
-      for (let i = 0; i < 40; i++) {
-        const work = await post("/v1/guest/exec", { role: "client", op: "poll" });
-        const cmd = work.result && work.result.commands && work.result.commands[0];
-        if (cmd) {
-          await post("/v1/guest/exec", {
-            role: "client",
-            op: "result",
-            args: { id: cmd.id, ok: true, result: { clicked: cmd.args } },
-          });
-          return cmd;
-        }
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      return null;
-    })();
-    // the plugin asks the bridge to run something inside the game
-    const fromPlugin = post("/v1/guest/exec", { role: "client", op: "click", args: { x: 3, y: 4 }, timeoutMs: 5000 });
-    const seen = await driver;
-    assert.ok(seen, "the in-game driver never received the click");
-    assert.equal(seen.op, "click");
-    assert.deepEqual(seen.args, { x: 3, y: 4 });
-    const answer = await fromPlugin;
-    assert.equal(answer.ok, true);
-    assert.deepEqual(answer.result, { clicked: { x: 3, y: 4 } });
-  } finally {
-    await new Promise((r) => server.close(r));
-    await new Promise((r) => setTimeout(r, 200));
-  }
+      const now = Math.floor(Date.now() / 1000);
+      const box = stub.chan(CHAN);
+      box.beacons.set("-b1", { op: "hello", ts: now - 5, v: "4.0.0", place: "Test Place" });
+      const live = await cli.status();
+      assert.match(live.verdict, /LIVE/);
+      assert.equal(live.beacon.op, "hello");
+
+      // a rotated channel is not a dead plugin: the verdict must say so
+      box.beacons.set("-b2", { op: "revoked", ts: now, v: "4.0.0" });
+      const rotated = await cli.status();
+      assert.match(rotated.verdict, /ROTATED/);
+      assert.match(rotated.verdict, /reconnect/);
+    } finally {
+      process.chdir(savedCwd);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
-test("status explains what to do when nothing is listening", async () => {
-  const before = process.cwd();
+test("status without a saved channel says how to connect", async () => {
+  const savedCwd = process.cwd();
+  const savedEnv = process.env.GOLEM_CHANNEL;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "golem-status-"));
   process.chdir(dir);
-  const savedPort = process.env.GOLEM_PORT;
-  process.env.GOLEM_PORT = "45899";
+  delete process.env.GOLEM_CHANNEL;
   try {
     const s = await cli.status();
     assert.equal(s.ok, false);
-    assert.match(s.error, /connect|setup line/);
+    assert.match(s.error, /connect/);
   } finally {
-    if (savedPort === undefined) delete process.env.GOLEM_PORT;
-    else process.env.GOLEM_PORT = savedPort;
-    process.chdir(before);
+    if (savedEnv !== undefined) process.env.GOLEM_CHANNEL = savedEnv;
+    process.chdir(savedCwd);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a remote caller is refused unless it has the secret, and never forges results", () => {
-  const remote = { socket: { remoteAddress: "203.0.113.9" } };
-  const local = { socket: { remoteAddress: "127.0.0.1" } };
-  assert.equal(cli.isLocalSocket(remote), false);
-  assert.equal(cli.isLocalSocket(local), true);
-
-  cli.broker.secret = "a".repeat(40);
-  const url = new URL("http://bridge/v1/call");
-  // no secret, wrong secret
-  assert.equal(cli.authorized(url, {}, {}), false);
-  assert.equal(cli.authorized(url, {}, { secret: "b".repeat(40) }), false);
-  // the real secret, however presented
-  assert.equal(cli.authorized(url, {}, { secret: "a".repeat(40) }), true);
-  assert.equal(cli.authorized(url, { "x-golem-secret": "a".repeat(40) }, {}), true);
-  assert.equal(cli.authorized(new URL("http://bridge/v1/poll?secret=" + "a".repeat(40)), {}, null), true);
-  cli.broker.secret = "";
-});
-
-test("binding defaults to loopback and only moves when asked", () => {
-  const saved = process.env.GOLEM_BIND;
-  const restore = () => {
-    if (saved === undefined) delete process.env.GOLEM_BIND;
-    else process.env.GOLEM_BIND = saved;
-  };
+test("the saved link is only a channel - the id is the whole capability", inTempCwd(async (dir) => {
+  const saved = cli.saveLink({ channel: CHAN, place: "Test Place" });
+  const data = JSON.parse(fs.readFileSync(saved, "utf8"));
+  assert.equal(data.channel, CHAN);
+  assert.ok(!("secret" in data), "no second credential may be persisted");
+  const link = cli.loadLink();
+  assert.equal(link.channel, CHAN);
+  // GOLEM_CHANNEL overrides the file, so a sandbox can pin a session
+  process.env.GOLEM_CHANNEL = "ffffffffffffffff";
   try {
-    delete process.env.GOLEM_BIND;
-    assert.equal(cli.bindAddress(), "127.0.0.1");
-    assert.equal(cli.onLoopback(), true);
-    // garbage must never widen the listener
-    for (const junk of ["", "localhost", "not-an-ip", "evil.example.com"]) {
-      process.env.GOLEM_BIND = junk;
-      assert.equal(cli.bindAddress(), "127.0.0.1", junk);
-      assert.equal(cli.onLoopback(), true, junk);
-    }
-    // an explicit address is honoured, and then it is no longer loopback-only
-    process.env.GOLEM_BIND = "0.0.0.0";
-    assert.equal(cli.bindAddress(), "0.0.0.0");
-    assert.equal(cli.onLoopback(), false);
-    process.env.GOLEM_BIND = "192.168.1.20";
-    assert.equal(cli.bindAddress(), "192.168.1.20");
-    assert.equal(cli.onLoopback(), false);
+    assert.equal(cli.loadLink().channel, "ffffffffffffffff");
+    process.env.GOLEM_CHANNEL = "not hex";
+    assert.equal(cli.loadLink().channel, CHAN, "a junk override is ignored, not obeyed");
   } finally {
-    restore();
+    delete process.env.GOLEM_CHANNEL;
   }
-});
-
-test("tunnel mode: GOLEM_URL moves the agent off loopback, secret stays in a header", () => {
-  const savedUrl = process.env.GOLEM_URL;
-  try {
-    delete process.env.GOLEM_URL;
-    assert.match(cli.agentBaseUrl(), /^http:\/\/127\.0\.0\.1/);
-    process.env.GOLEM_URL = "https://abc.trycloudflare.com/";
-    assert.equal(cli.agentBaseUrl(), "https://abc.trycloudflare.com", "the trailing slash is trimmed");
-    process.env.GOLEM_URL = "not a url";
-    assert.throws(() => cli.agentBaseUrl(), /GOLEM_URL/);
-    // a secret must never be pasted into the URL a tunnel would log
-    process.env.GOLEM_URL = "https://abc.trycloudflare.com";
-    const headers = cli.agentHeaders({});
-    assert.ok(headers["X-Golem-Secret"] !== undefined || headers["X-Golem-Secret"] === undefined);
-  } finally {
-    if (savedUrl === undefined) delete process.env.GOLEM_URL;
-    else process.env.GOLEM_URL = savedUrl;
-  }
-});
+}));
 
 // ------------------------------------------------------------------- plugin
-test("the shipped plugin source is v4 and has no relay left", () => {
+test("the shipped plugin talks over the relay and keeps the session capability", () => {
   const file = path.join(__dirname, "plugin", "Golem.lua");
   const src = fs.readFileSync(file, "utf8");
   assert.match(src, /local VERSION = "4\.0\.0"/);
-  assert.ok(!/firebaseio\.com/.test(src), "a Firebase relay URL is still in the plugin");
-  assert.ok(!/parse\.app|PROXY_URL/.test(src), "a hosted proxy fallback is still in the plugin");
-  // the setup line goes into a chat, so it must be a session secret
-  assert.ok(!/SetSetting\("Golem_DeviceSecret", bridge\.deviceSecret\)/.test(src),
-    "the session secret is persisted - a pasted line would never expire");
-  assert.match(src, /rotateSecret/, "ending a session must mint a new secret");
-  assert.match(src, /Golem_BridgeHost/, "there is no way to point the plugin at a tunnel");
-  assert.ok(!/\/v1\/inbox\//.test(src), "the relay's inbox endpoints are still in the plugin");
+  // the transport a cloud agent can actually use
+  assert.match(src, /roblox-golem-default-rtdb\.firebaseio\.com/, "the relay URL is missing");
+  assert.match(src, /\/channels\//, "no channel path");
+  assert.match(src, /function relayDeliver/, "no result publish path");
+  assert.match(src, /function relayLoop|task\.spawn\(relayLoop/, "nothing polls the channel");
+  assert.match(src, /orderBy=/, "the command poll must only ask for new keys");
+  assert.match(src, /DELETE/, "handled commands must be deleted so they never run twice");
+  assert.match(src, /op = "revoked"|"revoked"/, "a retired channel must announce itself");
+  // the old localhost broker is gone for good
+  assert.ok(!/127\.0\.0\.1:/.test(src), "the loopback broker is still in the plugin");
+  assert.ok(!/GOLEM_PORT|DEFAULT_PORT/.test(src), "port plumbing is still in the plugin");
+  assert.ok(!/Golem_BridgeHost/.test(src), "the tunnel setting is still in the plugin");
+  // the channel id is the capability: minted per session, never persisted
+  assert.ok(!/SetSetting\("Golem_Channel",\s*bridge\.channel/.test(src),
+    "the session channel is persisted - a pasted line would never expire");
+  assert.match(src, /function rotateChannel/, "ending a session must mint a new channel");
+  assert.match(src, /randomHex\(16\)/, "channels must be 16 random hex chars");
   assert.ok(!/function OPS\.say/.test(src), "the note system is still in the plugin");
   assert.ok(!/turn_begin|turn_end/.test(src), "the old turn ops are still in the plugin");
   assert.match(src, /TryBeginRecording/, "the revert fix is missing");
   assert.match(src, /ExecutePlayModeAsync/, "play must start a real test session");
   assert.match(src, /CreateVirtualInput/, "input tools need virtual input");
   assert.match(src, /CaptureScreenshot/, "screenshot needs CaptureService");
-  // the wrong-role call that started this whole rewrite must be gone
   assert.ok(!/guestExec\("editor"/.test(src), "screenshot must not ask for a nonexistent editor driver");
 });
 

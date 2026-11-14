@@ -3,15 +3,15 @@
 
 // golem-bridge: drive a live Roblox Studio session from any AI agent.
 //
-// v4 connects *directly*: this CLI listens on 127.0.0.1 and the Golem plugin
-// polls it over HTTP. There is no relay, no account, no cloud in the middle -
-// the AI's terminal command talks to Studio through loopback only.
+// Studio and this CLI meet at a small Firebase Realtime Database relay: the
+// plugin can only make outgoing calls, and the agent running these commands is
+// often a cloud sandbox that cannot reach the user's machine. The relay stores
+// JSON and nothing else - the channel id is the whole capability.
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const zlib = require("zlib");
-const http = require("http");
 const crypto = require("crypto");
 
 let VERSION = "unknown";
@@ -29,40 +29,12 @@ function envOf(...names) {
   return undefined;
 }
 
-// The bridge lives on loopback by default: a plugin in Studio, and the AI's
-// terminal, are both on this machine, so nothing has to cross a network.
-// GOLEM_BIND exists only for the cases where the agent is NOT on this machine
-// (WSL2/Docker, or an AI harness on another box) - it moves the listener off
-// loopback, which is a real security decision, not a convenience toggle.
-const DEFAULT_PORT = 41717;
-const LOOPBACK = "127.0.0.1";
-
-function bindAddress() {
-  const raw = (envOf("GOLEM_BIND") || "").trim();
-  if (!raw || raw === LOOPBACK || raw === "localhost") return LOOPBACK;
-  if (raw === "0.0.0.0" || raw === "::") return raw;
-  // any concrete interface address is allowed; resolve nothing (keep it literal)
-  if (/^[0-9a-fA-F:.]+$/.test(raw)) return raw;
-  return LOOPBACK;
-}
-
-// Advertised base URL. When bound to a wildcard we still hand out loopback to
-// this machine's own callers; remote callers use their own host:port.
-function bindHostForUrls() {
-  const bind = bindAddress();
-  return bind === "0.0.0.0" || bind === "::" ? LOOPBACK : bind;
-}
-
-function onLoopback() {
-  return bindAddress() === LOOPBACK;
-}
 const PLUGIN_STALE_MS = 20000;
 const DEFAULT_TIMEOUT = 120;
 // One AI request = one turn. Tools called in a burst share a turn token, so
 // the very first call of a request already opens (and reports) its turn.
 const TURN_IDLE_MS = Math.max(30000, (parseFloat(envOf("GOLEM_TURN_IDLE")) || 300) * 1000);
 // Device ids are minted by the plugin ("golem-" + hex) and are public.
-const DEVICE_RE = /^golem-[0-9a-f]{8,64}$/;
 
 class UsageError extends Error {}
 
@@ -130,16 +102,15 @@ function removeStaleHelpers(dir) {
 }
 
 function loadLink() {
-  const fromEnv = envOf("GOLEM_SECRET");
-  if (fromEnv) {
-    return { secret: String(fromEnv), port: serverPort(), fromEnv: true };
+  // the env override exists so a script or a sandbox can pin a session
+  const fromEnv = envOf("GOLEM_CHANNEL", "AIB_CHANNEL");
+  if (fromEnv && isValidChannel(String(fromEnv).trim())) {
+    return { channel: String(fromEnv).trim(), fromEnv: true };
   }
   const data = readJsonFile(linkFile());
-  if (!data || !data.secret) return null;
+  if (!data || !isValidChannel(String(data.channel || ""))) return null;
   return {
-    deviceId: data.deviceId,
-    secret: data.secret,
-    port: data.port || serverPort(),
+    channel: data.channel,
     place: data.place,
     placeId: data.placeId,
     pluginVersion: data.pluginVersion,
@@ -161,7 +132,7 @@ function requireLink() {
     out({
       ok: false,
       error:
-        "not connected - run the setup line shown in the Golem window in Studio: npx golem-bridge connect <secret>",
+        "not connected - run the setup line shown in the Golem window in Studio: npx golem-bridge connect <channelId>",
     });
     return null;
   }
@@ -169,54 +140,22 @@ function requireLink() {
 }
 
 /**
- * Accepts the setup line from the Studio window - "npx golem-bridge connect
- * <secret>" with an optional "--port N" - or just the secret on its own. The
- * 3.x "<channel>" and "<inbox>:<secret>" shapes are refused with a clear
- * message so an old line never half-works.
+ * Accepts the line from the Studio window - "npx golem-bridge connect <id>",
+ * with or without a "Connect to my Roblox Studio, Run:" prefix and any
+ * surrounding quotes - or the bare 16-char channel id. The id is the secret, so
+ * anything that is not hex is rejected rather than pasted into a URL.
  */
 function parseSetupLine(text) {
-  // Strip surrounding quotes first: users copy from a chat window that may have
-  // added them, and the line itself never starts with a quote.
   const raw = String(text == null ? "" : text).trim().replace(/^["'`]+|["'`]+$/g, "").trim();
-  const cleaned = raw.replace(/^npx\s+golem-bridge\s+connect\s+/i, "").trim();
-  const m = cleaned.match(/^([0-9a-fA-F]{24,128})(?:\s+--port\s+(\d{1,5}))?$/);
-  if (!m) {
-    if (/^[0-9a-fA-F]{8,64}$/.test(cleaned)) return { legacy: "channel" };
-    if (/^[0-9a-fA-F]{8,64}:[0-9a-fA-F]{16,128}$/.test(cleaned)) return { legacy: "pair" };
-    return null;
-  }
-  const parsed = { secret: m[1].toLowerCase() };
-  if (m[2]) {
-    const port = parseInt(m[2], 10);
-    if (!(port > 0) || port > 65535) return null;
-    parsed.port = port;
-  }
-  return parsed;
-}
-
-function serverPort() {
-  const n = parseInt(envOf("GOLEM_PORT") || "", 10);
-  return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_PORT;
-}
-
-/**
- * Where THIS process reaches the bridge. Normally loopback. With GOLEM_URL set
- * it points at whatever the user exposed - that is the path for an AI that runs
- * somewhere else and can only reach a tunnel.
- */
-function agentBaseUrl() {
-  const raw = (envOf("GOLEM_URL") || "").trim().replace(/\/+$/, "");
-  if (raw) {
-    if (!/^https?:\/\/\S+$/.test(raw)) {
-      throw new Error(`GOLEM_URL must be an http(s) URL, got "${raw}"`);
-    }
-    return raw;
-  }
-  return serverUrl();
-}
-
-function serverUrl(port, host) {
-  return `http://${host || bindHostForUrls()}:${port || serverPort()}`;
+  const cleaned = raw
+    .replace(/^connect\s+to\s+my\s+roblox\s+studio,?\s*/i, "")
+    .replace(/^run:?\s*/i, "")
+    .replace(/^npx\s+golem-bridge\s+connect\s+/i, "")
+    .replace(/^golem-bridge\s+connect\s+/i, "")
+    .trim();
+  const m = cleaned.match(/^([0-9a-fA-F]{8,64})$/);
+  if (!m) return null;
+  return { channel: m[1].toLowerCase() };
 }
 
 // ---------------------------------------------------------------- turn tokens
@@ -276,728 +215,268 @@ function turnReminder(entry) {
   console.error(`>> Turn ${entry.turn}${suffix}. When this request is finished, reply to the user - the turn closes itself.`);
 }
 
-// ------------------------------------------------------------- http to Studio
-function httpJson(url, options) {
-  const o = options || {};
-  const body = o.body === undefined ? undefined : typeof o.body === "string" ? o.body : JSON.stringify(o.body);
-  const headers = Object.assign({ Accept: "application/json" }, o.headers || {});
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (body !== undefined) headers["Content-Length"] = Buffer.byteLength(body);
-  return new Promise((resolve, reject) => {
-    const req = http.request(url, { method: o.method || (body === undefined ? "GET" : "POST"), headers }, (res) => {
-      const chunks = [];
-      let size = 0;
-      res.on("data", (c) => {
-        size += c.length;
-        if (size > 64 * 1024 * 1024) {
-          req.destroy(new Error("response too large"));
-          return;
-        }
-        chunks.push(c);
-      });
-      res.on("end", () => {
-        const text = Buffer.concat(chunks).toString("utf8");
-        let json = null;
-        try {
-          json = text ? JSON.parse(text) : null;
-        } catch {
-          json = null;
-        }
-        resolve({ status: res.statusCode || 0, text, json });
-      });
-    });
-    req.setTimeout(o.timeoutMs || 15000, () => req.destroy(new Error("request timed out")));
-    req.on("error", reject);
-    if (body !== undefined) req.write(body);
-    req.end();
-  });
-}
+// ------------------------------------------------------------------ firebase
+// The relay. Studio and this CLI both reach a Firebase Realtime Database, which
+// is the only place they can meet: Studio can only make outgoing calls, and a
+// cloud agent cannot see the user's localhost. Firebase is a message box, not a
+// participant - it stores JSON and knows nothing about Roblox.
+//
+//   channels/<id>/cmd      this CLI writes commands here
+//   channels/<id>/res      Studio writes results here
+//   channels/<id>/beacons  Studio says hello / revoked, for diagnostics
+//
+// The channel id is the capability: 16 random hex characters, minted fresh
+// every Studio session, wiped when Studio closes or the user ends the session.
 
-async function serverInfo(port) {
-  try {
-    const base = agentBaseUrl();
-    const r = await httpJson(`${base}/v1/health`, {
-      timeoutMs: 2500,
-      headers: agentHeaders(),
-    });
-    return r.json && typeof r.json === "object" && r.json.ok ? r.json : null;
-  } catch {
-    return null;
-  }
+const FIREBASE_DB = envOf("GOLEM_FIREBASE_DB", "AIB_FIREBASE_DB") || "https://roblox-golem-default-rtdb.firebaseio.com";
+const FETCH_TIMEOUT_MS = 30000;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+function pollIntervalMs() {
+  const secs = parseFloat(envOf("GOLEM_POLL_INTERVAL", "AIB_POLL_INTERVAL")) || 2;
+  return Math.max(100, secs * 1000);
 }
+// Channel ids are 16 hex chars today; tolerate 8-64 for forward compatibility.
+// Anything else is rejected so a malformed id can never alter the request URL.
+const CHANNEL_RE = /^[0-9a-fA-F]{8,64}$/;
 
 /**
- * The session secret travels as a header, never in a URL: behind a tunnel the
- * URL ends up in proxy logs and request histories, and the line is already in a
- * chat transcript.
+ * The relay must be HTTPS (plain HTTP only for a local emulator). Trailing
+ * slashes are trimmed so URL joins stay clean.
  */
-function agentHeaders(extra) {
-  const link = (() => {
-    try {
-      return loadLink();
-    } catch {
-      return null;
-    }
-  })();
-  const secret = (link && link.secret) || broker.secret || "";
-  return Object.assign({}, extra || {}, secret ? { "X-Golem-Secret": secret } : {});
-}
-
-/** Ask for commands to run. Long-polls when the CLI is serving. */
-async function pollCommands(link, cursor, waitMs) {
-  const query = new URLSearchParams({ device: link.deviceId, cursor: cursor || "", wait: String(waitMs || 0) });
-  const r = await httpJson(`${agentBaseUrl()}/v1/poll?${query}`, {
-    timeoutMs: (waitMs || 0) + 8000,
-    headers: { "X-Golem-Secret": link.secret || "" },
-  });
-  if (r.status !== 200 || !r.json) return null;
-  return r.json;
-}
-
-async function postResult(link, envelope) {
-  const r = await httpJson(`${agentBaseUrl()}/v1/result`, {
-    method: "POST",
-    body: { device: link.deviceId, secret: link.secret, result: envelope },
-    timeoutMs: 15000,
-  });
-  return r.status === 200;
-}
-
-// -------------------------------------------------------------- screenshots
-// The plugin sends raw RGBA as "x,y,r,g,b,a;..." pairs. Writing the PNG here
-// keeps the plugin small and means the AI gets a file it can actually open.
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-function crc32(buf) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc ^= buf[i];
-    for (let k = 0; k < 8; k++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+function relayBase(url) {
+  // read the env override on every call: a test or a wrapper may set it late
+  const configured = envOf("GOLEM_FIREBASE_DB", "AIB_FIREBASE_DB") || FIREBASE_DB || "";
+  const raw = String(url !== undefined ? url : configured).replace(/\/+$/, "");
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(raw)) return raw;
+  if (!/^https:\/\//.test(raw)) {
+    throw new Error(
+      `refusing to talk to a non-HTTPS relay (${raw || "(empty)"}) - check GOLEM_FIREBASE_DB/AIB_FIREBASE_DB`
+    );
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return raw;
 }
 
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const name = Buffer.from(type, "ascii");
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(Buffer.concat([name, data])), 0);
-  return Buffer.concat([len, name, data, crc]);
+function isTooLarge(err) {
+  return !!err && typeof err.message === "string" && err.message.includes("response too large");
 }
 
-function encodePng(width, height, rgba) {
-  const stride = width * 4;
-  const raw = Buffer.alloc((stride + 1) * height);
-  for (let y = 0; y < height; y++) {
-    raw[y * (stride + 1)] = 0; // filter: none
-    rgba.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
+function parseRetryAfter(headers, fallback) {
+  try {
+    const v = parseFloat(headers.get("retry-after"));
+    if (Number.isFinite(v) && v >= 0) return v;
+  } catch {
+    // fall through
   }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  return Buffer.concat([
-    PNG_SIGNATURE,
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", zlib.deflateSync(raw, { level: 6 })),
-    pngChunk("IEND", Buffer.alloc(0)),
-  ]);
+  return fallback;
 }
 
-function decodeRgbaCsv(text, width, height) {
-  const buf = Buffer.alloc(width * height * 4);
-  let i = 0;
-  for (const pixel of String(text || "").split(";")) {
-    if (i >= buf.length) break;
-    const parts = pixel.split(",");
-    if (parts.length < 4) {
-      i += 4;
-      continue;
-    }
-    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[0], 10) || 0));
-    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[1], 10) || 0));
-    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[2], 10) || 0));
-    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[3], 10) || 255));
-  }
-  return buf;
-}
-
-function writeScreenshot(result, label) {
-  const width = parseInt(result.width, 10);
-  const height = parseInt(result.height, 10);
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
-    throw new Error("the capture came back without a usable size");
-  }
-  const safe = String(label || result.label || "viewport").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40) || "viewport";
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const file = path.join(shotsDir(), `${safe}-${stamp}.png`);
-  fs.mkdirSync(shotsDir(), { recursive: true });
-  fs.writeFileSync(file, encodePng(width, height, decodeRgbaCsv(result.pixels, width, height)));
-  return { file, width, height };
-}
-
-// ---------------------------------------------------------------- marketplace
-// search/info run on this machine: Studio's HttpService cannot reach roblox.com.
-
-const MP_CATEGORIES = {
-  model: "Model", models: "Model", mesh: "MeshPart", meshes: "MeshPart", meshpart: "MeshPart",
-  decal: "Decal", decals: "Decal", image: "Decal", images: "Decal", picture: "Decal", texture: "Decal",
-  audio: "Audio", sound: "Audio", sounds: "Audio", music: "Audio",
-  video: "Video", videos: "Video", plugin: "Plugin", plugins: "Plugin",
-};
-const ASSET_TYPE_NAMES = { 1: "Image", 3: "Audio", 4: "Mesh", 9: "Decal", 10: "Model", 18: "Video", 19: "Font", 40: "MeshPart" };
-
-async function webJson(url, timeoutMs) {
+async function fetchText(url, opts) {
+  const o = opts || {};
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+  const timer = setTimeout(() => ctrl.abort(), o.timeoutMs || FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": `golem-bridge/${VERSION}`, Accept: "application/json" },
+      method: o.method || (o.body === undefined ? "GET" : "POST"),
+      headers: Object.assign({ Accept: "application/json" }, o.headers || {}),
+      body: o.body,
       signal: ctrl.signal,
+      redirect: "error", // responses must come from the relay itself
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status} from Roblox: ${text.slice(0, 200)}`);
-    return JSON.parse(text);
+    if (text.length > MAX_BODY_BYTES) {
+      throw new Error("response too large, refusing to parse it");
+    }
+    return { ok: res.ok, status: res.status, headers: res.headers, text };
   } catch (err) {
-    if (err && err.name === "AbortError") throw new Error("request timed out");
+    if (err && err.name === "AbortError") {
+      throw new Error(`request timed out (${(o.timeoutMs || FETCH_TIMEOUT_MS) / 1000}s)`);
+    }
     throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function mpSearch(query, category, limit, cursor) {
-  const assetType = MP_CATEGORIES[String(category || "model").toLowerCase()];
-  if (!assetType) throw new Error(`unknown category '${category}' (valid: model, mesh, image, audio, video, plugin)`);
-  let n = parseInt(limit, 10);
-  if (!Number.isFinite(n)) n = 10;
-  n = Math.max(1, Math.min(n, 50));
-  let url = `https://apis.roblox.com/toolbox-service/v1/marketplace/${assetType}?keyword=${encodeURIComponent(String(query))}&limit=${n}`;
-  if (cursor) url += `&cursor=${encodeURIComponent(String(cursor))}`;
-  const data = await webJson(url);
-  const ids = ((data && data.data) || []).filter((it) => it && it.id != null).map((it) => it.id);
-  const details = {};
-  const thumbs = {};
-  const enriched = Math.min(ids.length, 12);
-  for (let i = 0; i < enriched; i++) {
-    try {
-      details[ids[i]] = await webJson(`https://economy.roblox.com/v2/assets/${ids[i]}/details`);
-    } catch {
-      // one bad asset must not kill the search
-    }
-    if (i < enriched - 1) await sleep(400); // the economy API rate limits hard
-  }
-  if (ids.length) {
-    try {
-      const tdata = await webJson(
-        `https://thumbnails.roblox.com/v1/assets?assetIds=${ids.slice(0, 12).join(",")}&size=420x420&format=Png`
-      );
-      for (const th of (tdata && tdata.data) || []) {
-        if (th && th.targetId != null) thumbs[th.targetId] = th;
-      }
-    } catch {
-      // thumbnails are a bonus
-    }
-  }
-  const results = ids.map((aid) => {
-    const d = details[aid];
-    const th = thumbs[aid];
-    const entry = { id: aid, category: assetType };
-    if (d && typeof d === "object") {
-      entry.name = d.Name;
-      entry.assetTypeId = d.AssetTypeId;
-      entry.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
-      if (d.Creator && typeof d.Creator === "object") entry.creator = d.Creator.Name;
-      entry.priceInRobux = d.PriceInRobux ?? null;
-      if (d.IsForSale != null) entry.forSale = d.IsForSale;
-      if (typeof d.Description === "string" && d.Description) entry.description = d.Description.slice(0, 280);
-    } else {
-      entry.detailsUnavailable = true;
-    }
-    if (th && typeof th === "object") {
-      entry.thumbnail = th.imageUrl;
-      entry.thumbnailState = th.state;
-    }
-    return entry;
-  });
-  const output = { totalResults: (data && data.totalResults) ?? 0, results };
-  if (data && data.nextPageCursor) output.nextPageCursor = data.nextPageCursor;
-  return output;
-}
-
-async function mpInfo(assetId) {
-  const text = String(assetId == null ? "" : assetId).trim();
-  if (!/^\d+$/.test(text)) throw new Error(`bad asset id '${assetId}'`);
-  const aid = parseInt(text, 10);
-  const d = await webJson(`https://economy.roblox.com/v2/assets/${aid}/details`);
-  const output = { id: aid };
-  if (d && typeof d === "object") {
-    output.name = d.Name;
-    output.assetTypeId = d.AssetTypeId;
-    output.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
-    if (d.Creator && typeof d.Creator === "object") output.creator = d.Creator.Name;
-    output.priceInRobux = d.PriceInRobux ?? null;
-    if (d.IsForSale != null) output.forSale = d.IsForSale;
-    if (typeof d.Description === "string") output.description = d.Description.slice(0, 1000);
-  }
-  try {
-    const tdata = await webJson(`https://thumbnails.roblox.com/v1/assets?assetIds=${aid}&size=420x420&format=Png`);
-    if (Array.isArray(tdata && tdata.data) && tdata.data.length) {
-      output.thumbnail = tdata.data[0].imageUrl;
-      output.thumbnailState = tdata.data[0].state;
-    }
-  } catch {
-    // thumbnails are a bonus
-  }
-  return output;
-}
-
-// -------------------------------------------------------------- local broker
-// The bridge is a small HTTP server on loopback that the Studio plugin polls.
-// It is also the switchboard for the play-test driver: both the plugin and the
-// driver that runs inside the game post here, so a screenshot taken in the game
-// comes back to the plugin without leaving the machine.
-//
-//   plugin  --GET  /v1/poll-->  broker  (commands queued by this CLI)
-//   plugin  --POST /v1/result-> broker
-//   driver  --POST /v1/guest/exec (op=poll)--> broker  (work for the game)
-//   plugin  --POST /v1/guest/exec---------> broker --> driver --> back
-
-const broker = {
-  secret: "",
-  deviceId: null,
-  place: null,
-  placeId: null,
-  pluginVersion: null,
-  startedAt: Date.now(),
-  lastPluginPoll: 0,
-  lastPluginSeen: 0,
-  commandsServed: 0,
-  errors: 0,
-  queue: [],
-  pollWaiters: [],
-  inflight: new Map(),
-  log: [],
-  drivers: { client: 0, server: 0 },
-  guestQueue: { client: [], server: [] },
-  guestPending: new Map(),
-  guestWaiters: { client: [], server: [] },
-  guestSeq: 0,
-};
-
-function brokerLog(line) {
-  const stamp = new Date().toISOString().slice(11, 19);
-  broker.log.push(`${stamp} ${line}`);
-  if (broker.log.length > 200) broker.log.shift();
-}
-
-function readBody(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > (limit || 32 * 1024 * 1024)) {
-        reject(new Error("request body too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
-}
-
-// The secret is a capability: it proves the caller holds the setup line. Both
-// the plugin (poll) and this CLI (call) must present it.
-function authorized(url, headers, body) {
-  const presented = [
-    url.searchParams.get("secret"),
-    headers["x-golem-secret"],
-    body && body.secret,
-  ];
-  // An empty secret only ever happens for a loopback-only listener; off
-  // loopback that would mean "everyone is authorized", so refuse instead.
-  if (!broker.secret) return onLoopback();
-  const ok = presented.some((v) => v === broker.secret);
-  if (ok) return true;
-  // Only this machine's own helpers (health probe, the in-game driver's own
-  // hello/result handshake) may work without it - and only while the listener
-  // is bound to loopback. Off-loopback, every route needs the secret.
-  return false;
+function isValidChannel(id) {
+  return typeof id === "string" && CHANNEL_RE.test(id);
 }
 
 /**
- * Is this request coming from this very machine? True for loopback and for any
- * address this host owns - when the listener is bound to a LAN address, Studio
- * and this CLI reach it through that same address, so "own address" has to
- * count as local. Everything else is a remote caller.
+ * Send one command and wait for Studio's reply.
+ *
+ * Writes to /cmd (Firebase assigns the key, so a command can never collide or
+ * overwrite a previous one), then polls /res with a shallow read and fetches
+ * only the entries newer than the last key seen. That keeps polling cheap: the
+ * shallow read is a few bytes no matter how large the results are.
  */
-function isLocalSocket(req) {
-  const addr = (req.socket && req.socket.remoteAddress) || "";
-  const plain = addr.replace(/^::ffff:/, "");
-  if (plain === "127.0.0.1" || plain === "::1") return true;
+async function relayCall(channelId, op, args, timeoutSec) {
+  let base;
   try {
-    for (const list of Object.values(os.networkInterfaces())) {
-      for (const entry of list || []) {
-        if (entry && entry.address === plain) return true;
-      }
-    }
-  } catch {
-    // no interface info: treat as remote, which is the safe default
+    base = relayBase();
+  } catch (err) {
+    return { ok: false, error: err.message };
   }
-  return false;
-}
-
-function reply(res, status, data) {
-  const body = JSON.stringify(data === undefined ? {} : data);
-  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
-  res.end(body);
-}
-
-function markPluginSeen() {
-  broker.lastPluginPoll = Date.now();
-  broker.lastPluginSeen = Date.now();
-}
-
-/** Hand one command to the plugin and wait for its result. */
-function dispatch(op, args, timeoutSec, extra) {
-  return new Promise((resolve) => {
-    const id = `c${Date.now().toString(36)}${crypto.randomBytes(3).toString("hex")}`;
-    const timer = setTimeout(() => {
-      if (!broker.inflight.has(id)) return;
-      broker.inflight.delete(id);
-      resolve({
-        id,
-        op,
-        ok: false,
-        error: `Studio did not answer '${op}' within ${timeoutSec}s. Check that the Golem window is open and connected.`,
-      });
-    }, Math.max(1, timeoutSec) * 1000);
-    broker.inflight.set(id, { resolve, timer });
-    broker.queue.push(Object.assign({ id, op, args: args || {} }, extra || {}));
-    // wake a long-polling plugin immediately instead of waiting for its timer
-    const waiters = (broker.pollWaiters || []).splice(0, (broker.pollWaiters || []).length);
-    for (const w of waiters) w();
-  });
-}
-
-/** Ask the in-game driver something (screenshot, click, key press, logs). */
-function guestDispatch(role, op, args, timeoutMs) {
-  return new Promise((resolve) => {
-    const id = `g${(broker.guestSeq += 1)}`;
-    const timer = setTimeout(() => {
-      broker.guestPending.delete(id);
-      resolve({ ok: false, error: `the ${role} driver did not answer within ${Math.round(timeoutMs / 1000)}s - is the play test running?` });
-    }, Math.max(1000, timeoutMs || 20000));
-    broker.guestPending.set(id, { resolve, timer });
-    broker.guestQueue[role] = broker.guestQueue[role] || [];
-    broker.guestQueue[role].push({ id, op, args: args || {} });
-    const waiters = broker.guestWaiters[role] || [];
-    const waiter = waiters.shift();
-    if (waiter) waiter();
-  });
-}
-
-function handleBrokerRequest(req, res, url) {
-  const pathname = url.pathname;
-  const route = `${req.method} ${pathname}`;
-
-  if (route === "GET /v1/health") {
-    // Reachability probe for this machine's own CLI. Off-loopback it would leak
-    // the device id and place name to anyone who can hit the port.
-    if (!onLoopback() && !isLocalSocket(req)) {
-      reply(res, 403, { ok: false, error: "health is local-only" });
-      return;
-    }
-    reply(res, 200, {
-      ok: true,
-      service: "golem-bridge",
-      version: VERSION,
-      port: serverPort(),
-      bind: bindAddress(),
-      loopbackOnly: onLoopback(),
-      plugin: { connected: Date.now() - broker.lastPluginPoll < PLUGIN_STALE_MS, lastPollMs: broker.lastPluginPoll },
-      place: broker.place,
-      deviceId: broker.deviceId,
-      drivers: { client: Date.now() - broker.drivers.client < 12000, server: Date.now() - broker.drivers.server < 12000 },
-      commandsServed: broker.commandsServed,
-      errors: broker.errors,
-      uptimeSeconds: Math.floor((Date.now() - broker.startedAt) / 1000),
-    });
-    return;
+  if (!isValidChannel(channelId)) {
+    return { ok: false, error: "bad channel id - copy the setup line from the Studio window" };
   }
-
-  if (route === "POST /v1/session") {
-    readBody(req).then((text) => {
-      let data = {};
-      try {
-        data = JSON.parse(text || "{}");
-      } catch {
-        reply(res, 400, { ok: false, error: "bad JSON" });
-        return;
-      }
-      if (broker.secret && data.secret !== broker.secret) {
-        broker.errors += 1;
-        brokerLog("rejected a link with the wrong secret");
-        reply(res, 403, { ok: false, error: "wrong secret - copy the setup line from the Golem window again" });
-        return;
-      }
-      broker.deviceId = data.deviceId || broker.deviceId;
-      broker.place = data.place || broker.place;
-      broker.placeId = data.placeId || broker.placeId;
-      broker.pluginVersion = data.pluginVersion || broker.pluginVersion;
-      markPluginSeen();
-      brokerLog(`linked: ${broker.place || "place"} v${broker.pluginVersion || "?"}`);
-      reply(res, 200, { ok: true, cursor: String(Date.now()) });
-    }).catch(() => reply(res, 400, { ok: false, error: "unreadable body" }));
-    return;
+  const enc = encodeURIComponent(channelId);
+  const cmdId = `c${Date.now().toString(36)}${crypto.randomBytes(8).toString("hex")}`;
+  const payload = JSON.stringify({ id: cmdId, op, args: args || {}, ts: Math.floor(Date.now() / 1000) });
+  // The relay answers a POST with the push key it minted. Result keys are push
+  // keys too, so anything at or below ours was written before this command and
+  // cannot be its reply - skip it and keep each poll to one small GET.
+  let sinceKey = null;
+  for (let attempt = 0; ; attempt++) {
+    let r;
+    try {
+      r = await fetchText(`${base}/channels/${enc}/cmd.json`, { method: "POST", body: payload });
+    } catch (err) {
+      return { ok: false, error: `cannot reach the relay (${err.message}) - check internet/DNS` };
+    }
+    if (r.status === 429 && attempt < 3) {
+      await sleep(parseRetryAfter(r.headers, 5 * (attempt + 1)) * 1000);
+      continue;
+    }
+    if (!r.ok) {
+      return { ok: false, error: `relay rejected the command: HTTP ${r.status}: ${r.text.slice(0, 200)}` };
+    }
+    try {
+      sinceKey = (JSON.parse(r.text) || {}).name || null;
+    } catch {
+      sinceKey = null;
+    }
+    break;
   }
-
-  if (route === "GET /v1/poll") {
-    if (!authorized(url, req.headers, null)) {
-      reply(res, 403, { ok: false, error: "unauthorized" });
-      return;
-    }
-    const device = url.searchParams.get("device") || "";
-    if (broker.deviceId && device && device !== broker.deviceId) {
-      reply(res, 409, { ok: false, error: "this bridge belongs to another Studio session - run connect again" });
-      return;
-    }
-    if (device) broker.deviceId = broker.deviceId || device;
-    markPluginSeen();
-    const cursor = url.searchParams.get("cursor") || "";
-    const waitMs = Math.min(2500, Math.max(0, parseInt(url.searchParams.get("wait") || "0", 10) || 0));
-    const send = () => {
-      const commands = broker.queue.splice(0, broker.queue.length);
-      for (const c of commands) broker.commandsServed += 1;
-      reply(res, 200, { ok: true, cursor: cursor || String(Date.now()), commands });
-      if (commands.length && commands.length > 1) brokerLog(`queued ${commands.length} commands`);
-    };
-    if (broker.queue.length || waitMs === 0) {
-      send();
-      return;
-    }
-    // Long poll: answer as soon as work arrives, otherwise say "nothing yet".
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const idx = (broker.pollWaiters || []).indexOf(finish);
-      if (idx !== -1) broker.pollWaiters.splice(idx, 1);
-      send();
-    };
-    const timer = setTimeout(finish, waitMs);
-    broker.pollWaiters = broker.pollWaiters || [];
-    broker.pollWaiters.push(finish);
-    return;
-  }
-
-  if (route === "POST /v1/result") {
-    // Only Studio (same machine) posts command results. A remote caller posting
-    // here could forge the answer to a command the AI is waiting on.
-    if (!isLocalSocket(req)) {
-      reply(res, 403, { ok: false, error: "results are accepted from this machine only" });
-      return;
-    }
-    readBody(req).then((text) => {
-      let data = {};
-      try {
-        data = JSON.parse(text || "{}");
-      } catch {
-        reply(res, 400, { ok: false, error: "bad JSON" });
-        return;
-      }
-      const envelope = data.result || data;
-      const pending = envelope && broker.inflight.get(envelope.id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        broker.inflight.delete(envelope.id);
-        pending.resolve(envelope);
-      } else {
-        brokerLog(`result for unknown command ${envelope && envelope.id}`);
-      }
-      reply(res, 200, { ok: true });
-    }).catch(() => reply(res, 400, { ok: false, error: "unreadable body" }));
-    return;
-  }
-
-  if (route === "POST /v1/call") {
-    // handleBrokerRequest is sync; keep its promise rejection off the stack
-    readBody(req).then(async (text) => {
-      let data = {};
-      try {
-        data = JSON.parse(text || "{}");
-      } catch {
-        reply(res, 400, { ok: false, error: "bad JSON" });
-        return;
-      }
-      if (!authorized(url, req.headers, data)) {
-        reply(res, 403, { ok: false, error: "unauthorized - the setup line does not match this bridge" });
-        return;
-      }
-      // The plugin polls continuously, so a command may arrive in the gap
-      // between the broker starting and the plugin's next poll: give it a
-      // moment instead of failing the call.
-      const waitingSince = Date.now();
-      while (!broker.deviceId && Date.now() - waitingSince < 4000) {
-        await sleep(100);
-      }
-      if (!broker.deviceId) {
-        reply(res, 200, {
+  const deadline = Date.now() + timeoutSec * 1000;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    let r;
+    try {
+      r = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 60000 });
+    } catch (err) {
+      if (isTooLarge(err)) {
+        return {
           ok: false,
-          op: data.op,
-          error:
-            "Studio is not polling this bridge. Keep the Golem window open - its footer should say connected. If it does, paste the setup line from that window here again so both sides use the same one.",
-        });
-        return;
-      }
-      const result = await dispatch(data.op, data.args, data.timeout || DEFAULT_TIMEOUT, { turn: data.turn });
-      reply(res, 200, result);
-    }).catch((err) => {
-      broker.errors += 1;
-      brokerLog(`call failed: ${(err && err.message) || err}`);
-      if (!res.headersSent) reply(res, 400, { ok: false, error: `unreadable body: ${(err && err.message) || err}` });
-    });
-    return;
-  }
-
-  if (route === "POST /v1/guest/exec") {
-    if (!isLocalSocket(req)) {
-      reply(res, 403, { ok: false, error: "the in-game driver must be on this machine" });
-      return;
-    }
-    readBody(req).then((text) => {
-      let data = {};
-      try {
-        data = JSON.parse(text || "{}");
-      } catch {
-        reply(res, 400, { ok: false, error: "bad JSON" });
-        return;
-      }
-      const role = data.role === "server" ? "server" : "client";
-      const op = String(data.op || "");
-
-      // the driver inside the game checks in for work
-      if (op === "poll") {
-        broker.drivers[role] = Date.now();
-        const queue = broker.guestQueue[role] || [];
-        const item = queue.shift();
-        if (item) {
-          reply(res, 200, { ok: true, result: { commands: [{ id: item.id, op: item.op, args: item.args }] } });
-          return;
-        }
-        broker.guestWaiters[role] = broker.guestWaiters[role] || [];
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          const list = broker.guestWaiters[role] || [];
-          const idx = list.indexOf(finish);
-          if (idx !== -1) list.splice(idx, 1);
-          const next = (broker.guestQueue[role] || []).shift();
-          reply(res, 200, {
-            ok: true,
-            result: { commands: next ? [{ id: next.id, op: next.op, args: next.args }] : [] },
-          });
+          error: "the result channel is too large to poll - ask the user to restart Studio to rotate to a fresh channel",
         };
-        const timer = setTimeout(finish, 1500);
-        broker.guestWaiters[role].push(finish);
-        return;
       }
-
-      // the driver reporting back
-      if (op === "result") {
-        broker.drivers[role] = Date.now();
-        const payload = data.args || {};
-        const pending = broker.guestPending.get(payload.id);
-        if (pending) {
-          clearTimeout(pending.timer);
-          broker.guestPending.delete(payload.id);
-          pending.resolve(payload);
+      attempt++;
+      await sleep(Math.min(15, 0.5 * 2 ** Math.min(attempt, 5)) * 1000);
+      continue;
+    }
+    if (r.status === 429) {
+      await sleep(parseRetryAfter(r.headers, 6) * 1000);
+      continue;
+    }
+    if (!r.ok) {
+      await sleep(2000);
+      continue;
+    }
+    attempt = 0;
+    let keys;
+    try {
+      keys = r.text === "null" ? {} : JSON.parse(r.text);
+    } catch {
+      keys = {};
+    }
+    if (keys && typeof keys === "object") {
+      for (const key of Object.keys(keys).sort()) {
+        if (sinceKey !== null && !(key > sinceKey)) continue;
+        let entry;
+        try {
+          const er = await fetchText(`${base}/channels/${enc}/res/${encodeURIComponent(key)}.json`, {
+            timeoutMs: 60000,
+          });
+          if (!er.ok) continue; // transient: retry this key on the next poll
+          entry = JSON.parse(er.text);
+        } catch (err) {
+          if (isTooLarge(err)) {
+            return {
+              ok: false,
+              error: `Studio's reply to '${op}' exceeded the relay size cap - narrow the query (path, depth, max)`,
+            };
+          }
+          continue; // transient or corrupt entry: retry this key on the next poll
         }
-        reply(res, 200, { ok: true });
-        return;
+        if (entry && entry.id === cmdId) {
+          if (entry.resultEncoded && typeof entry.result === "string") {
+            try {
+              entry.result = JSON.parse(entry.result);
+            } catch {
+              // keep the raw string
+            }
+            delete entry.resultEncoded;
+          }
+          return entry;
+        }
       }
-
-      if (op === "hello") {
-        const live = Date.now() - (broker.drivers[role] || 0) < 12000;
-        reply(res, 200, {
-          ok: true,
-          result: {
-            role,
-            live,
-            play: live,
-            place: broker.place,
-            client: role === "client",
-          },
-        });
-        return;
-      }
-
-      // a request from the plugin that must run inside the game
-      const timeoutMs = Math.min(120000, Math.max(1000, parseInt(data.timeoutMs, 10) || 20000));
-      guestDispatch(role, op, data.args || {}, timeoutMs).then((result) => reply(res, 200, result));
-    }).catch(() => reply(res, 400, { ok: false, error: "unreadable body" }));
-    return;
+    }
+    await sleep(pollIntervalMs());
   }
-
-  reply(res, 404, { ok: false, error: `no route ${route}` });
+  return {
+    ok: false,
+    error: `timed out after ${timeoutSec}s waiting for Studio to answer '${op}'. Is Roblox Studio open with the Golem plugin, and does its window say connected?`,
+  };
 }
 
-function startBroker(link) {
-  broker.secret = link.secret || "";
-  if (!broker.secret && !onLoopback()) {
-    throw new Error("refusing to listen off loopback without a session secret (GOLEM_SECRET)");
+/**
+ * Diagnostics without Studio: read the beacon cache and count cached results.
+ * This is how "the plugin is alive but not answering" gets distinguished from
+ * "Studio is closed" or "the channel was rotated".
+ */
+async function status() {
+  const channel = loadLink();
+  if (!channel || !isValidChannel(channel.channel)) {
+    return { ok: false, error: "not connected (no channel saved) - run: npx golem-bridge connect <channelId>" };
   }
-  const port = link.port || serverPort();
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      let url;
-      try {
-        url = new URL(req.url, `http://${bindHostForUrls()}:${port}`);
-      } catch {
-        reply(res, 400, { ok: false, error: "bad request" });
-        return;
-      }
-      try {
-        handleBrokerRequest(req, res, url);
-      } catch (err) {
-        broker.errors += 1;
-        reply(res, 500, { ok: false, error: String((err && err.message) || err) });
-      }
-    });
-    // Track live sockets so a one-shot call can shut the listener down without
-    // leaving a plugin's long-poll hanging forever.
-    const sockets = new Set();
-    server.on("connection", (socket) => {
-      sockets.add(socket);
-      socket.on("close", () => sockets.delete(socket));
-    });
-    server.forceClose = () => {
-      for (const socket of sockets) socket.destroy();
+  let beaconData;
+  let resKeys;
+  try {
+    const base = relayBase();
+    const enc = encodeURIComponent(channel.channel);
+    const bb = await fetchText(
+      `${base}/channels/${enc}/beacons.json?orderBy=${encodeURIComponent('"$key"')}&limitToLast=5`,
+      { timeoutMs: 30000 }
+    );
+    beaconData = bb.text === "null" ? {} : JSON.parse(bb.text);
+    if (typeof beaconData !== "object" || beaconData === null) beaconData = {};
+    const rb = await fetchText(`${base}/channels/${enc}/res.json?shallow=true`, { timeoutMs: 30000 });
+    resKeys = rb.text === "null" ? {} : JSON.parse(rb.text);
+    if (typeof resKeys !== "object" || resKeys === null) resKeys = {};
+  } catch (err) {
+    return { ok: false, error: `cannot read the relay channel: ${err.message}` };
+  }
+  const results = Object.values(resKeys).filter((v) => v === true).length;
+  const beacons = Object.values(beaconData)
+    .filter((e) => e && (e.op === "hello" || e.op === "revoked"))
+    .map((e) => [parseFloat(e.ts) || 0, e]);
+  if (!beacons.length) {
+    const verdict = results
+      ? `no beacons, but ${results} cached result(s) - Studio is not running or runs an older plugin; ask the user to restart Studio with the current plugin`
+      : "the channel is empty - the plugin has never posted here: Studio is closed, or the setup line is from an older Studio session";
+    return { ok: true, beacon: null, ageSeconds: null, recentResults: results, verdict };
+  }
+  beacons.sort((a, b) => a[0] - b[0]);
+  const [ts, beacon] = beacons[beacons.length - 1];
+  const age = ts > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - ts)) : null;
+  const ver = beacon.v || "?";
+  if (beacon.op === "revoked") {
+    const ago = age === null ? "" : age < 120 ? ` ${age}s ago` : ` ${Math.floor(age / 60)} min ago`;
+    return {
+      ok: true,
+      beacon,
+      ageSeconds: age,
+      recentResults: results,
+      verdict: `this channel was ROTATED${ago} - Studio wiped it (END SESSION or restart) and minted a new one; ask the user for the fresh setup line and run: npx golem-bridge reconnect <newId>`,
     };
-    server.on("error", (err) => {
-      if (err && err.code === "EADDRINUSE") {
-        reject(new Error(`port ${port} is already in use - another golem-bridge is running, or set GOLEM_PORT`));
-      } else {
-        reject(err);
-      }
-    });
-    server.listen(port, bindAddress(), () => {
-      brokerLog(`listening on ${serverUrl(port)}`);
-      resolve({ server, port });
-    });
-  });
+  }
+  const verdict =
+    age === null
+      ? `last beacon has no timestamp (v${ver}) - ask the user to check the Golem window`
+      : age <= 900
+        ? `plugin is LIVE (v${ver}, hello beacon ${age}s ago) - it should answer commands`
+        : `last hello was ${Math.floor(age / 60)} min ago (v${ver}) - Studio may be closed or hung since then; ask the user to check the Golem window`;
+  return { ok: true, beacon, ageSeconds: age, recentResults: results, verdict };
 }
 
 // ---------------------------------------------------------------- tool table
@@ -1024,8 +503,8 @@ const GROUPS = [
 const TOOLS = {
   ping: { help: "health check - is Studio connected?" },
   debug: { help: "diagnostics: transport, versions, turn, drivers, errors" },
-  status: { help: "is the plugin reachable from this terminal? (no Studio needed)", local: true },
-  cancel: { help: "drop commands still waiting for Studio (after a stuck call)", local: true },
+  status: { help: "is Studio live on this channel? reads the relay beacons (no Studio round-trip)", local: true },
+  cancel: { help: "explains how to recover when a call looks stuck", local: true },
   exec: { help: 'send a raw op JSON: {"op":..., "args":...}', pos: [["json"]] },
   lua: { help: "run Lua inside Studio (code arg, or - for stdin)", pos: [["code", null]] },
   list: { help: "children of a path", pos: [["path", "game"]], flags: { recursive: "bool", max: "int" } },
@@ -1586,13 +1065,13 @@ function toolUsage(name) {
 function printHelp() {
   console.log("golem-bridge: drive a live Roblox Studio session from any AI agent.");
   console.log("");
-  console.log("Direct link - the plugin in Studio talks to this terminal over localhost,");
-  console.log("so there is no relay and nothing to sign in to.");
+  console.log("Studio and this CLI meet at a relay, because a cloud agent cannot reach");
+  console.log("your machine and a Studio plugin can only make outgoing calls.");
   console.log("");
   console.log("  Start:  paste the setup line from the Golem window in Studio:");
-  console.log("          npx golem-bridge connect <secret>");
+  console.log("          npx golem-bridge connect <channelId>");
   console.log("");
-  console.log("Session: connect <line> | disconnect | status | cancel | manual | help [tool]");
+  console.log("Session: connect <line> | reconnect [line] | disconnect | status | cancel | manual | help [tool]");
   for (const [group, names] of GROUPS) {
     console.log("");
     console.log(`${group}:`);
@@ -1642,118 +1121,210 @@ function printManual() {
   }
 }
 
-// ------------------------------------------------------------- connection ops
-async function status() {
-  const link = loadLink();
-  const port = link ? link.port : serverPort();
-  const health = await serverInfo(port);
-  if (!health) {
-    return {
-      ok: false,
-      error: link
-        ? `no golem-bridge server is listening on ${serverUrl(port)} - start tools through this CLI (each call serves briefly), or run \`npx golem-bridge connect\` in a terminal that stays open`
-        : "not connected - run the setup line from the Golem window: npx golem-bridge connect <secret>",
-    };
+// -------------------------------------------------------------- screenshots
+// The plugin sends raw RGBA as "x,y,r,g,b,a;..." pairs. Writing the PNG here
+// keeps the plugin small and means the AI gets a file it can actually open.
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let k = 0; k < 8; k++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
   }
-  const pluginLive = !!(health.plugin && health.plugin.connected);
-  return {
-    ok: true,
-    op: "status",
-    result: {
-      server: {
-        url: process.env.GOLEM_URL ? agentBaseUrl() : serverUrl(port),
-        tunnel: !!process.env.GOLEM_URL,
-        bind: health.bind,
-        loopbackOnly: health.loopbackOnly,
-        version: health.version,
-        uptimeSeconds: health.uptimeSeconds,
-      },
-      linked: !!link,
-      deviceId: health.deviceId || (link && link.deviceId) || null,
-      place: health.place,
-      pluginConnected: pluginLive,
-      lastPluginPollMsAgo: health.plugin && health.plugin.lastPollMs ? Date.now() - health.plugin.lastPollMs : null,
-      drivers: health.drivers,
-      commandsServed: health.commandsServed,
-      verdict: pluginLive
-        ? "Studio is linked and polling - tools will answer"
-        : "this bridge is up, but no plugin is polling it. Open the Golem window in Studio and check it says connected; if it does not, paste the setup line there again.",
-    },
-  };
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
-/**
- * A tool call must not host the bridge itself: the plugin only polls in bursts,
- * so the listener has to outlive a single command. `npx golem-bridge __serve`
- * is that detached listener - connect starts it, and any tool call starts it
- * on demand so back-to-back calls in a fresh terminal still work.
- */
-function spawnServer(link) {
-  const env = Object.assign({}, process.env, {
-    GOLEM_PORT: String(link.port || serverPort()),
-    GOLEM_SERVE_SECRET: link.secret || "",
-  });
-  const child = require("child_process").spawn(process.execPath, [__filename, "__serve"], {
-    detached: true,
-    stdio: "ignore",
-    env,
-  });
-  child.unref();
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const name = Buffer.from(type, "ascii");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([name, data])), 0);
+  return Buffer.concat([len, name, data, crc]);
 }
 
-async function ensureServer(link) {
-  const port = link.port || serverPort();
-  const health = await serverInfo(port);
-  if (health) return;
-  spawnServer(link);
-  const deadline = Date.now() + 6000;
-  while (Date.now() < deadline) {
-    await sleep(120);
-    if (await serverInfo(port)) return;
+function encodePng(width, height, rgba) {
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: none
+    rgba.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
   }
-  throw new Error(`could not start the bridge on ${serverUrl(port)} - run \`npx golem-bridge status\``);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw, { level: 6 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
-async function withServer(link, fn) {
-  await ensureServer(link);
-  return fn();
-}
-
-/** Long-running bridge process; exits when Studio stops polling for a while. */
-async function serve(link) {
-  const { server, port } = await startBroker(link);
-  brokerLog("serving until Studio goes quiet");
-  const idleLimitMs = 30 * 60 * 1000;
-  const timer = setInterval(() => {
-    if (Date.now() - broker.lastPluginSeen > idleLimitMs) {
-      clearInterval(timer);
-      server.close(() => process.exit(0));
-      setTimeout(() => process.exit(0), 1500);
+function decodeRgbaCsv(text, width, height) {
+  const buf = Buffer.alloc(width * height * 4);
+  let i = 0;
+  for (const pixel of String(text || "").split(";")) {
+    if (i >= buf.length) break;
+    const parts = pixel.split(",");
+    if (parts.length < 4) {
+      i += 4;
+      continue;
     }
-  }, 30000);
-  timer.unref();
-  const shutdown = () => {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 800);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  brokerLog(`bridge ready for Studio on ${serverUrl(port)}`);
+    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[0], 10) || 0));
+    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[1], 10) || 0));
+    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[2], 10) || 0));
+    buf[i++] = Math.max(0, Math.min(255, parseInt(parts[3], 10) || 255));
+  }
+  return buf;
 }
 
+function writeScreenshot(result, label) {
+  const width = parseInt(result.width, 10);
+  const height = parseInt(result.height, 10);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error("the capture came back without a usable size");
+  }
+  const safe = String(label || result.label || "viewport").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40) || "viewport";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const file = path.join(shotsDir(), `${safe}-${stamp}.png`);
+  fs.mkdirSync(shotsDir(), { recursive: true });
+  fs.writeFileSync(file, encodePng(width, height, decodeRgbaCsv(result.pixels, width, height)));
+  return { file, width, height };
+}
+
+// ---------------------------------------------------------------- marketplace
+// search/info run on this machine: Studio's HttpService cannot reach roblox.com.
+
+const MP_CATEGORIES = {
+  model: "Model", models: "Model", mesh: "MeshPart", meshes: "MeshPart", meshpart: "MeshPart",
+  decal: "Decal", decals: "Decal", image: "Decal", images: "Decal", picture: "Decal", texture: "Decal",
+  audio: "Audio", sound: "Audio", sounds: "Audio", music: "Audio",
+  video: "Video", videos: "Video", plugin: "Plugin", plugins: "Plugin",
+};
+const ASSET_TYPE_NAMES = { 1: "Image", 3: "Audio", 4: "Mesh", 9: "Decal", 10: "Model", 18: "Video", 19: "Font", 40: "MeshPart" };
+
+async function webJson(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": `golem-bridge/${VERSION}`, Accept: "application/json" },
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} from Roblox: ${text.slice(0, 200)}`);
+    return JSON.parse(text);
+  } catch (err) {
+    if (err && err.name === "AbortError") throw new Error("request timed out");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function mpSearch(query, category, limit, cursor) {
+  const assetType = MP_CATEGORIES[String(category || "model").toLowerCase()];
+  if (!assetType) throw new Error(`unknown category '${category}' (valid: model, mesh, image, audio, video, plugin)`);
+  let n = parseInt(limit, 10);
+  if (!Number.isFinite(n)) n = 10;
+  n = Math.max(1, Math.min(n, 50));
+  let url = `https://apis.roblox.com/toolbox-service/v1/marketplace/${assetType}?keyword=${encodeURIComponent(String(query))}&limit=${n}`;
+  if (cursor) url += `&cursor=${encodeURIComponent(String(cursor))}`;
+  const data = await webJson(url);
+  const ids = ((data && data.data) || []).filter((it) => it && it.id != null).map((it) => it.id);
+  const details = {};
+  const thumbs = {};
+  const enriched = Math.min(ids.length, 12);
+  for (let i = 0; i < enriched; i++) {
+    try {
+      details[ids[i]] = await webJson(`https://economy.roblox.com/v2/assets/${ids[i]}/details`);
+    } catch {
+      // one bad asset must not kill the search
+    }
+    if (i < enriched - 1) await sleep(400); // the economy API rate limits hard
+  }
+  if (ids.length) {
+    try {
+      const tdata = await webJson(
+        `https://thumbnails.roblox.com/v1/assets?assetIds=${ids.slice(0, 12).join(",")}&size=420x420&format=Png`
+      );
+      for (const th of (tdata && tdata.data) || []) {
+        if (th && th.targetId != null) thumbs[th.targetId] = th;
+      }
+    } catch {
+      // thumbnails are a bonus
+    }
+  }
+  const results = ids.map((aid) => {
+    const d = details[aid];
+    const th = thumbs[aid];
+    const entry = { id: aid, category: assetType };
+    if (d && typeof d === "object") {
+      entry.name = d.Name;
+      entry.assetTypeId = d.AssetTypeId;
+      entry.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
+      if (d.Creator && typeof d.Creator === "object") entry.creator = d.Creator.Name;
+      entry.priceInRobux = d.PriceInRobux ?? null;
+      if (d.IsForSale != null) entry.forSale = d.IsForSale;
+      if (typeof d.Description === "string" && d.Description) entry.description = d.Description.slice(0, 280);
+    } else {
+      entry.detailsUnavailable = true;
+    }
+    if (th && typeof th === "object") {
+      entry.thumbnail = th.imageUrl;
+      entry.thumbnailState = th.state;
+    }
+    return entry;
+  });
+  const output = { totalResults: (data && data.totalResults) ?? 0, results };
+  if (data && data.nextPageCursor) output.nextPageCursor = data.nextPageCursor;
+  return output;
+}
+
+async function mpInfo(assetId) {
+  const text = String(assetId == null ? "" : assetId).trim();
+  if (!/^\d+$/.test(text)) throw new Error(`bad asset id '${assetId}'`);
+  const aid = parseInt(text, 10);
+  const d = await webJson(`https://economy.roblox.com/v2/assets/${aid}/details`);
+  const output = { id: aid };
+  if (d && typeof d === "object") {
+    output.name = d.Name;
+    output.assetTypeId = d.AssetTypeId;
+    output.assetType = ASSET_TYPE_NAMES[d.AssetTypeId];
+    if (d.Creator && typeof d.Creator === "object") output.creator = d.Creator.Name;
+    output.priceInRobux = d.PriceInRobux ?? null;
+    if (d.IsForSale != null) output.forSale = d.IsForSale;
+    if (typeof d.Description === "string") output.description = d.Description.slice(0, 1000);
+  }
+  try {
+    const tdata = await webJson(`https://thumbnails.roblox.com/v1/assets?assetIds=${aid}&size=420x420&format=Png`);
+    if (Array.isArray(tdata && tdata.data) && tdata.data.length) {
+      output.thumbnail = tdata.data[0].imageUrl;
+      output.thumbnailState = tdata.data[0].state;
+    }
+  } catch {
+    // thumbnails are a bonus
+  }
+  return output;
+}
+
+
+// ------------------------------------------------------------- connection ops
+/** One command, end to end, through the relay. */
 async function runCommand(link, op, args, timeoutSec) {
   const turn = currentTurn();
-  return withServer(link, async () => {
-    const r = await httpJson(`${agentBaseUrl()}/v1/call`, {
-      method: "POST",
-      body: { op, args, timeout: timeoutSec, turn: turn.token, device: link.deviceId, secret: link.secret },
-      timeoutMs: (timeoutSec + 25) * 1000,
-    });
-    if (!r.json) {
-      return { id: null, op, ok: false, error: `the local bridge did not answer (HTTP ${r.status}). Run \`npx golem-bridge status\`.` };
-    }
-    return r.json;
-  });
+  // The turn token rides along on every command of a request so the plugin can
+  // open the turn on the first call instead of the next one.
+  const envelope = await relayCall(link.channel, op, Object.assign({}, args, { __turn: turn.token }), timeoutSec);
+  return envelope;
 }
 
 // Slow ops need longer minimum waits, but only when the user did not pass an
@@ -1770,52 +1341,25 @@ async function connect(setupLine, opts) {
   const parsed = parseSetupLine(setupLine);
   if (!parsed) {
     fail(
-      "connect: expected the setup line from the Golem window (npx golem-bridge connect <secret>). Copy the whole line.",
+      "connect: expected the setup line from the Golem window (npx golem-bridge connect <channelId>). Copy the whole line.",
       2
     );
   }
-  if (parsed.legacy) {
-    fail(
-      "connect: that is a 3.x line. The 4.x plugin shows a single secret (no channel id, no colon) - copy the line from the updated Golem window.",
-      2
-    );
-  }
-  const port = parsed.port || serverPort();
-  const link = { secret: parsed.secret, port, deviceId: null };
-  const url = serverUrl(port);
-  process.stdout.write(`golem-bridge is listening on ${url}\n`);
-  if (!onLoopback()) {
-    process.stdout.write(
-      `  (bound to ${bindAddress()} - reachable from other machines on this network; ` +
-        "every call needs the session secret)\n"
-    );
-  }
-  try {
-    await ensureServer(link);
-  } catch (err) {
-    fail(`connect: ${err.message}`, 1);
-  }
-
-  const deadline = Date.now() + (o.timeout || 90) * 1000;
-  let health = await serverInfo(port);
-  process.stderr.write("waiting for Studio to link");
-  while (Date.now() < deadline) {
-    health = await serverInfo(port);
-    if (health && health.deviceId) break;
-    process.stderr.write(".");
-    await sleep(750);
-  }
+  const channel = parsed.channel;
+  console.log(`relay: ${relayBase()}`);
+  process.stderr.write("asking Studio to answer");
+  const entry = await relayCall(channel, "ping", {}, o.timeout || 60);
   process.stderr.write("\n");
-
-  if (!health || !health.deviceId || !(health.plugin && health.plugin.connected)) {
-    const saved = saveLink({ secret: parsed.secret, port });
+  if (!entry || !entry.ok) {
+    saveLink({ channel });
     console.error(
       JSON.stringify(
         {
           ok: false,
           error:
-            "Studio never linked to this terminal. Check that the Golem window is open, that the setup line there matches this one, and that Studio allows this computer's plugin to use HTTP.",
-          savedTo: saved,
+            (entry && entry.error) ||
+            "Studio did not answer that channel. Copy the line from the Golem window in Studio; it changes every Studio session.",
+          savedTo: linkFile(),
         },
         null,
         2
@@ -1824,37 +1368,15 @@ async function connect(setupLine, opts) {
     process.exitCode = 1;
     return;
   }
-
-  const saved = saveLink({
-    secret: parsed.secret,
-    port,
-    deviceId: health.deviceId,
-    place: health.place,
-  });
-  // the background bridge needs the real secret, not whatever env it inherited
-  spawnServer({ secret: parsed.secret, port });
-  console.log(`connected. place: ${health.place || "(unknown)"}`);
+  const res = (entry.result && typeof entry.result === "object" && entry.result) || {};
+  const place = res.place || res.placeName || entry.place;
+  const saved = saveLink({ channel, place, pluginVersion: res.version });
+  console.log(`connected. place: ${place || "(unknown)"}${res.version ? `  (plugin v${res.version})` : ""}`);
   console.log(`saved to ${saved}`);
-  if (process.env.GOLEM_URL) {
-    console.log(`reaching the bridge through ${agentBaseUrl()} (tunnel mode)`);
-  }
+  const shadow = envOf("GOLEM_CHANNEL", "AIB_CHANNEL");
+  if (shadow) console.error(`warning: $GOLEM_CHANNEL is set - it overrides the saved channel.`);
   console.log("");
-  console.log("Keep this terminal open while the AI works - it is the direct link to Studio.");
-  console.log("Every tool call from any other terminal will reach Studio through it.");
   printManual();
-
-  console.log("");
-  console.log("The bridge runs in the background, so you can close this terminal and");
-  console.log("keep working - `npx golem-bridge disconnect` stops it when you are done.");
-  if (o.stay === false) return;
-  // Stay attached so the user sees the link is live, until Ctrl+C.
-  await new Promise((resolve) => {
-    const stop = () => resolve();
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
-    setInterval(() => {}, 1 << 30);
-  });
-  console.log("\nbridge still running in the background (Studio keeps running too).");
 }
 
 function disconnect() {
@@ -1874,21 +1396,10 @@ function disconnect() {
   console.log(removed ? "disconnected (local link files removed)." : "already disconnected (nothing saved).");
 }
 
-async function cancelQueued() {
-  const link = loadLink();
-  const port = link ? link.port : serverPort();
-  if (!(await serverInfo(port))) {
-    console.log("nothing to cancel - no bridge is running.");
-    return;
-  }
-  const dropped = broker.queue.length + broker.inflight.size;
-  for (const [, pending] of broker.inflight) {
-    clearTimeout(pending.timer);
-    pending.resolve({ ok: false, op: "cancelled", error: "cancelled by the user" });
-  }
-  broker.inflight.clear();
-  broker.queue.length = 0;
-  console.log(dropped ? `dropped ${dropped} queued command(s).` : "nothing was waiting.");
+function cancelQueued() {
+  console.log("nothing to cancel: with the relay, each tool call waits on its own reply.");
+  console.log("If a call looks stuck, press Ctrl+C here and ask Studio to restart - a stuck");
+  console.log("command cannot hold the channel open, it only expires.");
 }
 
 function parseToolInvocation(name, argv) {
@@ -1963,46 +1474,34 @@ async function main(argv) {
     return;
   }
   if (cmd === "manual") { printManual(); return; }
-  if (cmd === "__serve") {
-    const saved = loadLink() || {};
-    const link = {
-      secret: envOf("GOLEM_SERVE_SECRET") || saved.secret || "",
-      port: serverPort(),
-    };
-    await serve(link);
-    return;
-  }
-  if (cmd === "disconnect") { disconnect(); return; }
-  if (cmd === "connect") {
+  if (cmd === "connect" || cmd === "reconnect") {
     let timeout = null;
     let line = null;
-    let stay = true;
-    let portFlag = null;
     for (let k = 0; k < rest.length; k++) {
       const a = rest[k];
       if (a === "--timeout" && k + 1 < rest.length) timeout = parseFloat(rest[++k]);
       else if (a.startsWith("--timeout=")) timeout = parseFloat(a.slice(10));
-      else if (a === "--no-wait") stay = false;
-      else if (a === "--port" && k + 1 < rest.length) portFlag = parseInt(rest[++k], 10);
-      else if (a.startsWith("--port=")) portFlag = parseInt(a.slice(7), 10);
       else if (!a.startsWith("-") && line === null) line = a;
-      else { console.error(`golem-bridge: connect: bad argument ${a}`); process.exitCode = 2; return; }
+      else { console.error(`golem-bridge: ${cmd}: bad argument ${a}`); process.exitCode = 2; return; }
     }
     if (timeout != null && (!(timeout > 0) || !Number.isFinite(timeout))) {
       console.error("golem-bridge: --timeout must be a positive, finite number of seconds");
       process.exitCode = 2;
       return;
     }
-    if (line === null) fail("connect: need the setup line from the Golem window.", 2);
-    if (portFlag != null && (!(portFlag > 0) || portFlag > 65535)) {
-      console.error("golem-bridge: --port must be a port number");
-      process.exitCode = 2;
-      return;
+    // reconnect with no argument re-tries the channel already saved, which is
+    // what you want after Studio restarts mid-conversation
+    if (line === null) {
+      if (cmd !== "reconnect") fail("connect: need the setup line from the Golem window.", 2);
+      const saved = loadLink();
+      if (!saved) fail("reconnect: nothing saved yet - run: npx golem-bridge connect <channelId>", 2);
+      line = saved.channel;
+      console.log(`re-trying the saved channel ${line}`);
     }
-    if (portFlag != null) process.env.GOLEM_PORT = String(portFlag);
-    await connect(line, { timeout, stay });
+    await connect(line, { timeout });
     return;
   }
+  if (cmd === "disconnect") { disconnect(); return; }
   if (Object.hasOwn(TOOLS, cmd)) {
     if (TOOLS[cmd].local) await runLocalTool(cmd, rest);
     else await runRelayTool(cmd, rest);
@@ -2035,14 +1534,12 @@ module.exports = {
   mpSearch,
   mpInfo,
   status,
-  broker,
-  startBroker,
-  authorized,
-  isLocalSocket,
-  bindAddress,
-  onLoopback,
-  agentBaseUrl,
-  agentHeaders,
+  relayCall,
+  relayBase,
+  isValidChannel,
+  pollIntervalMs,
+  isTooLarge,
   UsageError,
   main,
 };
+

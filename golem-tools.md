@@ -9,17 +9,21 @@ need — do not read the file end to end every request.
 
 ## 0. The two rules that matter
 
-**Direct link.** Studio calls `npx golem-bridge`; nothing goes through a relay
-service, no account is involved, and there is no third party that can read the
-place. If a tool fails, the answer is in this terminal — run
-`npx golem-bridge status` and read the verdict.
+**The relay.** Studio and this CLI cannot talk to each other directly: a Studio
+plugin can only make outgoing calls, and you are usually running in a cloud
+sandbox that cannot reach the user's computer. So both sides meet at a small
+Firebase Realtime Database: you push a command into a channel
+(`channels/<id>/cmd`), Studio polls it, runs it, and pushes the result back
+(`channels/<id>/res`). The database only stores JSON, and the channel id in the
+setup line is the entire capability.
 
-That also means **your Studio is going to a URL you must be able to reach**: the
-plugin can only make outgoing calls. On the same machine as Studio that is
-loopback and needs no setup. If you run somewhere else (a cloud sandbox, a
-different box), the user has to expose the bridge through a tunnel and set
-`GOLEM_URL` plus the same host in Studio's Settings; until they do, `connect`
-will sit there waiting for Studio and never see it.
+That channel belongs to **one Studio session**. When the user restarts Studio or
+presses END SESSION, a new channel is minted and the old one is revoked, so the
+line in this chat stops working — if tools suddenly time out but `status` says
+the channel was rotated, ask for the fresh line instead of retrying.
+
+If a tool fails, the answer is in this terminal: run `npx golem-bridge status`
+and read the verdict.
 
 **Turns are automatic.** The plugin draws a `Turn: N` header for each request
 you make, and it opens on your *first* tool call, not the next one. You do not
@@ -29,24 +33,27 @@ can see where you are. There is no `turn` tool and there is no note system.
 
 ## 1. Connection and recovery
 
-The user pastes one line into this terminal:
+The user pastes one line into this chat (or your terminal):
 
-    npx golem-bridge connect <inbox>:<secret>
+    npx golem-bridge connect 9f3c1a77b0e24d58
 
-That line comes from the Golem window in Studio and stays valid until the user
-ends the session there. `connect` starts a small background bridge on
-`127.0.0.1:41717` and keeps it running after the terminal closes; every later
-tool call goes through it. `npx golem-bridge disconnect` stops it.
+That line comes from the Golem window in Studio and names a session channel.
+`connect` pings the channel to prove Studio answers, saves the id to
+`./.golem/link.json`, and prints the tool manual. Every later tool call is one
+round trip through the relay; there is no background process to keep alive.
+
+If you already have a line saved and Studio restarted, `reconnect` re-tries the
+saved channel, and `reconnect <newId>` switches to a fresh one.
+`npx golem-bridge disconnect` forgets it locally (Studio is unaffected).
 
 | Symptom | What it means | What to do |
 |---|---|---|
 | `not connected - run the setup line...` | no `.golem/link.json` in this directory | ask the user to paste the setup line from the Golem window |
-| `Studio is not polling this bridge` | the bridge is up but no Studio is linked to it | tell the user to open the Golem window; check its footer says connected. If it does, have them paste that window's line here again |
-| `unauthorized` | this terminal holds a different session than Studio | same as above: re-copy the line from the window |
-| tools hang, then time out | the play session is busy, or Studio is modal | `npx golem-bridge cancel` drops the queue, then retry with a longer `--timeout` |
-| several Studio windows share one line | commands may run twice | stop, tell the user to keep one window per link |
-| `connect` waits forever and `status` shows a bridge with no plugin | Studio cannot reach this machine: no tunnel, wrong tunnel URL, or the host was not set in Studio's Settings | ask the user to check **Settings → Where your AI runs** shows the same URL you are dialling, and that the tunnel is running |
-| `unauthorized` after a Studio restart or END SESSION | the setup line is a *session* secret and rotates | ask for the new line from the Golem window; the old one is dead by design |
+| `timed out waiting for Studio to answer` | the channel exists but Studio is not polling it | run `npx golem-bridge status`: it reads the beacons and tells you whether Studio is closed, running an old plugin, or the channel was rotated. Ask the user to open the Golem window; if it says connected, re-copy the line from it |
+| `status` says the channel was ROTATED | the pasted line is from a finished Studio session | ask for the new line and run `npx golem-bridge reconnect <newId>` |
+| `status` says no hello at all | Studio has never posted on this channel | the line is probably mistyped or from another session; ask the user to copy it again |
+| tools hang, then time out | a long op (play, insert_asset) is running, or Studio is modal | retry with a longer `--timeout`; `cancel` explains the recovery steps |
+| `cannot reach the relay` | this sandbox has no outbound HTTPS | tell the user your environment blocks it; no amount of retrying fixes it |
 
 `npx golem-bridge status` is the cheap check and needs no Studio round trip.
 `npx golem-bridge debug` is the expensive one: it asks the plugin about its
@@ -74,9 +81,9 @@ with the closest matches, not a silent no-op.
 | Tool | Args | Returns |
 |---|---|---|
 | `ping` | | `{ok, plugin, version, place, studio}` |
-| `debug` | | transport, port, device, cursor, turn, drivers, counters |
-| `status` | | local only: is a bridge up, is Studio polling it |
-| `cancel` | | local only: drop queued commands |
+| `debug` | | transport, relay, channel, poll interval, last error, drivers, counters |
+| `status` | | local only: reads the channel beacons - is Studio live, stale, or rotated |
+| `cancel` | | local only: explains how to recover from a stuck call |
 
 ### Exploring
 
@@ -198,8 +205,8 @@ editor it captures the Studio viewport, in a test it captures the game.
 
 ### Session
 
-`connect <line>` · `disconnect` · `status` · `cancel` · `help [tool]` ·
-`manual` · `--version`. Every tool accepts `--timeout <seconds>`.
+`connect <line>` · `reconnect [<line>]` · `disconnect` · `status` · `cancel` ·
+`help [tool]` · `manual` · `--version`. Every tool accepts `--timeout <seconds>`.
 
 ## 4. Property value formats
 
@@ -238,8 +245,9 @@ clear` carves air.
 
 ## 6. Limits and honesty
 
-- One Studio window per link. A second window on the same line can run commands
-  twice; tell the user if you suspect it.
+- One Studio session per channel. Two windows on the same line would both poll
+  it; if results look like they came from a different place, say so instead of
+  guessing.
 - Results over ~400 KB come back as an error asking you to narrow the query.
   Scope big explorations with `--max`, `--depth`, `--limit`.
 - `lua` can hang the session. Anything that could loop must have a bound.

@@ -14,10 +14,15 @@ Install: drop `Golem.rbxmx` into Studio's `Plugins` folder and restart Studio.
 
 ## What changed in 4.0.0
 
-- **Direct link.** The plugin talks to `npx golem-bridge` on
-  `127.0.0.1:41717` — Studio plugins are allowed to reach localhost, so there is
-  no Firebase relay, no channel to leak, and no third party in the path. The
-  window shows one setup line; the AI's terminal runs it once.
+- **Relay transport.** Studio can only make outgoing calls and the AI is often a
+  cloud sandbox, so both meet at a Firebase Realtime Database:
+  `channels/<id>/cmd`, `/res`, `/beacons`. The plugin polls for new command keys,
+  deletes each one it handled, and ignores anything older than the moment its
+  session started. The window shows one setup line
+  (`npx golem-bridge connect <channelId>`) that works from any machine.
+- **Session capability.** The 16-hex channel id is minted per Studio session,
+  kept in memory only (an id persisted by an older build is wiped on load), and
+  replaced on END SESSION — the old channel is marked `revoked` and deleted.
 - **Reverts work.** Every AI tool call runs inside a named
   `ChangeHistoryService` recording, so one Undo in Studio reverts exactly one
   tool call instead of a vague waypoint sprawl.
