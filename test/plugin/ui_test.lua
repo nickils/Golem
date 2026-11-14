@@ -51,13 +51,15 @@ function M.run()
   local panel = widgets[1]
   local settings = widgets[2]
 
-  -- The popup is the SMALLEST frame that DIRECTLY contains the copy button.
+  -- The popup is the SMALLEST frame that DIRECTLY contains the setup line.
   -- "the first frame with it somewhere inside" matches the root window, which is
   -- exactly how a test ends up asserting nothing about the popup.
   local popup
   for _, f in ipairs(find(panel, function(n) return n.ClassName == "Frame" end)) do
     for _, c in ipairs(f:GetChildren()) do
-      if tostring(c.Text) == "COPY THE LINE" then popup = f break end
+      if c.ClassName == "TextBox" and string.find(tostring(c.Text), "golem%-bridge connect") then
+        popup = f break
+      end
     end
     if popup ~= nil then break end
   end
@@ -100,43 +102,27 @@ function M.run()
   assertTrue(lineBox.TextEditable == false, "the setup line is editable - it must be selectable only")
   assertTrue(lineBox.ClearTextOnFocus ~= true, "focusing the line would clear it")
 
-  -- 4. COPY copies, and does not steal focus
-  local copyBtn
-  for _, b in ipairs(popup:GetChildren()) do
-    if b.ClassName == "TextButton" and string.find(tostring(b.Text), "COPY") then copyBtn = b end
+  -- 4. there is no copy button, and the line tells the user what to do. A
+  -- button that may silently copy nothing is worse than no button.
+  for _, b in ipairs(find(panel, function(n) return n.ClassName == "TextButton" end)) do
+    local t = tostring(b.Text)
+    assertTrue(string.find(t, "COPY") == nil and string.find(t, "ASK YOUR AI") == nil,
+      "a copy/ask button is still present: '" .. t .. "'")
   end
-  assertTrue(copyBtn ~= nil, "there is no copy button")
-  _G.__clipboard = nil
-  local focusedBefore = lineBox:IsFocused()
-  copyBtn.Activated:Fire()
-  local feedback = tostring(copyBtn.Text)
-  assertTrue(_G.__clipboard ~= nil, "COPY did not put anything on the clipboard")
-  -- exact equality, not "contains": a selection that drops the first character
-  -- still contains "golem-bridge connect" and would pass a substring check
-  assertTrue(_G.__clipboard == tostring(lineBox.Text),
-    "the clipboard does not hold the whole line.\n  wanted: " .. tostring(lineBox.Text)
-    .. "\n  got:    " .. tostring(_G.__clipboard))
-  assertTrue(lineBox:IsFocused() == focusedBefore, "COPY stole focus - it must only copy")
-  assertTrue(string.find(feedback, "COPIED") ~= nil,
-    "COPY gave no feedback, text is now '" .. feedback .. "'")
+  local lineHelp = textOf(popup)
+  assertTrue(string.find(lineHelp, "Ctrl%+C") ~= nil,
+    "the panel does not tell the user to press Ctrl+C:\n" .. lineHelp)
 
-  -- 4b. when copying genuinely cannot work, the button must SAY SO instead of
-  -- claiming COPIED. This is the failure that shipped: the old handler called
-  -- an API that does not exist inside a pcall and printed COPIED regardless.
-  local uis = game:GetService("UserInputService")
-  local realCreate = uis.CreateVirtualInput
-  uis.CreateVirtualInput = function() error("no virtual input", 0) end
-  _G.__clipboard = nil
-  -- The button debounces on os.clock() (CPU time, which barely moves in a
-  -- shim), so a press right after the successful one is swallowed. Wait past
-  -- the debounce rather than pretending a second press was handled.
-  local firedAt = os.clock()
-  while os.clock() - firedAt < 0.5 do
-    _G.__advance(0.1)
-  end
-  copyBtn.Activated:Fire()
-  local failedLabel = tostring(copyBtn.Text)
-  uis.CreateVirtualInput = realCreate
+  -- 4b. selecting is made easy: focusing the line selects all of it, so Ctrl+C
+  -- is the only keystroke needed.
+  lineBox.SelectionStart = -1
+  lineBox:CaptureFocus()
+  assertTrue(lineBox.SelectionStart == 1,
+    "focusing the line did not select it (SelectionStart = " .. tostring(lineBox.SelectionStart) .. ")")
+  assertTrue(lineBox.CursorPosition == #lineBox.Text + 1,
+    "focusing the line did not put the caret at the end (CursorPosition = "
+    .. tostring(lineBox.CursorPosition) .. ")")
+  lineBox:ReleaseFocus()
 
   -- 6. a reopened popup must show a line that still works. The channel rotates
   -- on END SESSION and on the switch, so a cached line would be dead on arrival.
@@ -194,17 +180,10 @@ function M.run()
   assertEveryButtonIsWired(panel, "the panel")
   assertEveryButtonIsWired(settings, "Settings")
 
-  -- 9. the plugin must not call input functions that do not exist. The shim
-  -- models VirtualInput exactly, so a wrong name is an error rather than a
-  -- silent no-op - which is how two broken copy implementations shipped.
-  assertTrue((_G.__virtualKeysSent or 0) > 0,
-    "no key was ever sent through VirtualInput, so copy cannot have worked")
-  assertTrue((_G.__virtualLetters or 0) > 0,
-    "Ctrl+C was never sent through VirtualInput")
-
   assertTrue(#_G.__uiErrors == 0, "UI errors: " .. table.concat(_G.__uiErrors, " | "))
-  print("UI OK - close works, the pill reopens, copy really copies and admits failure, "
-    .. "both lines are read-only, a reopened line is live, no dead buttons, the switch persists")
+  print("UI OK - close works, the pill reopens, no copy button and the line says Ctrl+C, "
+    .. "focus selects the line, both lines are read-only, a reopened line is live, "
+    .. "no dead buttons, the switch persists")
 end
 
 return M

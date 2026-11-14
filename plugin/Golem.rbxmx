@@ -6413,7 +6413,7 @@ local function buildUi(widget, linkWidget)
 		Name = "SetupPopup",
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.new(0.5, 0, 0.45, 0),
-		Size = UDim2.new(1, -32, 0, 250),
+		Size = UDim2.new(1, -32, 0, 196),
 		BackgroundColor3 = COLORS.card,
 		BorderSizePixel = 0,
 		Visible = false,
@@ -6464,16 +6464,27 @@ local function buildUi(widget, linkWidget)
 		BackgroundColor3 = COLORS.inner,
 	}, ui.setupPopup)
 	addCorner(ui.setupBox, 8)
-	ui.copyLineButton = button({
-		Position = UDim2.new(0, 16, 0, 146),
-		Size = UDim2.new(1, -32, 0, 28),
-		Text = "COPY THE LINE",
-		BackgroundColor3 = COLORS.inner,
+	label({
+		Text = "Click the line to select it, then press Ctrl+C (Cmd+C on Mac).",
+		Position = UDim2.new(0, 16, 0, 144),
+		Size = UDim2.new(0.62, -16, 0, 28),
+		FontFace = fontSemibold,
+		TextSize = 12,
+		TextWrapped = true,
 		TextColor3 = COLORS.text,
 	}, ui.setupPopup)
 	label({
+		Text = "If it is not all selected, drag across it or double-click.",
+		Position = UDim2.new(0.62, 0, 0, 144),
+		Size = UDim2.new(0.38, -16, 0, 28),
+		FontFace = fontRegular,
+		TextSize = 11,
+		TextWrapped = true,
+		TextColor3 = COLORS.textFaint,
+	}, ui.setupPopup)
+	label({
 		Text = "The line is the key to this session. It stays the same until you end the session in Settings.",
-		Position = UDim2.new(0, 16, 0, 214),
+		Position = UDim2.new(0, 16, 0, 176),
 		Size = UDim2.new(1, -32, 0, 28),
 		FontFace = fontRegular,
 		TextSize = 11,
@@ -6481,145 +6492,31 @@ local function buildUi(widget, linkWidget)
 		TextColor3 = COLORS.textFaint,
 	}, ui.setupPopup)
 
-	-- Copying the line, honestly.
+	-- There is no copy button, and no attempt to fake one.
 	--
-	-- A plugin cannot write to the clipboard. The API dump has exactly one
-	-- clipboard member, StudioService:CopyToClipboard, and it is
-	-- RobloxScriptSecurity; the `setclipboard` global seen in exploit scripts
-	-- does not exist in Studio at all. (The previous build called it inside a
-	-- pcall and then always printed "COPIED", so it reported success while
-	-- copying nothing - which is exactly how a broken copy button survives.)
+	-- A Roblox plugin cannot write the clipboard. The only clipboard member in
+	-- the API dump is StudioService:CopyToClipboard and it is
+	-- RobloxScriptSecurity; `setclipboard` is an exploit global that Studio does
+	-- not define. Synthesising Ctrl+C through
+	-- UserInputService:CreateVirtualInput exists on paper, but it did not work
+	-- in practice and cannot be verified without Studio here - a button that
+	-- may silently do nothing is worse than no button.
 	--
-	-- What a plugin can do is what a person does: select the text and send
-	-- Ctrl+C. UserInputService:CreateVirtualInput is the one input-synthesis
-	-- API available to plugins, and TextBox SelectionStart/SelectionEnd are
-	-- public. Returns true only when the keystroke was actually sent; the
-	-- caller must not claim COPIED otherwise.
-	local COPY_LABEL = "COPY THE LINE"
-	local function ctrlC(box)
-		local uis = game:GetService("UserInputService")
-		local keyCodes = {}
-		for _, name in ipairs({ "LeftControl", "C" }) do
-			local ok, code = pcall(function()
-				return Enum.KeyCode[name]
-			end)
-			if not ok or code == nil then
-				return false
-			end
-			keyCodes[#keyCodes + 1] = code
-		end
-		-- VirtualInput has exactly one key function, SendKey, and its first
-		-- argument is whether the key went DOWN:
-		--   SendKey(isPressed: bool, keyCode: KeyCode, isRepeated: bool)
-		-- There is no SendKeyDown/SendKeyUp - calling those was silently
-		-- swallowed by a pcall and sent no keyboard input at all.
-		local input
-		local okInput = pcall(function()
-			input = uis:CreateVirtualInput()
-		end)
-		if not okInput or input == nil then
-			return false
-		end
-		local okSend = pcall(function()
-			for _, code in ipairs(keyCodes) do
-				input:SendKey(true, code, false)
-			end
-			for i = #keyCodes, 1, -1 do
-				input:SendKey(false, keyCodes[i], false)
-			end
-		end)
-		return okSend
-	end
-	local function copyLineToClipboard()
-		local box = ui.setupBox
-		if box == nil then
-			return false
-		end
-		-- Per the TextBox docs the caret and SelectionStart are 1-based ("a value
-		-- of 1 represents the position before the first byte") and -1 means the
-		-- box is not being edited; the selection runs between the two.
-		--
-		-- Clearing first matters: a stale selection from an earlier press would
-		-- otherwise read back as valid even when this press selected nothing.
+	-- So this is the honest design: the line is a read-only TextBox you select
+	-- and copy yourself, exactly as you would copy anything else on screen.
+	local function selectWholeLine(box)
 		pcall(function()
-			box.CursorPosition = -1
-			box.SelectionStart = -1
-		end)
-		local okSelect = pcall(function()
-			box:CaptureFocus()
-		end)
-		if not okSelect then
-			return false
-		end
-		-- Focus must land: an unfocused box reports -1 for the caret and the
-		-- selection, so Ctrl+C would copy nothing.
-		local focused = false
-		pcall(function()
-			focused = (box:IsFocused() == true)
-		end)
-		if not focused then
-			return false
-		end
-		-- And read the selection back: only report success when the box holds the
-		-- exact values we asked for. This is the guard that stops "COPIED" being
-		-- printed for a copy that copied nothing.
-		local tookSelection = false
-		pcall(function()
-			local wantCursor = #box.Text + 1
-			box.CursorPosition = wantCursor
+			box.CursorPosition = #box.Text + 1
 			box.SelectionStart = 1
-			local cursor = box.CursorPosition
-			local start = box.SelectionStart
-			if type(cursor) == "number" and type(start) == "number"
-				and cursor == wantCursor and start == 1 then
-				tookSelection = true
-			end
 		end)
-		if not tookSelection then
-			pcall(function()
-				box:ReleaseFocus()
-			end)
-			return false
-		end
-		local okCopy = ctrlC(box)
-		-- Give the focus straight back: the line is read-only and the user did
-		-- not ask to type into it.
-		pcall(function()
-			box:ReleaseFocus()
-		end)
-		return okCopy
 	end
-
-	-- nil, not 0: comparing os.clock() against 0 swallowed the very first
-	-- press's feedback (the clipboard filled, the button stayed silent).
-	local copiedAt = nil
-	ui.copyLineButton.Activated:Connect(function()
-		-- Roblox exposes no clipboard-write API to plugins at all (the only
-		-- member in the API dump, StudioService:CopyToClipboard, is
-		-- RobloxScriptSecurity; `setclipboard` is an exploit function that does
-		-- not exist in Studio). The one real path is the one a person uses:
-		-- select all of the text, then send Ctrl+C. That is what this does.
-		if copiedAt ~= nil and os.clock() - copiedAt &lt; 0.4 then
-			return
-		end
-		copiedAt = os.clock()
-		if copyLineToClipboard() then
-			ui.copyLineButton.Text = "COPIED"
-			task.delay(2, function()
-				if ui.copyLineButton ~= nil then
-					ui.copyLineButton.Text = COPY_LABEL
-				end
-			end)
-		else
-			-- Say so rather than pretending. Double-click selects the line and
-			-- Ctrl+C copies it, which always works.
-			ui.copyLineButton.Text = "SELECT THE LINE, THEN CTRL+C"
-			task.delay(4, function()
-				if ui.copyLineButton ~= nil then
-					ui.copyLineButton.Text = COPY_LABEL
-				end
-			end)
-		end
+	-- Convenience, not magic: clicking into the line selects all of it, so
+	-- Ctrl+C is the only keystroke needed. If the box does not focus, selecting
+	-- by hand still works - the instruction below says how.
+	pcall(function()
+		ui.setupBox.Focused:Connect(function()
+			selectWholeLine(ui.setupBox)
+		end)
 	end)
 	-- The close button existed and was never connected, so the popup could not
 	-- be dismissed at all. It closes; the SET UP AI pill brings it back.

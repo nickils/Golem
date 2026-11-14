@@ -235,6 +235,7 @@ local function makeInstance(class, name)
   end
   function obj:CaptureFocus()
     self._props.focused = true
+    self:_sig("Focused"):Fire()
     self._props.CursorPosition = #tostring(self._props.Text or "") + 1
     self._props.SelectionStart = -1
     self._props.SelectionEnd = -1
@@ -317,6 +318,7 @@ local function makeInstance(class, name)
         return self:_sig(key)
       end
       if key == "FocusLost" then return self:_sig("FocusLost") end
+      if key == "Focused" then return self:_sig("Focused") end
       if key == "Parent" then return rawget(self, "_props").Parent end
       if (key == "CursorPosition" or key == "SelectionStart" or key == "SelectionEnd")
         and rawget(self, "_props").focused ~= true then
