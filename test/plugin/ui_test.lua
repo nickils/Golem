@@ -180,6 +180,12 @@ function M.run()
   assertEveryButtonIsWired(panel, "the panel")
   assertEveryButtonIsWired(settings, "Settings")
 
+  -- 9. Settings shows its build, so "which version is running" is answerable
+  -- from the panel rather than from a bug report.
+  local settingsText = textOf(settings)
+  assertTrue(string.find(settingsText, "v%d+%.%d+%.%d+") ~= nil,
+    "Settings does not show the plugin version:\n" .. settingsText)
+
   assertTrue(#_G.__uiErrors == 0, "UI errors: " .. table.concat(_G.__uiErrors, " | "))
   print("UI OK - close works, the pill reopens, no copy button and the line says Ctrl+C, "
     .. "focus selects the line, both lines are read-only, a reopened line is live, "

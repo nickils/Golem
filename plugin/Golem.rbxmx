@@ -6768,6 +6768,18 @@ local function buildUi(widget, linkWidget)
 	}, settingsList)
 	addCorner(setupCard, 10)
 	label({ Text = "SET UP YOUR AI", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, setupCard)
+	-- Show the build, so "which version am I running" is answerable from the
+	-- panel instead of from a bug report about a button that no longer exists.
+	label({
+		Text = "v" .. VERSION,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -14, 0, 9),
+		Size = UDim2.fromOffset(60, 12),
+		FontFace = fontRegular,
+		TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextColor3 = COLORS.textFaint,
+	}, setupCard)
 	label({
 		Text = "Paste this line into your AI - anywhere it runs. It names this Studio session, and it stops working when the session ends.",
 		Position = UDim2.new(0, 14, 0, 26),
