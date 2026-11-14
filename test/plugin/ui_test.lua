@@ -138,20 +138,6 @@ function M.run()
   local failedLabel = tostring(copyBtn.Text)
   uis.CreateVirtualInput = realCreate
 
-  -- 5. ASK YOUR AI TO CONNECT must do something real, not return silently
-  local askBtn
-  for _, b in ipairs(popup:GetChildren()) do
-    if b.ClassName == "TextButton" and string.find(tostring(b.Text), "ASK YOUR AI") then askBtn = b end
-  end
-  assertTrue(askBtn ~= nil, "there is no ASK YOUR AI button")
-  _G.__clipboard = nil
-  local before = tostring(askBtn.Text)
-  askBtn.Activated:Fire()
-  assertTrue(_G.__clipboard ~= nil, "ASK YOUR AI TO CONNECT did nothing at all")
-  assertTrue(string.find(_G.__clipboard, "golem%-bridge connect") ~= nil,
-    "ASK YOUR AI did not copy the line")
-  assertTrue(tostring(askBtn.Text) ~= before, "ASK YOUR AI gave no feedback")
-
   -- 6. a reopened popup must show a line that still works. The channel rotates
   -- on END SESSION and on the switch, so a cached line would be dead on arrival.
   local shownBefore = tostring(lineBox.Text)
@@ -172,6 +158,18 @@ function M.run()
     "after END SESSION the reopened popup still shows the retired line: " .. tostring(lineBox.Text))
   assertTrue(string.find(tostring(lineBox.Text), "golem%-bridge connect") ~= nil,
     "the reopened popup does not show a setup line at all")
+
+  -- 6b. the Settings copy of the line obeys the same rule: selectable, never
+  -- editable. Only the popup's copy was fixed the first time round.
+  local settingsBox
+  for _, tb in ipairs(find(settings, function(n) return n.ClassName == "TextBox" end)) do
+    if string.find(tostring(tb.Text), "golem%-bridge connect") then settingsBox = tb end
+  end
+  assertTrue(settingsBox ~= nil, "the setup line is not shown in Settings")
+  assertTrue(settingsBox.TextEditable == false,
+    "the setup line in Settings is editable - it must be selectable only")
+  assertTrue(settingsBox.ClearTextOnFocus ~= true,
+    "focusing the Settings line would clear it")
 
   -- 7. the master switch exists, stops the relay, and persists
   local toggle
@@ -196,9 +194,17 @@ function M.run()
   assertEveryButtonIsWired(panel, "the panel")
   assertEveryButtonIsWired(settings, "Settings")
 
+  -- 9. the plugin must not call input functions that do not exist. The shim
+  -- models VirtualInput exactly, so a wrong name is an error rather than a
+  -- silent no-op - which is how two broken copy implementations shipped.
+  assertTrue((_G.__virtualKeysSent or 0) > 0,
+    "no key was ever sent through VirtualInput, so copy cannot have worked")
+  assertTrue((_G.__virtualLetters or 0) > 0,
+    "Ctrl+C was never sent through VirtualInput")
+
   assertTrue(#_G.__uiErrors == 0, "UI errors: " .. table.concat(_G.__uiErrors, " | "))
   print("UI OK - close works, the pill reopens, copy really copies and admits failure, "
-    .. "the line is read-only, a reopened line is live, no dead buttons, the switch persists")
+    .. "both lines are read-only, a reopened line is live, no dead buttons, the switch persists")
 end
 
 return M

@@ -518,20 +518,39 @@ function terr:WriteVoxels() end
 -- no security level, i.e. the only one a plugin may call. VirtualInputManager
 -- and GuiService:AddKey are RobloxScriptSecurity and stay absent here.
 local uis = _G.game:GetService("UserInputService")
+-- VirtualInput, exactly as the API dump describes it. Its only key function is
+-- SendKey(isPressed: bool, keyCode: KeyCode, isRepeated: bool); there is no
+-- SendKeyDown/SendKeyUp. An earlier shim invented those, so the plugin called
+-- functions that do not exist, the pcall swallowed it, and copy silently sent
+-- no input at all.
 function uis:CreateVirtualInput()
   local v = {}
-  function v:SendKeyDown(code)
-    _G.__virtualKeyDown = true
+  function v:SendKey(isPressed, keyCode, isRepeated)
+    assert(type(isPressed) == "boolean", "SendKey: isPressed must be a boolean")
+    assert(keyCode ~= nil, "SendKey: keyCode is required")
     _G.__virtualKeysSent = (_G.__virtualKeysSent or 0) + 1
-    applyCopyKey(code)
+    local name = tostring(keyCode)
+    if name == "Enum.KeyCode.LeftControl" then
+      _G.__virtualKeyDown = isPressed == true
+      return
+    end
+    if name == "Enum.KeyCode.C" then
+      if isPressed == true then
+        _G.__virtualLetters = (_G.__virtualLetters or 0) + 1
+        if _G.__virtualKeyDown == true then
+          applyCopyKey(keyCode)
+        end
+      end
+      return
+    end
   end
-  function v:SendKeyUp(code)
-    if tostring(code) ~= "Enum.KeyCode.LeftControl" then _G.__virtualKeyDown = false end
-    _G.__virtualKeysSent = (_G.__virtualKeysSent or 0) + 1
+  function v:SendTextInput(text)
+    _G.__virtualText = tostring(text)
   end
   function v:SendMouseButton() end
-  function v:SendMouseMove() end
-  function v:SendTextInput() end
+  function v:SendMouseDelta() end
+  function v:SendMousePosition() end
+  function v:SendPointerAction() end
   return v
 end
 

@@ -6471,13 +6471,6 @@ local function buildUi(widget, linkWidget)
 		BackgroundColor3 = COLORS.inner,
 		TextColor3 = COLORS.text,
 	}, ui.setupPopup)
-	ui.askAiButton = button({
-		Position = UDim2.new(0, 16, 0, 180),
-		Size = UDim2.new(1, -32, 0, 28),
-		Text = "ASK YOUR AI TO CONNECT",
-		BackgroundColor3 = COLORS.inner,
-		TextColor3 = COLORS.text,
-	}, ui.setupPopup)
 	label({
 		Text = "The line is the key to this session. It stays the same until you end the session in Settings.",
 		Position = UDim2.new(0, 16, 0, 214),
@@ -6515,12 +6508,24 @@ local function buildUi(widget, linkWidget)
 			end
 			keyCodes[#keyCodes + 1] = code
 		end
+		-- VirtualInput has exactly one key function, SendKey, and its first
+		-- argument is whether the key went DOWN:
+		--   SendKey(isPressed: bool, keyCode: KeyCode, isRepeated: bool)
+		-- There is no SendKeyDown/SendKeyUp - calling those was silently
+		-- swallowed by a pcall and sent no keyboard input at all.
+		local input
+		local okInput = pcall(function()
+			input = uis:CreateVirtualInput()
+		end)
+		if not okInput or input == nil then
+			return false
+		end
 		local okSend = pcall(function()
 			for _, code in ipairs(keyCodes) do
-				uis:CreateVirtualInput():SendKeyDown(code, false)
+				input:SendKey(true, code, false)
 			end
 			for i = #keyCodes, 1, -1 do
-				uis:CreateVirtualInput():SendKeyUp(keyCodes[i], false)
+				input:SendKey(false, keyCodes[i], false)
 			end
 		end)
 		return okSend
@@ -6621,21 +6626,6 @@ local function buildUi(widget, linkWidget)
 	ui.closeButton.Activated:Connect(function()
 		ui.hideSetupPopup()
 	end)
-	ui.askAiButton.Activated:Connect(function()
-		-- This used to set a `ui.chatBox` that was never assigned and returned,
-		-- so the button did nothing at all. There is no text prompt in the panel
-		-- (the AI lives in your chat, not here), so the honest action is to copy
-		-- the line the only way a plugin can, and say where to paste it.
-		local ok = copyLineToClipboard()
-		ui.askAiButton.Text = ok and "COPIED - PASTE IT INTO YOUR AI"
-			or "SELECT THE LINE, THEN CTRL+C"
-		task.delay(3, function()
-			if ui.askAiButton ~= nil then
-				ui.askAiButton.Text = "ASK YOUR AI TO CONNECT"
-			end
-		end)
-	end)
-
 	ui.setupPopupToken = 0
 	ui.showSetupPopup = function()
 		if ui.setupPopup == nil or ui.setupPopup.Visible then
@@ -6895,6 +6885,11 @@ local function buildUi(widget, linkWidget)
 		Size = UDim2.new(1, -28, 0, 50),
 		TextWrapped = true,
 		MultiLine = true,
+		-- Same rule as the copy in the setup popup: this line is a capability,
+		-- not an input. Selectable, never editable - an edited line is a broken
+		-- line, and this copy was missed when the popup's was fixed.
+		TextEditable = false,
+		ClearTextOnFocus = false,
 		FontFace = fontMono,
 		TextSize = 12,
 		TextColor3 = COLORS.text,
