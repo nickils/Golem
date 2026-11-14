@@ -51,6 +51,8 @@ local state = {
 	startedAt = os.clock(),
 	playStartedAt = nil,
 	publishError = nil,
+	-- master switch; read from settings so "off" survives a Studio restart
+	enabled = true,
 }
 
 -- Everything about the wire protocol lives in this table.
@@ -507,6 +509,19 @@ local function setupCommandText()
 end
 
 local httpWarningShown = false
+
+-- The master switch lives with the plugin, not with the place: whether Golem
+-- runs at all is a property of the install, not of this project.
+local PLUGIN_ENABLED_KEY = "Golem_Enabled"
+local function readEnabledSetting()
+	local ok, value = pcall(function()
+		return plugin:GetSetting(PLUGIN_ENABLED_KEY)
+	end)
+	if ok and value == false then
+		return false
+	end
+	return true
+end
 
 local function ensureHttpEnabled()
 	local enabled = false
@@ -3861,7 +3876,7 @@ end
 -- in-game driver needs its lane served.
 local function relayLoop(myGeneration)
 	log(string.format("relay: live on channel %s (every ~%ds)", tostring(bridge.channel), bridge.interval))
-	while myGeneration == generation do
+	while myGeneration == generation and state.enabled ~= false do
 		relayFlushPending()
 		local ok, err = pollOnce()
 		if ok then
@@ -6433,11 +6448,16 @@ local function buildUi(widget, linkWidget)
 		TextWrapped = true,
 		TextColor3 = COLORS.textDim,
 	}, ui.setupPopup)
+	-- The line is a capability, not an input: it must be selectable so you can
+	-- copy it by hand, and it must NOT be editable - an edited line is a broken
+	-- line, and a TextBox invites exactly that.
 	ui.setupBox = textBox({
 		Position = UDim2.new(0, 16, 0, 76),
 		Size = UDim2.new(1, -32, 0, 62),
 		TextWrapped = true,
 		MultiLine = true,
+		TextEditable = false,
+		ClearTextOnFocus = false,
 		FontFace = fontMono,
 		TextSize = 12,
 		TextColor3 = COLORS.text,
@@ -6468,40 +6488,47 @@ local function buildUi(widget, linkWidget)
 		TextColor3 = COLORS.textFaint,
 	}, ui.setupPopup)
 
-	local copiedAt = 0
+	-- nil, not 0: comparing os.clock() against 0 swallowed the very first
+	-- press's feedback (the clipboard filled, the button stayed silent).
+	local copiedAt = nil
 	ui.copyLineButton.Activated:Connect(function()
-		ui.setupBox.Text = setupCommandText()
-		ui.setupBox:CaptureFocus()
-		ui.setupBox.CursorPosition = #ui.setupBox.Text + 1
-		local ok, err = pcall(function()
-			setclipboard(setupCommandText())
+		-- Copy means copy. It must not steal focus, move the cursor, or open a
+		-- keyboard - the old version captured focus and the user had to fight
+		-- the text box to get back out.
+		local line = setupCommandText()
+		pcall(function()
+			setclipboard(line)
 		end)
-		if ok and os.clock() - copiedAt &gt; 0.4 then
-			copiedAt = os.clock()
-			ui.copyLineButton.Text = "COPIED - PRESS CTRL+C IF IT IS NOT ON YOUR CLIPBOARD"
-			task.delay(2.5, function()
-				if ui.copyLineButton ~= nil then
-					ui.copyLineButton.Text = "COPY THE LINE"
-				end
-			end)
-		elseif not ok then
-			ui.copyLineButton.Text = "FOCUSED - PRESS CTRL+C TO COPY"
-			task.delay(3, function()
-				if ui.copyLineButton ~= nil then
-					ui.copyLineButton.Text = "COPY THE LINE"
-				end
-			end)
-		end
-	end)
-	ui.askAiButton.Activated:Connect(function()
-		-- The line is the whole capability and it dies with this Studio session,
-		-- so pasting it into a chat (even a public one) is safe by design.
-		if ui.chatBox == nil then
+		if copiedAt ~= nil and os.clock() - copiedAt &lt; 0.4 then
 			return
 		end
-		ui.chatBox.Text = setupCommandText()
+		copiedAt = os.clock()
+		ui.copyLineButton.Text = "COPIED"
+		task.delay(2, function()
+			if ui.copyLineButton ~= nil then
+				ui.copyLineButton.Text = "COPY THE LINE"
+			end
+		end)
+	end)
+	-- The close button existed and was never connected, so the popup could not
+	-- be dismissed at all. It closes; the SET UP AI pill brings it back.
+	ui.closeButton.Activated:Connect(function()
 		ui.hideSetupPopup()
-		ui.chatBox:CaptureFocus()
+	end)
+	ui.askAiButton.Activated:Connect(function()
+		-- This used to set a `ui.chatBox` that was never assigned and returned,
+		-- so the button did nothing at all. There is no text prompt in the panel
+		-- (the AI lives in your chat, not here), so the honest action is to put
+		-- the line on the clipboard and say where to paste it.
+		pcall(function()
+			setclipboard(setupCommandText())
+		end)
+		ui.askAiButton.Text = "COPIED - PASTE IT INTO YOUR AI"
+		task.delay(3, function()
+			if ui.askAiButton ~= nil then
+				ui.askAiButton.Text = "ASK YOUR AI TO CONNECT"
+			end
+		end)
 	end)
 
 	ui.setupPopupToken = 0
@@ -6654,6 +6681,85 @@ local function buildUi(widget, linkWidget)
 		PaddingLeft = UDim.new(0, 12),
 		PaddingRight = UDim.new(0, 12),
 	}, settingsList)
+
+	-- Master switch. Persisted per plugin install (not per place: it is about
+	-- whether Golem runs at all), and it stops the relay too - "off" must not
+	-- mean "still polling and still accepting commands".
+	local powerCard = createElement("Frame", {
+		Size = UDim2.new(1, 0, 0, 74),
+		BackgroundColor3 = COLORS.card,
+		BorderSizePixel = 0,
+		LayoutOrder = 0,
+	}, settingsList)
+	addCorner(powerCard, 10)
+	label({ Text = "GOLEM", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, powerCard)
+	ui.powerInfo = label({
+		Text = "",
+		Position = UDim2.new(0, 14, 0, 24),
+		Size = UDim2.new(1, -110, 0, 26),
+		FontFace = fontRegular,
+		TextSize = 11,
+		TextWrapped = true,
+		TextColor3 = COLORS.textFaint,
+	}, powerCard)
+	ui.powerToggle = button({
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -14, 0, 20),
+		Size = UDim2.fromOffset(86, 28),
+		Text = "OFF",
+		BackgroundColor3 = COLORS.inner,
+		TextColor3 = COLORS.text,
+	}, powerCard)
+	ui.setEnabled = function(enabled)
+		state.enabled = enabled
+		pcall(function()
+			plugin:SetSetting(PLUGIN_ENABLED_KEY, enabled)
+		end)
+		if enabled then
+			ui.powerToggle.Text = "ON"
+			ui.powerToggle.BackgroundColor3 = COLORS.accent
+			ui.powerInfo.Text = "Golem is running. The relay is polling and an AI holding your line can drive this Studio."
+			pcall(startBridge)
+		else
+			ui.powerToggle.Text = "OFF"
+			ui.powerToggle.BackgroundColor3 = COLORS.inner
+			ui.powerInfo.Text = "Golem is off: nothing polls, nothing runs, and any line you pasted stops working. Press ON to resume with a fresh channel."
+			-- stop the loop and retire the channel, so a pasted line is dead
+			generation = generation + 1
+			state.running = false
+			local old = bridge.channel
+			if old ~= nil then
+				rotateChannel()
+				pcall(relayRetireChannel, old)
+			end
+			pcall(removeDriver)
+			setConnected(false, "Golem is switched off")
+			if ui.setupBox ~= nil then
+				ui.setupBox.Text = setupCommandText()
+			end
+			if ui.settingsSetupBox ~= nil then
+				ui.settingsSetupBox.Text = setupCommandText()
+			end
+		end
+		ui.root.Visible = true
+		updateStatus()
+		if ui.refreshSettings ~= nil then
+			ui.refreshSettings()
+		end
+		log(enabled and "Golem switched on." or "Golem switched off: the relay has stopped and the old line no longer works.")
+	end
+	ui.powerToggle.Activated:Connect(function()
+		ui.setEnabled(state.enabled ~= true)
+	end)
+	-- paint the initial position: a fresh install starts ON
+	do
+		local on = state.enabled ~= false
+		ui.powerToggle.Text = on and "ON" or "OFF"
+		ui.powerToggle.BackgroundColor3 = on and COLORS.accent or COLORS.inner
+		ui.powerInfo.Text = on
+			and "Golem is running. The relay is polling and an AI holding your line can drive this Studio."
+			or "Golem is off: nothing polls, nothing runs, and any line you pasted stops working. Press ON to resume with a fresh channel."
+	end
 
 	local setupCard = createElement("Frame", {
 		Size = UDim2.new(1, 0, 0, 116),
@@ -6855,10 +6961,20 @@ end
 if ui.settingsSetupBox ~= nil then
 	ui.settingsSetupBox.Text = setupCommandText()
 end
+-- Read the master switch before anything starts: starting the bridge first and
+-- asking "are we enabled?" afterwards means the first poll always happens even
+-- when the user switched Golem off.
+state.enabled = readEnabledSetting()
 if ui.refreshSettings ~= nil then
 	ui.refreshSettings()
 end
-pcall(startBridge)
+if state.enabled then
+	pcall(startBridge)
+else
+	pcall(function()
+		ui.setEnabled(false)
+	end)
+end
 updateStatus()
 
 plugin.Unloading:Connect(function()
