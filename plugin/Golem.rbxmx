@@ -49,6 +49,9 @@ local state = {
 -- else. Everything about the wire protocol lives in this table.
 local bridge = {
 	mode = "local", -- "local" | "none"
+	-- where the bridge lives. Loopback by default; set a tunnel URL when the AI
+	-- does not run on this machine (Studio can only make outgoing calls).
+	host = "http://127.0.0.1",
 	port = DEFAULT_PORT,
 	baseUrl = nil,
 	deviceId = nil,
@@ -630,8 +633,11 @@ local function opNeedsRecording(opName)
 end
 -- ---------------------------------------------------------------- session
 -- A device id (public: it tells the CLI which Studio to talk to) and a secret
--- (private: it authorizes this CLI to drive this Studio). Both are minted once
--- per Studio install; END SESSION rotates them.
+-- (private: it authorizes this CLI to drive this Studio).
+--
+-- The device id is stable so a saved link keeps pointing at this Studio; the
+-- secret is minted per Studio session and never written to disk, because the
+-- user hands it to an AI client by pasting it into a chat.
 
 local function randomHex(n)
 	local rng = Random.new()
@@ -656,21 +662,41 @@ local function ensureIdentity()
 			end)
 		end
 	end
-	if bridge.deviceSecret == nil then
-		local stored = getSetting("Golem_DeviceSecret", nil)
-		if type(stored) == "string" and #stored &gt;= 24 then
-			bridge.deviceSecret = stored
-		else
-			bridge.deviceSecret = randomHex(40)
-			pcall(function()
-				plugin:SetSetting("Golem_DeviceSecret", bridge.deviceSecret)
-			end)
+	-- The secret is NEVER saved. The setup line is handed to an AI client - often
+	-- by pasting it into a chat - so it has to be a session capability: it lives
+	-- in memory only, dies when Studio closes, reloads, or the user ends the
+	-- session, and a leaked pasted log is worthless afterwards.
+	bridge.deviceSecret = randomHex(40)
+	bridge.secretMintedAt = os.time()
+	pcall(function()
+		plugin:SetSetting("Golem_DeviceSecret", nil)
+	end)
+	bridge.port = tonumber(getSetting("Golem_Port", DEFAULT_PORT)) or DEFAULT_PORT
+	-- Optional override for the case where the AI cannot see our loopback.
+	-- Accepts "http://host", "https://host", or "https://host/some/path".
+	local storedHost = getSetting("Golem_BridgeHost", nil)
+	if type(storedHost) == "string" and #storedHost &gt; 0 then
+		local cleaned = string.gsub(storedHost, "/+$", "")
+		if string.match(cleaned, "^https?://[%w%.%-%:_/]+$") then
+			bridge.host = cleaned
 		end
 	end
-	bridge.port = tonumber(getSetting("Golem_Port", DEFAULT_PORT)) or DEFAULT_PORT
 end
 
 ensureIdentity()
+
+-- Mint a fresh secret. Any line handed to an AI client before this call stops
+-- working immediately - that is the point: pasting the line into a chat must
+-- leave nothing usable behind once the session is over.
+local function rotateSecret()
+	bridge.deviceSecret = randomHex(40)
+	bridge.secretMintedAt = os.time()
+	bridge.cursor = nil
+	pcall(function()
+		plugin:SetSetting("Golem_DeviceSecret", nil)
+	end)
+	return bridge.deviceSecret
+end
 
 -- The one line the user (or their AI) runs to link this Studio.
 local function setupCommandText()
@@ -769,7 +795,11 @@ end
 -- for every later command, so no secret is ever printed or pasted again.
 local function linkLocal()
 	bridge.mode = "local"
-	bridge.baseUrl = string.format("http://127.0.0.1:%d", bridge.port)
+	-- Loopback unless the user pointed the plugin somewhere else: when the AI
+	-- does not run on this machine, it can reach a tunnel URL but not our
+	-- localhost, so the plugin has to dial the same address the AI does.
+	local host = bridge.host
+	bridge.baseUrl = string.format("%s:%d", host, bridge.port)
 	local body, encodeErr = encodeBody({
 		deviceId = bridge.deviceId,
 		secret = bridge.deviceSecret,
@@ -5882,11 +5912,8 @@ local function buildUi(widget, linkWidget)
 	setupCard.Size = UDim2.new(1, 0, 0, 132)
 
 	local function endSessionNow()
-		bridge.deviceSecret = randomHex(40)
-		pcall(function()
-			plugin:SetSetting("Golem_DeviceSecret", bridge.deviceSecret)
-		end)
-		bridge.cursor = nil
+		-- rotates in memory only: the previous line is dead from this moment
+		rotateSecret()
 		bridge.mode = "none"
 		generation = generation + 1
 		state.running = false
@@ -5949,12 +5976,71 @@ local function buildUi(widget, linkWidget)
 		end
 	end)
 
-	local historyCard = createElement("Frame", {
-		Size = UDim2.new(1, 0, 0, 100),
+	-- Where the AI runs decides whether loopback is enough. This is the one
+	-- choice the user has to make, so it gets its own card with the honest
+	-- explanation attached.
+	local remoteCard = createElement("Frame", {
+		Size = UDim2.new(1, 0, 0, 132),
 		BackgroundColor3 = COLORS.card,
 		BorderSizePixel = 0,
 		LayoutOrder = 3,
 	}, settingsList)
+	addCorner(remoteCard, 10)
+	label({ Text = "WHERE YOUR AI RUNS", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, remoteCard)
+	label({
+		Text = "Same PC as Studio (terminal, Cursor, Codex): nothing to do. A web or cloud AI cannot see your localhost - give it a tunnel to this port and paste that URL below.",
+		Position = UDim2.new(0, 14, 0, 26),
+		Size = UDim2.new(1, -28, 0, 44),
+		FontFace = fontRegular,
+		TextSize = 11,
+		TextWrapped = true,
+		TextColor3 = COLORS.textFaint,
+	}, remoteCard)
+	ui.bridgeHostBox = textBox({
+		Position = UDim2.new(0, 14, 0, 76),
+		Size = UDim2.new(1, -110, 0, 28),
+		Text = bridge.host or "http://127.0.0.1",
+		PlaceholderText = "https://your-tunnel.example.com",
+	}, remoteCard)
+	addCorner(ui.bridgeHostBox, 6)
+	local hostSave = button({
+		Position = UDim2.new(1, -90, 0, 76),
+		Size = UDim2.fromOffset(76, 28),
+		Text = "USE THIS",
+		BackgroundColor3 = COLORS.inner,
+		TextColor3 = COLORS.text,
+	}, remoteCard, COLORS.accent)
+	hostSave.Activated:Connect(function()
+		local typed = tostring(ui.bridgeHostBox.Text or "")
+		local cleaned = string.gsub(typed, "/+$", "")
+		if #cleaned == 0 or string.lower(cleaned) == "http://127.0.0.1" then
+			cleaned = "http://127.0.0.1"
+		elseif string.match(cleaned, "^https?://[%w%.%-%:_/]+$") == nil then
+			log("That is not a URL I can dial - it must start with http:// or https://")
+			return
+		end
+		bridge.host = cleaned
+		pcall(function()
+			plugin:SetSetting("Golem_BridgeHost", cleaned)
+		end)
+		ui.bridgeHostBox.Text = cleaned
+		-- relink against the new address right away
+		generation = generation + 1
+		bridge.mode = "none"
+		local ok = linkLocal()
+		if ok then
+			bridge.mode = "local"
+			setConnected(true, nil)
+			log("Bridge address set to " .. cleaned .. " - linking there.")
+		else
+			setConnected(false, "cannot reach " .. cleaned .. " - is the bridge and tunnel running?")
+		end
+		task.spawn(bridgeLoop, generation)
+		if ui.refreshSettings ~= nil then
+			ui.refreshSettings()
+		end
+	end)
+
 	addCorner(historyCard, 10)
 	label({ Text = "TOOL HISTORY (THIS PLACE)", Position = UDim2.new(0, 14, 0, 10), Size = UDim2.new(1, -28, 0, 12) }, historyCard)
 	local historyInfo = label({

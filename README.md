@@ -40,6 +40,34 @@ Done with a session? Forget it locally (Studio is unaffected):
 npx golem-bridge disconnect
 ```
 
+## Who this is for
+
+Any AI you can paste text into — **including agents with no MCP support**, and
+agents that run somewhere other than your PC. Roblox's built-in MCP server is
+stdio-only (there is no local port to connect to), and a cloud session cannot
+start it, so the same limit hits every remote agent.
+
+Golem works the other way around: **Studio reaches out to the AI's terminal.**
+Paste the setup line into the chat, the agent runs it, and Studio starts calling
+back. No MCP, no server for the agent to launch, no IDE plugin.
+
+### The one thing that has to be true
+
+The plugin can only make *outgoing* HTTP calls, so your Studio has to be able to
+reach wherever the bridge is listening.
+
+| Where the AI runs | Setup |
+|---|---|
+| Same machine as Studio (terminal, Cursor, Codex CLI) | nothing — the line just works |
+| A web/cloud agent, or a different machine | give the AI a URL it can reach: run a tunnel to the bridge port, set `GOLEM_URL` to it, and paste that host into **Settings → Where your AI runs** in Studio |
+
+A tunnel is the user's own, on the user's terms — there is no relay service in
+this design that can read your place.
+
+The setup line is a **session** secret: it is never written to disk, and it dies
+when Studio closes, reloads, or you press END SESSION. That matters because this
+flow means the line ends up in a chat transcript.
+
 ## What the AI can do
 
 - **Build and edit**: create parts, scripts, UI, terrain, lights, sounds; move,
@@ -50,8 +78,7 @@ npx golem-bridge disconnect
   terminal.
 - **Play the game**: `play` starts a real Studio test session and injects a
   driver into it, so the AI can `screenshot` (PNG on disk), `click`, `input`
-  keys, aim the camera, and read the in-game `logs`. That is what makes it able
-  to test what it built instead of guessing.
+  keys, aim the camera, and read the in-game `logs`.
 
 The Studio window shows a numbered timeline — `Turn: 1`, one row per tool call,
 click a row for the request, result, and the instances it touched. There are no
@@ -78,31 +105,39 @@ notes: the turn counter is the whole bookkeeping.
 
 - `GOLEM_PORT` — bridge port (default `41717`). Set it when two projects need
   separate sessions at the same time.
-- `GOLEM_BIND` — address to listen on (default `127.0.0.1`). Only needed when the
-  agent is **not** on this machine; see below.
-- `GOLEM_DEVICE` — `device:secret` override, for scripted setups.
+- `GOLEM_URL` — the address *this* process uses to reach the bridge
+  (default loopback). Set it to your tunnel URL for a remote agent.
+- `GOLEM_BIND` — address the bridge listens on (default `127.0.0.1`). Moving it
+  off loopback is a security decision: every route then requires the session
+  secret, command results and the in-game driver handshake are accepted only from
+  this machine, and the health probe goes dark. The bridge refuses to listen off
+  loopback with no secret.
+- `GOLEM_SECRET` — use this session secret instead of `./.golem/link.json`.
 - `GOLEM_TURN_IDLE` — seconds of quiet after which the next tool call starts a
   new turn in the Studio timeline (default 300).
 
-## Where the agent runs (read this before opening a port)
+## Remote agent, step by step
 
-The bridge listens on loopback, so the AI's terminal must be on the same machine
-as Studio. That is the normal case for a coding agent in your shell, and it is
-why there is no relay to trust.
+Studio cannot be reached from outside your machine, so put the bridge somewhere
+the agent can reach and point Studio at it:
 
-| Agent runs in | Works? | What to do |
-|---|---|---|
-| Your terminal (Claude Code, Cursor, Codex CLI, local loops) | yes | nothing — loopback is enough |
-| WSL2 / a container / a VM on the same machine | no | `GOLEM_BIND=0.0.0.0` in the CLI, and the plugin/setup line must reach the host IP; or run the CLI inside the same container |
-| A hosted/cloud agent (a remote sandbox, a web agent) | no | it cannot reach your loopback. Exposing the bridge to the internet is not supported — put it behind your own tunnel/VPN if you really need it, and keep the secret |
+```sh
+# 1. on the Studio machine: expose the bridge port through your own tunnel
+cloudflared tunnel --url http://127.0.0.1:41717
 
-`GOLEM_BIND` is a real security decision, not a convenience: it moves the
-listener off loopback, and anything that can reach the port can try to use it.
-With it set, every route requires the session secret, command **results** and the
-in-game driver handshake are only accepted from this machine's own addresses, and
-the health probe stops answering at all — otherwise a remote caller could read
-the device id and place name, or forge the reply to a command the AI is waiting
-on. `golem-bridge` refuses to listen off loopback with no secret.
+# 2. in the agent's terminal (or its sandbox): use that URL instead of loopback
+GOLEM_URL=https://your-tunnel.trycloudflare.com npx golem-bridge connect <secret>
+```
+
+3. In Studio: **Settings → Where your AI runs → paste the same https URL → USE
+   THIS**. The plugin dials that address instead of `127.0.0.1`.
+
+Then the setup line works exactly as before. If your tunnel gives a new hostname
+each restart, update it in both places.
+
+`GOLEM_BIND` (below) is only needed when the bridge itself must listen on
+something other than loopback — for example the CLI running in WSL2 while Studio
+is on Windows.
 
 ## Security
 

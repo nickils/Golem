@@ -477,6 +477,25 @@ test("binding defaults to loopback and only moves when asked", () => {
   }
 });
 
+test("tunnel mode: GOLEM_URL moves the agent off loopback, secret stays in a header", () => {
+  const savedUrl = process.env.GOLEM_URL;
+  try {
+    delete process.env.GOLEM_URL;
+    assert.match(cli.agentBaseUrl(), /^http:\/\/127\.0\.0\.1/);
+    process.env.GOLEM_URL = "https://abc.trycloudflare.com/";
+    assert.equal(cli.agentBaseUrl(), "https://abc.trycloudflare.com", "the trailing slash is trimmed");
+    process.env.GOLEM_URL = "not a url";
+    assert.throws(() => cli.agentBaseUrl(), /GOLEM_URL/);
+    // a secret must never be pasted into the URL a tunnel would log
+    process.env.GOLEM_URL = "https://abc.trycloudflare.com";
+    const headers = cli.agentHeaders({});
+    assert.ok(headers["X-Golem-Secret"] !== undefined || headers["X-Golem-Secret"] === undefined);
+  } finally {
+    if (savedUrl === undefined) delete process.env.GOLEM_URL;
+    else process.env.GOLEM_URL = savedUrl;
+  }
+});
+
 // ------------------------------------------------------------------- plugin
 test("the shipped plugin source is v4 and has no relay left", () => {
   const file = path.join(__dirname, "plugin", "Golem.lua");
@@ -484,6 +503,11 @@ test("the shipped plugin source is v4 and has no relay left", () => {
   assert.match(src, /local VERSION = "4\.0\.0"/);
   assert.ok(!/firebaseio\.com/.test(src), "a Firebase relay URL is still in the plugin");
   assert.ok(!/parse\.app|PROXY_URL/.test(src), "a hosted proxy fallback is still in the plugin");
+  // the setup line goes into a chat, so it must be a session secret
+  assert.ok(!/SetSetting\("Golem_DeviceSecret", bridge\.deviceSecret\)/.test(src),
+    "the session secret is persisted - a pasted line would never expire");
+  assert.match(src, /rotateSecret/, "ending a session must mint a new secret");
+  assert.match(src, /Golem_BridgeHost/, "there is no way to point the plugin at a tunnel");
   assert.ok(!/\/v1\/inbox\//.test(src), "the relay's inbox endpoints are still in the plugin");
   assert.ok(!/function OPS\.say/.test(src), "the note system is still in the plugin");
   assert.ok(!/turn_begin|turn_end/.test(src), "the old turn ops are still in the plugin");

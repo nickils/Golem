@@ -9,10 +9,17 @@ need — do not read the file end to end every request.
 
 ## 0. The two rules that matter
 
-**Direct link.** The user's Studio plugin talks to `npx golem-bridge` on this
-machine over localhost. Nothing goes through a cloud relay, no account is
-involved, and there is no third party to trust. If a tool fails, the answer is in
-this terminal — run `npx golem-bridge status` and read the verdict.
+**Direct link.** Studio calls `npx golem-bridge`; nothing goes through a relay
+service, no account is involved, and there is no third party that can read the
+place. If a tool fails, the answer is in this terminal — run
+`npx golem-bridge status` and read the verdict.
+
+That also means **your Studio is going to a URL you must be able to reach**: the
+plugin can only make outgoing calls. On the same machine as Studio that is
+loopback and needs no setup. If you run somewhere else (a cloud sandbox, a
+different box), the user has to expose the bridge through a tunnel and set
+`GOLEM_URL` plus the same host in Studio's Settings; until they do, `connect`
+will sit there waiting for Studio and never see it.
 
 **Turns are automatic.** The plugin draws a `Turn: N` header for each request
 you make, and it opens on your *first* tool call, not the next one. You do not
@@ -38,7 +45,8 @@ tool call goes through it. `npx golem-bridge disconnect` stops it.
 | `unauthorized` | this terminal holds a different session than Studio | same as above: re-copy the line from the window |
 | tools hang, then time out | the play session is busy, or Studio is modal | `npx golem-bridge cancel` drops the queue, then retry with a longer `--timeout` |
 | several Studio windows share one line | commands may run twice | stop, tell the user to keep one window per link |
-| `connect` cannot reach Studio at all, `status` sees no bridge | the agent is not on the same machine as Studio (container, WSL2, remote sandbox) | the bridge is loopback-only by design. Ask the user to run the CLI on the Studio machine (or set `GOLEM_BIND` to a reachable address and open that port themselves) |
+| `connect` waits forever and `status` shows a bridge with no plugin | Studio cannot reach this machine: no tunnel, wrong tunnel URL, or the host was not set in Studio's Settings | ask the user to check **Settings → Where your AI runs** shows the same URL you are dialling, and that the tunnel is running |
+| `unauthorized` after a Studio restart or END SESSION | the setup line is a *session* secret and rotates | ask for the new line from the Golem window; the old one is dead by design |
 
 `npx golem-bridge status` is the cheap check and needs no Studio round trip.
 `npx golem-bridge debug` is the expensive one: it asks the plugin about its

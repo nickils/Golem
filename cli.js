@@ -199,6 +199,22 @@ function serverPort() {
   return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_PORT;
 }
 
+/**
+ * Where THIS process reaches the bridge. Normally loopback. With GOLEM_URL set
+ * it points at whatever the user exposed - that is the path for an AI that runs
+ * somewhere else and can only reach a tunnel.
+ */
+function agentBaseUrl() {
+  const raw = (envOf("GOLEM_URL") || "").trim().replace(/\/+$/, "");
+  if (raw) {
+    if (!/^https?:\/\/\S+$/.test(raw)) {
+      throw new Error(`GOLEM_URL must be an http(s) URL, got "${raw}"`);
+    }
+    return raw;
+  }
+  return serverUrl();
+}
+
 function serverUrl(port, host) {
   return `http://${host || bindHostForUrls()}:${port || serverPort()}`;
 }
@@ -299,24 +315,47 @@ function httpJson(url, options) {
 
 async function serverInfo(port) {
   try {
-    const r = await httpJson(`${serverUrl(port)}/v1/health`, { timeoutMs: 1500 });
-    return r.json && typeof r.json === "object" ? r.json : null;
+    const base = agentBaseUrl();
+    const r = await httpJson(`${base}/v1/health`, {
+      timeoutMs: 2500,
+      headers: agentHeaders(),
+    });
+    return r.json && typeof r.json === "object" && r.json.ok ? r.json : null;
   } catch {
     return null;
   }
 }
 
+/**
+ * The session secret travels as a header, never in a URL: behind a tunnel the
+ * URL ends up in proxy logs and request histories, and the line is already in a
+ * chat transcript.
+ */
+function agentHeaders(extra) {
+  const link = (() => {
+    try {
+      return loadLink();
+    } catch {
+      return null;
+    }
+  })();
+  const secret = (link && link.secret) || broker.secret || "";
+  return Object.assign({}, extra || {}, secret ? { "X-Golem-Secret": secret } : {});
+}
+
 /** Ask for commands to run. Long-polls when the CLI is serving. */
 async function pollCommands(link, cursor, waitMs) {
   const query = new URLSearchParams({ device: link.deviceId, cursor: cursor || "", wait: String(waitMs || 0) });
-  if (link.secret) query.set("secret", link.secret);
-  const r = await httpJson(`${serverUrl(link.port)}/v1/poll?${query}`, { timeoutMs: (waitMs || 0) + 8000 });
+  const r = await httpJson(`${agentBaseUrl()}/v1/poll?${query}`, {
+    timeoutMs: (waitMs || 0) + 8000,
+    headers: { "X-Golem-Secret": link.secret || "" },
+  });
   if (r.status !== 200 || !r.json) return null;
   return r.json;
 }
 
 async function postResult(link, envelope) {
-  const r = await httpJson(`${serverUrl(link.port)}/v1/result`, {
+  const r = await httpJson(`${agentBaseUrl()}/v1/result`, {
     method: "POST",
     body: { device: link.deviceId, secret: link.secret, result: envelope },
     timeoutMs: 15000,
@@ -1621,7 +1660,14 @@ async function status() {
     ok: true,
     op: "status",
     result: {
-      server: { url: serverUrl(port), version: health.version, uptimeSeconds: health.uptimeSeconds },
+      server: {
+        url: process.env.GOLEM_URL ? agentBaseUrl() : serverUrl(port),
+        tunnel: !!process.env.GOLEM_URL,
+        bind: health.bind,
+        loopbackOnly: health.loopbackOnly,
+        version: health.version,
+        uptimeSeconds: health.uptimeSeconds,
+      },
       linked: !!link,
       deviceId: health.deviceId || (link && link.deviceId) || null,
       place: health.place,
@@ -1698,7 +1744,7 @@ async function serve(link) {
 async function runCommand(link, op, args, timeoutSec) {
   const turn = currentTurn();
   return withServer(link, async () => {
-    const r = await httpJson(`${serverUrl(link.port)}/v1/call`, {
+    const r = await httpJson(`${agentBaseUrl()}/v1/call`, {
       method: "POST",
       body: { op, args, timeout: timeoutSec, turn: turn.token, device: link.deviceId, secret: link.secret },
       timeoutMs: (timeoutSec + 25) * 1000,
@@ -1755,7 +1801,7 @@ async function connect(setupLine, opts) {
   process.stderr.write("waiting for Studio to link");
   while (Date.now() < deadline) {
     health = await serverInfo(port);
-    if (health && health.plugin && health.plugin.connected && health.deviceId) break;
+    if (health && health.deviceId) break;
     process.stderr.write(".");
     await sleep(750);
   }
@@ -1789,6 +1835,9 @@ async function connect(setupLine, opts) {
   spawnServer({ secret: parsed.secret, port });
   console.log(`connected. place: ${health.place || "(unknown)"}`);
   console.log(`saved to ${saved}`);
+  if (process.env.GOLEM_URL) {
+    console.log(`reaching the bridge through ${agentBaseUrl()} (tunnel mode)`);
+  }
   console.log("");
   console.log("Keep this terminal open while the AI works - it is the direct link to Studio.");
   console.log("Every tool call from any other terminal will reach Studio through it.");
@@ -1992,6 +2041,8 @@ module.exports = {
   isLocalSocket,
   bindAddress,
   onLoopback,
+  agentBaseUrl,
+  agentHeaders,
   UsageError,
   main,
 };
