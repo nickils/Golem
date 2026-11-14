@@ -197,7 +197,7 @@ local function knownValue(key, value)
 end
 
 local function makeInstance(class, name)
-  local props = { Visible = true }
+  local props = { Visible = true, CursorPosition = -1, SelectionStart = -1, SelectionEnd = -1 }
   if class == "Part" or class == "MeshPart" then
     props.Size = Vector3.new(4, 1, 2)
     props.Position = Vector3.new(0, 0, 0)
@@ -233,8 +233,21 @@ local function makeInstance(class, name)
     end
     obj.Parent = nil
   end
-  function obj:CaptureFocus() self._props.focused = true end
-  function obj:ReleaseFocus() self._props.focused = false end
+  function obj:CaptureFocus()
+    self._props.focused = true
+    self._props.CursorPosition = #tostring(self._props.Text or "") + 1
+    self._props.SelectionStart = -1
+    self._props.SelectionEnd = -1
+    _G.__focusedTextBox = self
+  end
+  function obj:ReleaseFocus()
+    self._props.focused = false
+    -- not being edited: Studio reports -1 for the caret and the selection
+    self._props.CursorPosition = -1
+    self._props.SelectionStart = -1
+    self._props.SelectionEnd = -1
+    if _G.__focusedTextBox == self then _G.__focusedTextBox = nil end
+  end
   function obj:IsFocused() return self._props.focused == true end
   function obj:GetPropertyChangedSignal(key) return self:_sig("prop:" .. key) end
   function obj:GetChildren() return self._children end
@@ -305,6 +318,12 @@ local function makeInstance(class, name)
       end
       if key == "FocusLost" then return self:_sig("FocusLost") end
       if key == "Parent" then return rawget(self, "_props").Parent end
+      if (key == "CursorPosition" or key == "SelectionStart" or key == "SelectionEnd")
+        and rawget(self, "_props").focused ~= true then
+        -- documented TextBox behaviour: these are -1 while the box is not
+        -- being edited, so an unfocused box can never hold a selection
+        return -1
+      end
       if key == "WorldPivot" then
         local p = rawget(self, "_props")
         return p.CFrame or _G.CFrame.new(p.Position or _G.Vector3.new(0, 0, 0))
@@ -338,8 +357,12 @@ local function makeInstance(class, name)
         end
         return
       end
-      if key == "Parent" then return rawget(self, "_props").Parent end
       if key == "WorldPivot" then rawget(self, "_props").CFrame = value return end
+      if (key == "CursorPosition" or key == "SelectionStart" or key == "SelectionEnd")
+        and rawget(self, "_props").focused ~= true then
+        rawget(self, "_props")[key] = -1
+        return
+      end
       rawget(self, "_props")[key] = knownValue(key, value)
       rawset(self, key, value)
     end,
@@ -362,7 +385,14 @@ _G.Enum = setmetatable({
   UserInputType = { MouseButton1 = 1 },
   MessageType = { MessageError = 1, MessageWarning = 2, MessageOutput = 3 },
   PlaybackState = { Completed = 1, Cancelled = 2 },
-  KeyCode = setmetatable({}, { __index = function(_, k) return { Name = k } end }),
+  -- real Enum items stringify as "Enum.KeyCode.C", and that is how plugin code
+  -- and this shim compare them
+  KeyCode = setmetatable({}, { __index = function(_, k)
+    return setmetatable({ Name = k }, {
+      __tostring = function() return "Enum.KeyCode." .. k end,
+      __eq = function(a, b) return type(b) == "table" and a.Name == b.Name end,
+    })
+  end }),
   ZIndexBehavior = { Global = 1, Sibling = 2 },
   AutomaticSize = { None = 1, X = 2, Y = 3, XY = 4 },
 }, { __index = function(_, k) return setmetatable({}, { __index = function(_, kk) return { Name = kk } end }) end })
@@ -435,7 +465,39 @@ function ch:Redo()
   e.what = "redo"
 end
 
-function _G.setclipboard(text) _G.__clipboard = text end
+-- Roblox has NO clipboard-write API for plugins. The API dump has exactly one
+-- clipboard member (StudioService:CopyToClipboard, RobloxScriptSecurity), and
+-- `setclipboard` is an exploit-executor global that Studio does not define.
+-- This shim deliberately does not define it either: the previous version did,
+-- which is why a copy button that copied nothing passed the test suite.
+--
+-- The only path left is the one a person uses - select the text, send Ctrl+C -
+-- so the shim models UserInputService:CreateVirtualInput and applies the
+-- keystroke to the focused TextBox's selection, like the real thing would.
+local function applyCopyKey(code)
+  local box = _G.__focusedTextBox
+  if box == nil or _G.__virtualKeyDown ~= true then return end
+  if tostring(code) ~= "Enum.KeyCode.C" then return end
+  local text = tostring(box.Text or "")
+  -- Per the TextBox docs: CursorPosition and SelectionStart are 1-based
+  -- ("a value of 1 represents the position before the first byte") and -1
+  -- means the box is not being edited / has no selection. The selection spans
+  -- from min to max-1; an earlier version treated these as 0-based, which
+  -- copied the line missing its first character.
+  local cursor = tonumber(box.CursorPosition or -1) or -1
+  local start = tonumber(box.SelectionStart or -1) or -1
+  if cursor < 0 or start < 0 then
+    _G.__clipboard = nil
+    return
+  end
+  local from = math.min(cursor, start)
+  local to = math.max(cursor, start) - 1
+  if to < from then
+    _G.__clipboard = ""
+    return
+  end
+  _G.__clipboard = string.sub(text, from, to)
+end
 function _G.warn(...)
   local parts = {}
   for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
@@ -452,6 +514,27 @@ function terr:FillBall() end
 function terr:Clear() end
 function terr:ReadVoxels() return nil, Vector3.new(1, 1, 1) end
 function terr:WriteVoxels() end
+-- UserInputService:CreateVirtualInput is the only input-synthesis API with
+-- no security level, i.e. the only one a plugin may call. VirtualInputManager
+-- and GuiService:AddKey are RobloxScriptSecurity and stay absent here.
+local uis = _G.game:GetService("UserInputService")
+function uis:CreateVirtualInput()
+  local v = {}
+  function v:SendKeyDown(code)
+    _G.__virtualKeyDown = true
+    _G.__virtualKeysSent = (_G.__virtualKeysSent or 0) + 1
+    applyCopyKey(code)
+  end
+  function v:SendKeyUp(code)
+    if tostring(code) ~= "Enum.KeyCode.LeftControl" then _G.__virtualKeyDown = false end
+    _G.__virtualKeysSent = (_G.__virtualKeysSent or 0) + 1
+  end
+  function v:SendMouseButton() end
+  function v:SendMouseMove() end
+  function v:SendTextInput() end
+  return v
+end
+
 _G.version = function() return "ShimStudio/1.0" end
 _G.typeof = function(v)
   if v ~= nil and type(v) == "table" and v.__inst then return "Instance" end

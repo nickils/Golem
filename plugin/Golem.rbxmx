@@ -6488,27 +6488,133 @@ local function buildUi(widget, linkWidget)
 		TextColor3 = COLORS.textFaint,
 	}, ui.setupPopup)
 
+	-- Copying the line, honestly.
+	--
+	-- A plugin cannot write to the clipboard. The API dump has exactly one
+	-- clipboard member, StudioService:CopyToClipboard, and it is
+	-- RobloxScriptSecurity; the `setclipboard` global seen in exploit scripts
+	-- does not exist in Studio at all. (The previous build called it inside a
+	-- pcall and then always printed "COPIED", so it reported success while
+	-- copying nothing - which is exactly how a broken copy button survives.)
+	--
+	-- What a plugin can do is what a person does: select the text and send
+	-- Ctrl+C. UserInputService:CreateVirtualInput is the one input-synthesis
+	-- API available to plugins, and TextBox SelectionStart/SelectionEnd are
+	-- public. Returns true only when the keystroke was actually sent; the
+	-- caller must not claim COPIED otherwise.
+	local COPY_LABEL = "COPY THE LINE"
+	local function ctrlC(box)
+		local uis = game:GetService("UserInputService")
+		local keyCodes = {}
+		for _, name in ipairs({ "LeftControl", "C" }) do
+			local ok, code = pcall(function()
+				return Enum.KeyCode[name]
+			end)
+			if not ok or code == nil then
+				return false
+			end
+			keyCodes[#keyCodes + 1] = code
+		end
+		local okSend = pcall(function()
+			for _, code in ipairs(keyCodes) do
+				uis:CreateVirtualInput():SendKeyDown(code, false)
+			end
+			for i = #keyCodes, 1, -1 do
+				uis:CreateVirtualInput():SendKeyUp(keyCodes[i], false)
+			end
+		end)
+		return okSend
+	end
+	local function copyLineToClipboard()
+		local box = ui.setupBox
+		if box == nil then
+			return false
+		end
+		-- Per the TextBox docs the caret and SelectionStart are 1-based ("a value
+		-- of 1 represents the position before the first byte") and -1 means the
+		-- box is not being edited; the selection runs between the two.
+		--
+		-- Clearing first matters: a stale selection from an earlier press would
+		-- otherwise read back as valid even when this press selected nothing.
+		pcall(function()
+			box.CursorPosition = -1
+			box.SelectionStart = -1
+		end)
+		local okSelect = pcall(function()
+			box:CaptureFocus()
+		end)
+		if not okSelect then
+			return false
+		end
+		-- Focus must land: an unfocused box reports -1 for the caret and the
+		-- selection, so Ctrl+C would copy nothing.
+		local focused = false
+		pcall(function()
+			focused = (box:IsFocused() == true)
+		end)
+		if not focused then
+			return false
+		end
+		-- And read the selection back: only report success when the box holds the
+		-- exact values we asked for. This is the guard that stops "COPIED" being
+		-- printed for a copy that copied nothing.
+		local tookSelection = false
+		pcall(function()
+			local wantCursor = #box.Text + 1
+			box.CursorPosition = wantCursor
+			box.SelectionStart = 1
+			local cursor = box.CursorPosition
+			local start = box.SelectionStart
+			if type(cursor) == "number" and type(start) == "number"
+				and cursor == wantCursor and start == 1 then
+				tookSelection = true
+			end
+		end)
+		if not tookSelection then
+			pcall(function()
+				box:ReleaseFocus()
+			end)
+			return false
+		end
+		local okCopy = ctrlC(box)
+		-- Give the focus straight back: the line is read-only and the user did
+		-- not ask to type into it.
+		pcall(function()
+			box:ReleaseFocus()
+		end)
+		return okCopy
+	end
+
 	-- nil, not 0: comparing os.clock() against 0 swallowed the very first
 	-- press's feedback (the clipboard filled, the button stayed silent).
 	local copiedAt = nil
 	ui.copyLineButton.Activated:Connect(function()
-		-- Copy means copy. It must not steal focus, move the cursor, or open a
-		-- keyboard - the old version captured focus and the user had to fight
-		-- the text box to get back out.
-		local line = setupCommandText()
-		pcall(function()
-			setclipboard(line)
-		end)
+		-- Roblox exposes no clipboard-write API to plugins at all (the only
+		-- member in the API dump, StudioService:CopyToClipboard, is
+		-- RobloxScriptSecurity; `setclipboard` is an exploit function that does
+		-- not exist in Studio). The one real path is the one a person uses:
+		-- select all of the text, then send Ctrl+C. That is what this does.
 		if copiedAt ~= nil and os.clock() - copiedAt &lt; 0.4 then
 			return
 		end
 		copiedAt = os.clock()
-		ui.copyLineButton.Text = "COPIED"
-		task.delay(2, function()
-			if ui.copyLineButton ~= nil then
-				ui.copyLineButton.Text = "COPY THE LINE"
-			end
-		end)
+		if copyLineToClipboard() then
+			ui.copyLineButton.Text = "COPIED"
+			task.delay(2, function()
+				if ui.copyLineButton ~= nil then
+					ui.copyLineButton.Text = COPY_LABEL
+				end
+			end)
+		else
+			-- Say so rather than pretending. Double-click selects the line and
+			-- Ctrl+C copies it, which always works.
+			ui.copyLineButton.Text = "SELECT THE LINE, THEN CTRL+C"
+			task.delay(4, function()
+				if ui.copyLineButton ~= nil then
+					ui.copyLineButton.Text = COPY_LABEL
+				end
+			end)
+		end
 	end)
 	-- The close button existed and was never connected, so the popup could not
 	-- be dismissed at all. It closes; the SET UP AI pill brings it back.
@@ -6518,12 +6624,11 @@ local function buildUi(widget, linkWidget)
 	ui.askAiButton.Activated:Connect(function()
 		-- This used to set a `ui.chatBox` that was never assigned and returned,
 		-- so the button did nothing at all. There is no text prompt in the panel
-		-- (the AI lives in your chat, not here), so the honest action is to put
-		-- the line on the clipboard and say where to paste it.
-		pcall(function()
-			setclipboard(setupCommandText())
-		end)
-		ui.askAiButton.Text = "COPIED - PASTE IT INTO YOUR AI"
+		-- (the AI lives in your chat, not here), so the honest action is to copy
+		-- the line the only way a plugin can, and say where to paste it.
+		local ok = copyLineToClipboard()
+		ui.askAiButton.Text = ok and "COPIED - PASTE IT INTO YOUR AI"
+			or "SELECT THE LINE, THEN CTRL+C"
 		task.delay(3, function()
 			if ui.askAiButton ~= nil then
 				ui.askAiButton.Text = "ASK YOUR AI TO CONNECT"

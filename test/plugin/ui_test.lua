@@ -111,11 +111,32 @@ function M.run()
   copyBtn.Activated:Fire()
   local feedback = tostring(copyBtn.Text)
   assertTrue(_G.__clipboard ~= nil, "COPY did not put anything on the clipboard")
-  assertTrue(string.find(_G.__clipboard, "golem%-bridge connect") ~= nil,
-    "the clipboard does not hold the setup line: " .. tostring(_G.__clipboard))
+  -- exact equality, not "contains": a selection that drops the first character
+  -- still contains "golem-bridge connect" and would pass a substring check
+  assertTrue(_G.__clipboard == tostring(lineBox.Text),
+    "the clipboard does not hold the whole line.\n  wanted: " .. tostring(lineBox.Text)
+    .. "\n  got:    " .. tostring(_G.__clipboard))
   assertTrue(lineBox:IsFocused() == focusedBefore, "COPY stole focus - it must only copy")
   assertTrue(string.find(feedback, "COPIED") ~= nil,
     "COPY gave no feedback, text is now '" .. feedback .. "'")
+
+  -- 4b. when copying genuinely cannot work, the button must SAY SO instead of
+  -- claiming COPIED. This is the failure that shipped: the old handler called
+  -- an API that does not exist inside a pcall and printed COPIED regardless.
+  local uis = game:GetService("UserInputService")
+  local realCreate = uis.CreateVirtualInput
+  uis.CreateVirtualInput = function() error("no virtual input", 0) end
+  _G.__clipboard = nil
+  -- The button debounces on os.clock() (CPU time, which barely moves in a
+  -- shim), so a press right after the successful one is swallowed. Wait past
+  -- the debounce rather than pretending a second press was handled.
+  local firedAt = os.clock()
+  while os.clock() - firedAt < 0.5 do
+    _G.__advance(0.1)
+  end
+  copyBtn.Activated:Fire()
+  local failedLabel = tostring(copyBtn.Text)
+  uis.CreateVirtualInput = realCreate
 
   -- 5. ASK YOUR AI TO CONNECT must do something real, not return silently
   local askBtn
@@ -176,8 +197,8 @@ function M.run()
   assertEveryButtonIsWired(settings, "Settings")
 
   assertTrue(#_G.__uiErrors == 0, "UI errors: " .. table.concat(_G.__uiErrors, " | "))
-  print("UI OK - close works, the pill reopens, copy only copies, the line is read-only, "
-    .. "a reopened line is live, no dead buttons, the switch persists")
+  print("UI OK - close works, the pill reopens, copy really copies and admits failure, "
+    .. "the line is read-only, a reopened line is live, no dead buttons, the switch persists")
 end
 
 return M
