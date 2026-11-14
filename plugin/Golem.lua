@@ -5195,6 +5195,13 @@ end
 
 local generation = 0
 
+-- Ops that make sense while the game is running. Everything else edits the
+-- place, which must not happen against a live session.
+local PLAY_SAFE = {
+	ping = true, debug = true, stop = true, playstate = true, screenshot = true,
+	logs = true, click = true, input = true, look_through = true, play = true,
+}
+
 local MAX_RESULT_BYTES = 400000
 -- A single command may run for at most this long before the loop gives up on it.
 local COMMAND_TIMEOUT_SECONDS = 180
@@ -5248,6 +5255,15 @@ local function handleCommand(cmd)
 		return
 	end
 	state.commandsServed = state.commandsServed + 1
+	if not RunService:IsEdit() and not PLAY_SAFE[cmd.op] then
+		deliver({
+			id = cmd.id,
+			op = cmd.op,
+			ok = false,
+			error = "the game is running - `stop` the play test before editing the place (screenshot, click, input, and logs work while it runs)",
+		})
+		return
+	end
 	-- Every request from the AI carries the same token on all of its commands.
 	-- Seeing a new token means a new request, so the turn opens right now - the
 	-- first tool of a request lands in its own turn instead of the previous one.
@@ -5346,33 +5362,28 @@ end
 local function bridgeLoop(myGeneration)
 	local lastHeartbeat = 0
 	while myGeneration == generation do
-		if not RunService:IsEdit() then
-			-- edit-mode ops against a running play session would be wrong;
-			-- wait it out (play/stop/logs/screenshot run through their own paths)
-			task.wait(2)
+		-- Keep polling in both modes: during a play test the screenshot, input,
+		-- and log tools still have to reach the plugin, and the driver inside the
+		-- game needs the bridge to be live. Edit ops are refused per command
+		-- instead of stalling the whole link.
+		local now = os.clock()
+		if now - lastHeartbeat > 45 then
+			lastHeartbeat = now
+			heartbeat()
+		end
+		local ok, err = pollOnce()
+		if ok then
+			bridge.failStreak = 0
+			setConnected(true, nil)
+			bridge.interval = 0.45
+			task.wait(bridge.interval)
 		else
-			local now = os.clock()
-			if now - lastHeartbeat > 45 then
-				lastHeartbeat = now
-				heartbeat()
+			bridge.failStreak = bridge.failStreak + 1
+			bridge.interval = math.min(0.45 * bridge.failStreak, 4)
+			if bridge.failStreak == 6 then
+				setConnected(false, tostring(err))
 			end
-			local ok, err = pollOnce()
-			if ok then
-				bridge.failStreak = 0
-				setConnected(true, nil)
-				bridge.interval = 0.45
-				task.wait(bridge.interval)
-			else
-				bridge.failStreak = bridge.failStreak + 1
-				bridge.interval = math.min(0.45 * bridge.failStreak, 4)
-				if bridge.failStreak == 6 then
-					setConnected(false, tostring(err))
-					if bridge.mode == "local" then
-						useProxyMode()
-					end
-				end
-				task.wait(bridge.interval)
-			end
+			task.wait(bridge.interval)
 		end
 	end
 end
